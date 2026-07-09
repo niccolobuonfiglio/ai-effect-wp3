@@ -1,0 +1,20 @@
+syntax = "proto3";
+package data_analyzer;
+
+message AnalyzeDataRequest {
+  string output_file_path = 1;  // File path from previous service
+  float anomaly_threshold = 2;
+}
+
+message AnalyzeDataResponse {
+  bool success = 1;
+  string message = 2;
+  int32 total_records = 3;
+  int32 anomalies_detected = 4;
+  float average_efficiency = 5;
+  string output_file_path = 6;  // Path to analyzed output file
+}
+
+service DataAnalyzerService {
+  rpc AnalyzeData(AnalyzeDataRequest) returns (AnalyzeDataResponse);
+}

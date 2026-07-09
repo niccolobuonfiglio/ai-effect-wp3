@@ -1,0 +1,28 @@
+syntax = "proto3";
+package report_generator;
+
+import "common.proto";
+
+message ReportSection {
+  string title = 1;
+  repeated string content = 2;
+}
+
+message GenerateReportRequest {
+  repeated common.AnalyzedRecord analyzed_records = 1;
+  int32 total_records = 2;
+  int32 anomalies_detected = 3;
+  double average_efficiency = 4;
+}
+
+message GenerateReportResponse {
+  bool success = 1;
+  string message = 2;
+  repeated ReportSection sections = 3;
+  string summary = 4;
+}
+
+service ReportGeneratorService {
+  // Generate a report from analyzed data
+  rpc GenerateReport(GenerateReportRequest) returns (GenerateReportResponse);
+}

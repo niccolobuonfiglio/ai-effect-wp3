@@ -1,0 +1,79 @@
+{
+  "pipeline_id": "protobuf-energy-pipeline",
+  "name": "Protobuf-based Energy Pipeline",
+  "nodes": [
+    {
+      "container_name": "pb-input-provider",
+      "node_type": "DataSource",
+      "operation_signature_list": [
+        {
+          "operation_signature": {
+            "operation_name": "GetConfiguration",
+            "output_message_name": "Configuration"
+          },
+          "connected_to": [
+            {
+              "container_name": "pb-data-generator",
+              "operation_signature": {
+                "operation_name": "GenerateData"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "container_name": "pb-data-generator",
+      "node_type": "Processor",
+      "operation_signature_list": [
+        {
+          "operation_signature": {
+            "operation_name": "GenerateData",
+            "output_message_name": "RawData"
+          },
+          "connected_to": [
+            {
+              "container_name": "pb-data-analyzer",
+              "operation_signature": {
+                "operation_name": "AnalyzeData"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "container_name": "pb-data-analyzer",
+      "node_type": "Processor",
+      "operation_signature_list": [
+        {
+          "operation_signature": {
+            "operation_name": "AnalyzeData",
+            "output_message_name": "AnalyzedData"
+          },
+          "connected_to": [
+            {
+              "container_name": "pb-report-generator",
+              "operation_signature": {
+                "operation_name": "GenerateReport"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "container_name": "pb-report-generator",
+      "node_type": "DataSink",
+      "operation_signature_list": [
+        {
+          "operation_signature": {
+            "operation_name": "GenerateReport",
+            "output_message_name": "Report"
+          },
+          "connected_to": []
+        }
+      ]
+    }
+  ]
+}

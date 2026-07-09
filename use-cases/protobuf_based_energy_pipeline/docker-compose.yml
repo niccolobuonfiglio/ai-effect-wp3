@@ -1,0 +1,54 @@
+services:
+  pb-input-provider:
+    build:
+      context: ../
+      dockerfile: protobuf_based_energy_pipeline/services/input_provider/Dockerfile
+    ports:
+      - "18181:8080"   # HTTP control interface (no gRPC - config passed inline)
+    environment:
+      - PORT=8080
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+
+  pb-data-generator:
+    build:
+      context: ../
+      dockerfile: protobuf_based_energy_pipeline/services/data_generator/Dockerfile
+    ports:
+      - "18182:8080"   # HTTP control interface
+      - "50152:50051"  # gRPC data interface
+    environment:
+      - PORT=8080
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+      - GRPC_PORT=50051
+      - GRPC_HOST=pb-data-generator
+
+  pb-data-analyzer:
+    build:
+      context: ../
+      dockerfile: protobuf_based_energy_pipeline/services/data_analyzer/Dockerfile
+    ports:
+      - "18183:8080"   # HTTP control interface
+      - "50153:50051"  # gRPC data interface
+    environment:
+      - PORT=8080
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+      - GRPC_PORT=50051
+      - GRPC_HOST=pb-data-analyzer
+
+  pb-report-generator:
+    build:
+      context: ../
+      dockerfile: protobuf_based_energy_pipeline/services/report_generator/Dockerfile
+    ports:
+      - "18184:8080"   # HTTP control interface
+      - "50154:50051"  # gRPC data interface
+    environment:
+      - PORT=8080
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+      - GRPC_PORT=50051
+      - GRPC_HOST=pb-report-generator
+
+networks:
+  default:
+    name: ai-effect-services
+    external: true

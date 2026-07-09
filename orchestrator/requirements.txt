@@ -1,0 +1,13 @@
+grpcio>=1.50.0
+grpcio-tools>=1.50.0
+protobuf>=4.25.8
+pydantic>=2.0.0
+redis>=5.0.0
+httpx>=0.25.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pytest>=7.0.0
+pytest-cov>=4.0.0
+fakeredis>=2.20.0
+testcontainers>=3.7.0
+pytest-httpx>=0.30.0

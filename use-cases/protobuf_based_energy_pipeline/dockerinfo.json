@@ -1,0 +1,24 @@
+{
+  "docker_info_list": [
+    {
+      "container_name": "pb-input-provider",
+      "ip_address": "pb-input-provider",
+      "port": "8080"
+    },
+    {
+      "container_name": "pb-data-generator",
+      "ip_address": "pb-data-generator",
+      "port": "8080"
+    },
+    {
+      "container_name": "pb-data-analyzer",
+      "ip_address": "pb-data-analyzer",
+      "port": "8080"
+    },
+    {
+      "container_name": "pb-report-generator",
+      "ip_address": "pb-report-generator",
+      "port": "8080"
+    }
+  ]
+}

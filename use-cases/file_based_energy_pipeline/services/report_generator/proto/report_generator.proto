@@ -1,0 +1,18 @@
+syntax = "proto3";
+package report_generator;
+
+message GenerateReportRequest {
+  string output_file_path = 1;  // File path from previous service
+  string report_format = 2; // csv, html, json
+}
+
+message GenerateReportResponse {
+  bool success = 1;
+  string message = 2;
+  string report_path = 3;
+  string report_summary = 4;
+}
+
+service ReportGeneratorService {
+  rpc GenerateReport(GenerateReportRequest) returns (GenerateReportResponse);
+}

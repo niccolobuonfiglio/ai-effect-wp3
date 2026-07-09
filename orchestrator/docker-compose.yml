@@ -1,0 +1,55 @@
+services:
+  redis:
+    restart: unless-stopped
+    image: redis:7-alpine
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  api:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "18000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - HOST=0.0.0.0
+      - PORT=8000
+      - ORCHESTRATOR_API_KEY=${ORCHESTRATOR_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  worker:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "worker_daemon.py"]
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - WORKER_POLL_INTERVAL=1.0
+      - ORCHESTRATOR_API_KEY=${ORCHESTRATOR_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 3
+    networks:
+      - default
+      - services
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  services:
+    name: ai-effect-services
+    external: true

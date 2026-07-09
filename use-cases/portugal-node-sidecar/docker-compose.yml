@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  load-data:
+    build:
+      context: ../../
+      dockerfile: use-cases/portugal-node-sidecar/load-data/Dockerfile
+    ports:
+      - "18081:8080"
+    environment:
+      - PORT=8080
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+    networks:
+      - ai-effect-services
+    restart: unless-stopped
+
+  apply-features:
+    build:
+      context: ../../
+      dockerfile: use-cases/portugal-node-sidecar/apply-features/Dockerfile
+    ports:
+      - "18082:8080"
+    environment:
+      - PORT=8080
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+    networks:
+      - ai-effect-services
+    restart: unless-stopped
+
+  train-model:
+    build:
+      context: ../../
+      dockerfile: use-cases/portugal-node-sidecar/train-model/Dockerfile
+    ports:
+      - "18083:8080"
+    environment:
+      - PORT=8080
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+    networks:
+      - ai-effect-services
+    restart: unless-stopped
+
+  generate-data:
+    build:
+      context: ../../
+      dockerfile: use-cases/portugal-node-sidecar/generate-data/Dockerfile
+    ports:
+      - "18084:8080"
+    environment:
+      - PORT=8080
+      - SERVICE_API_KEY=${SERVICE_API_KEY:-}
+    networks:
+      - ai-effect-services
+    restart: unless-stopped
+
+networks:
+  ai-effect-services:
+    external: true

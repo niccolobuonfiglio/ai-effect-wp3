@@ -1,0 +1,52 @@
+services:
+  data_generator:
+    build:
+      context: .
+      dockerfile: services/data_generator/Dockerfile
+    container_name: protobuf_data_generator
+    environment:
+      - GRPC_PORT=50051
+    networks:
+      - energy_pipeline_test_net
+
+  data_analyzer:
+    build:
+      context: .
+      dockerfile: services/data_analyzer/Dockerfile
+    container_name: protobuf_data_analyzer
+    environment:
+      - GRPC_PORT=50051
+    networks:
+      - energy_pipeline_test_net
+    depends_on:
+      - data_generator
+
+  report_generator:
+    build:
+      context: .
+      dockerfile: services/report_generator/Dockerfile
+    container_name: protobuf_report_generator
+    environment:
+      - GRPC_PORT=50051
+    networks:
+      - energy_pipeline_test_net
+    depends_on:
+      - data_analyzer
+
+  tester:
+    build:
+      context: .
+      dockerfile: services-tester/Dockerfile
+    container_name: protobuf_pipeline_tester
+    networks:
+      - energy_pipeline_test_net
+    depends_on:
+      - data_generator
+      - data_analyzer
+      - report_generator
+    environment:
+      - PYTHONUNBUFFERED=1
+
+networks:
+  energy_pipeline_test_net:
+    driver: bridge

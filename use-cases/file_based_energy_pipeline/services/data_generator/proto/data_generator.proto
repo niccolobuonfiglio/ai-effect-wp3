@@ -1,0 +1,18 @@
+syntax = "proto3";
+package data_generator;
+
+message GenerateDataRequest {
+  int32 num_records = 1;
+  string output_format = 2; // csv, json
+}
+
+message GenerateDataResponse {
+  bool success = 1;
+  string message = 2;
+  int32 records_generated = 3;
+  string output_file_path = 4;
+}
+
+service DataGeneratorService {
+  rpc GenerateData(GenerateDataRequest) returns (GenerateDataResponse);
+}

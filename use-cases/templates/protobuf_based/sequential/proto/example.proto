@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package example;
+
+// Example input message
+message InputMessage {
+    string data_id = 1;
+    repeated double values = 2;
+    map<string, string> metadata = 3;
+}
+
+// Example output message
+message OutputMessage {
+    bool success = 1;
+    string message = 2;
+    double result = 3;
+    repeated string warnings = 4;
+}

@@ -1,0 +1,15 @@
+services:
+  services-tester:
+    build:
+      context: .
+      dockerfile: services-tester/Dockerfile
+    volumes:
+      - ./data:/app/data
+    networks:
+      - default
+    # Note: Make sure the main pipeline services are running first
+
+networks:
+  default:
+    external: true
+    name: file_based_energy_pipeline_energy-pipeline

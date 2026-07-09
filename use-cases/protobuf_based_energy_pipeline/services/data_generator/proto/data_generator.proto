@@ -1,0 +1,19 @@
+syntax = "proto3";
+package data_generator;
+
+import "common.proto";
+
+message GenerateDataRequest {
+  int32 num_records = 1;
+}
+
+message GenerateDataResponse {
+  bool success = 1;
+  string message = 2;
+  repeated common.EnergyRecord records = 3;
+}
+
+service DataGeneratorService {
+  // Generate synthetic energy data
+  rpc GenerateData(GenerateDataRequest) returns (GenerateDataResponse);
+}

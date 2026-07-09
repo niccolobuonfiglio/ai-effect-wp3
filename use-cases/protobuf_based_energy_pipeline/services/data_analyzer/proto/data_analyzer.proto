@@ -1,0 +1,23 @@
+syntax = "proto3";
+package data_analyzer;
+
+import "common.proto";
+
+message AnalyzeDataRequest {
+  repeated common.EnergyRecord records = 1;
+  double anomaly_threshold = 2;
+}
+
+message AnalyzeDataResponse {
+  bool success = 1;
+  string message = 2;
+  repeated common.AnalyzedRecord analyzed_records = 3;
+  int32 total_records = 4;
+  int32 anomalies_detected = 5;
+  double average_efficiency = 6;
+}
+
+service DataAnalyzerService {
+  // Analyze energy data for anomalies and efficiency
+  rpc AnalyzeData(AnalyzeDataRequest) returns (AnalyzeDataResponse);
+}
