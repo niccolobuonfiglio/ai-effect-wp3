@@ -9,6 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy orchestrator source code
 COPY src/ ./src/
 
+# Copy tests 
+COPY tests/ ./tests/
+
 WORKDIR /app/src
 
 EXPOSE 8000

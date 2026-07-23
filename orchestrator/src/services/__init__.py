@@ -15,6 +15,11 @@ from services.dockerinfo_parser import (
     ServiceEndpoint,
 )
 from services.log_service import SizeAndTimeRotatingHandler, configure_logging
+from services.node_validator import (
+    CheckResult,
+    NodeValidator,
+    ValidationResult,
+)
 from services.state_store import (
     RedisStateStore,
     TaskNotFoundError,
@@ -27,12 +32,14 @@ from services.workflow_engine import WorkflowEngine
 __all__ = [
     "BlueprintParseError",
     "BlueprintParser",
+    "CheckResult",
     "ControlClient",
     "ControlClientError",
     "DockerInfoParseError",
     "DockerInfoParser",
     "ExecuteRequest",
     "ExecuteResponse",
+    "NodeValidator",
     "OutputResponse",
     "RedisStateStore",
     "RedisTaskQueue",
@@ -40,6 +47,7 @@ __all__ = [
     "SizeAndTimeRotatingHandler",
     "StatusResponse",
     "TaskNotFoundError",
+    "ValidationResult",
     "Worker",
     "WorkerError",
     "WorkflowEngine",

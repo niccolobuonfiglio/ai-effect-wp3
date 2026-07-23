@@ -22,6 +22,9 @@ services:
       - HOST=0.0.0.0
       - PORT=8000
       - ORCHESTRATOR_API_KEY=${ORCHESTRATOR_API_KEY:-}
+    volumes:
+      - ./tests:/app/tests  
+      - ./src:/app/src 
     depends_on:
       redis:
         condition: service_healthy

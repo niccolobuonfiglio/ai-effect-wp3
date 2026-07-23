@@ -1,79 +1,37 @@
-"""HTTP client for service control endpoints."""
+"""HTTP client for service control endpoints.
 
-from typing import Literal
+The request/response contract models (:class:`ExecuteRequest`,
+:class:`ExecuteResponse`, :class:`StatusResponse`, :class:`OutputResponse`)
+now live in :mod:`services.contract`, the single source of truth for the Node
+Contract. They are re-exported here so that existing imports such as
+``from services.control_client import ExecuteResponse`` continue to work
+unchanged. New code should prefer importing them from ``services.contract``.
+"""
 
 import httpx
-from pydantic import BaseModel, ConfigDict, field_validator
 
 from models.data_reference import DataReference
+from services.contract import (
+    ExecuteRequest,
+    ExecuteResponse,
+    OutputResponse,
+    StatusResponse,
+)
+
+__all__ = [
+    "ControlClient",
+    "ControlClientError",
+    "ExecuteRequest",
+    "ExecuteResponse",
+    "OutputResponse",
+    "StatusResponse",
+]
 
 
 class ControlClientError(Exception):
     """Raised when control call fails."""
 
     pass
-
-
-class ExecuteRequest(BaseModel):
-    """Request body for /control/execute."""
-
-    model_config = ConfigDict(frozen=True)
-
-    method: str
-    workflow_id: str
-    task_id: str
-    inputs: list[DataReference] = []
-    parameters: dict = {}
-
-    @field_validator("method")
-    @classmethod
-    def method_not_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("method is required")
-        return v
-
-    @field_validator("workflow_id")
-    @classmethod
-    def workflow_id_not_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("workflow_id is required")
-        return v
-
-    @field_validator("task_id")
-    @classmethod
-    def task_id_not_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("task_id is required")
-        return v
-
-
-class ExecuteResponse(BaseModel):
-    """Response from /control/execute."""
-
-    model_config = ConfigDict(frozen=True)
-
-    status: Literal["complete", "running", "failed"]
-    task_id: str | None = None
-    output: DataReference | None = None
-    error: str | None = None
-
-
-class StatusResponse(BaseModel):
-    """Response from /control/status."""
-
-    model_config = ConfigDict(frozen=True)
-
-    status: Literal["running", "complete", "failed"]
-    progress: int | None = None
-    error: str | None = None
-
-
-class OutputResponse(BaseModel):
-    """Response from /control/output."""
-
-    model_config = ConfigDict(frozen=True)
-
-    output: DataReference
 
 
 class ControlClient:
