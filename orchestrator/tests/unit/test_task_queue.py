@@ -193,3 +193,96 @@ class TestWorkflowIsolation:
 
         assert queue.queue_length("wf-1") == 0
         assert queue.queue_length("wf-2") == 1
+
+
+class TestNonBlockingDequeue:
+    """timeout=0 must not block (Redis BRPOP treats 0 as forever)."""
+
+    def test_zero_timeout_on_empty_queue_returns_none(self, queue):
+        assert queue.dequeue_task("wf-1", timeout=0) is None
+
+    def test_zero_timeout_returns_fifo(self, queue):
+        queue.enqueue_task("wf-1", "task-1")
+        queue.enqueue_task("wf-1", "task-2")
+
+        assert queue.dequeue_task("wf-1", timeout=0) == "task-1"
+        assert queue.dequeue_task("wf-1", timeout=0) == "task-2"
+
+
+class TestDelayedTasks:
+    """Tests for parking tasks and releasing them later."""
+
+    def test_scheduled_task_not_queued_immediately(self, queue):
+        queue.schedule_task("wf-1", "task-1", delay=60)
+
+        assert queue.queue_length("wf-1") == 0
+        assert queue.delayed_tasks("wf-1") == ["task-1"]
+
+    def test_release_due_tasks_moves_only_due(self, queue):
+        queue.schedule_task("wf-1", "due", delay=0)
+        queue.schedule_task("wf-1", "later", delay=3600)
+
+        released = queue.release_due_tasks("wf-1")
+
+        assert released == ["due"]
+        assert queue.dequeue_task("wf-1", timeout=1) == "due"
+        assert queue.delayed_tasks("wf-1") == ["later"]
+
+    def test_release_due_tasks_with_explicit_now(self, queue):
+        queue.schedule_task("wf-1", "task-1", delay=10)
+
+        assert queue.release_due_tasks("wf-1") == []
+        import time
+
+        assert queue.release_due_tasks("wf-1", now=time.time() + 11) == ["task-1"]
+
+    def test_release_tasks_ignores_unknown(self, queue):
+        queue.schedule_task("wf-1", "task-1", delay=3600)
+
+        released = queue.release_tasks("wf-1", ["task-1", "not-parked"])
+
+        assert released == ["task-1"]
+        assert queue.queue_length("wf-1") == 1
+
+    def test_release_is_exactly_once(self, queue):
+        queue.schedule_task("wf-1", "task-1", delay=0)
+
+        assert queue.release_tasks("wf-1", ["task-1"]) == ["task-1"]
+        assert queue.release_due_tasks("wf-1") == []
+        assert queue.queue_length("wf-1") == 1
+
+    def test_on_release_runs_before_enqueue(self, queue):
+        seen = []
+        queue.schedule_task("wf-1", "task-1", delay=0)
+
+        queue.release_due_tasks(
+            "wf-1", on_release=lambda t: seen.append((t, queue.queue_length("wf-1")))
+        )
+
+        assert seen == [("task-1", 0)]
+
+    def test_rescheduling_does_not_duplicate(self, queue):
+        queue.schedule_task("wf-1", "task-1", delay=0)
+        queue.schedule_task("wf-1", "task-1", delay=0)
+
+        assert queue.release_due_tasks("wf-1") == ["task-1"]
+        assert queue.queue_length("wf-1") == 1
+
+    def test_negative_delay_raises(self, queue):
+        with pytest.raises(ValueError, match="delay"):
+            queue.schedule_task("wf-1", "task-1", delay=-1)
+
+    def test_empty_ids_raise(self, queue):
+        with pytest.raises(ValueError, match="workflow_id"):
+            queue.schedule_task("", "task-1", delay=0)
+        with pytest.raises(ValueError, match="task_id"):
+            queue.schedule_task("wf-1", "", delay=0)
+        with pytest.raises(ValueError, match="workflow_id"):
+            queue.release_due_tasks("")
+
+    def test_clear_queue_removes_parked_tasks(self, queue):
+        queue.schedule_task("wf-1", "task-1", delay=3600)
+
+        queue.clear_queue("wf-1")
+
+        assert queue.delayed_tasks("wf-1") == []

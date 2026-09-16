@@ -20,6 +20,7 @@ def _verify_orchestrator_key(
     if not credentials or credentials.credentials != api_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+from api.health_routes import create_health_router
 from api.models import (
     DataReferenceResponse,
     ErrorResponse,
@@ -32,7 +33,9 @@ from api.models import (
 )
 from models.data_reference import DataReference
 from services.blueprint_parser import BlueprintParseError, BlueprintParser
+from services.circuit_breaker import CircuitBreaker
 from services.dockerinfo_parser import DockerInfoParseError, DockerInfoParser
+from services.service_registry import ServiceRegistry
 from services.state_store import WorkflowNotFoundError, TaskNotFoundError
 from services.workflow_engine import WorkflowEngine
 
@@ -46,6 +49,8 @@ class OrchestratorAPI:
         blueprint_parser: BlueprintParser,
         dockerinfo_parser: DockerInfoParser,
         redis_client: Redis,
+        breaker: CircuitBreaker | None = None,
+        registry: ServiceRegistry | None = None,
     ):
         """Initialize API with dependencies."""
         if engine is None:
@@ -61,6 +66,10 @@ class OrchestratorAPI:
         self._blueprint_parser = blueprint_parser
         self._dockerinfo_parser = dockerinfo_parser
         self._redis = redis_client
+        self._breaker = breaker or CircuitBreaker(redis_client)
+        self._registry = registry or ServiceRegistry(
+            redis_client, self._breaker, engine
+        )
 
     def create_app(self) -> FastAPI:
         """Create FastAPI application."""
@@ -105,6 +114,10 @@ class OrchestratorAPI:
             }
             if endpoints_data:
                 self._redis.hset(endpoints_key, mapping=endpoints_data)
+
+            # Register services so they show up in the health dashboard
+            # before any task has run against them.
+            self._registry.register_all(endpoints, workflow_id=workflow_id)
 
             # Parse initial inputs for start nodes
             initial_inputs: list[DataReference] | None = None
@@ -258,5 +271,13 @@ class OrchestratorAPI:
         def health_check() -> HealthResponse:
             """Health check endpoint."""
             return HealthResponse(status="ok")
+
+        # Service health awareness & manual recovery routes
+        app.include_router(
+            create_health_router(
+                self._registry,
+                dependencies=[Depends(_verify_orchestrator_key)],
+            )
+        )
 
         return app

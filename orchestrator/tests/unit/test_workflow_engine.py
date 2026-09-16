@@ -653,3 +653,104 @@ class TestFanInWorkflow:
 
         workflow = state_store.get_workflow("wf-fanin")
         assert workflow.status == WorkflowStatus.COMPLETED
+
+
+class TestBlockedTasks:
+    """Tests for deferring tasks on unhealthy services and resuming them."""
+
+    def start(self, engine, graph, workflow_id="wf-blk"):
+        engine.initialize_workflow(workflow_id, graph)
+        engine.start_workflow(workflow_id)
+        return workflow_id
+
+    def test_defer_blocks_task_without_failing_workflow(self, engine, state_store, task_queue):
+        wf = self.start(engine, create_single_node_graph())
+        task = engine.claim_task(wf, timeout=1)
+
+        engine.defer_task(wf, task.task_id, "circuit open", delay=3600)
+
+        assert state_store.get_task(wf, task.task_id).status == TaskStatus.BLOCKED
+        assert state_store.get_task(wf, task.task_id).error == "circuit open"
+        assert state_store.get_workflow(wf).status == WorkflowStatus.RUNNING
+        assert engine.is_workflow_complete(wf) is False
+        assert task_queue.delayed_tasks(wf) == [task.task_id]
+        assert engine.claim_task(wf, timeout=0) is None
+
+    def test_release_due_tasks_requeues_as_pending(self, engine, state_store):
+        wf = self.start(engine, create_single_node_graph())
+        task = engine.claim_task(wf, timeout=1)
+        engine.defer_task(wf, task.task_id, "circuit open", delay=0)
+
+        assert engine.release_due_tasks(wf) == 1
+
+        state = state_store.get_task(wf, task.task_id)
+        assert state.status == TaskStatus.PENDING
+        assert state.error is None
+        assert engine.claim_task(wf, timeout=1).task_id == task.task_id
+
+    def test_release_due_tasks_skips_future(self, engine):
+        wf = self.start(engine, create_single_node_graph())
+        task = engine.claim_task(wf, timeout=1)
+        engine.defer_task(wf, task.task_id, "circuit open", delay=3600)
+
+        assert engine.release_due_tasks(wf) == 0
+
+    def test_resume_only_tasks_of_named_service(self, engine, state_store, task_queue):
+        wf = self.start(engine, create_parallel_graph())
+        first = engine.claim_task(wf, timeout=1)
+        second = engine.claim_task(wf, timeout=1)
+        for task in (first, second):
+            engine.defer_task(wf, task.task_id, "down", delay=3600)
+
+        resumed = engine.resume_blocked_tasks(wf, "service-a")
+
+        assert resumed == 1
+        claimed = engine.claim_task(wf, timeout=1)
+        assert claimed.node_key.startswith("service-a:")
+        remaining = task_queue.delayed_tasks(wf)
+        assert len(remaining) == 1
+        assert state_store.get_task(wf, remaining[0]).node_key.startswith("service-b:")
+
+    def test_resume_does_not_match_name_prefix(self, engine):
+        # "service-a" must not resume tasks of a service called "service-ab"
+        graph = ExecutionGraph()
+        node = create_graph_node("service-ab")
+        graph.add_node(node)
+        graph.start_nodes.append(node)
+        wf = self.start(engine, graph)
+        task = engine.claim_task(wf, timeout=1)
+        engine.defer_task(wf, task.task_id, "down", delay=3600)
+
+        assert engine.resume_blocked_tasks(wf, "service-a") == 0
+
+    def test_resume_ignores_non_running_workflow(self, engine, state_store):
+        wf = self.start(engine, create_single_node_graph())
+        task = engine.claim_task(wf, timeout=1)
+        engine.defer_task(wf, task.task_id, "down", delay=3600)
+        state_store.update_workflow_status(wf, WorkflowStatus.FAILED)
+
+        assert engine.resume_blocked_tasks(wf, "service-a") == 0
+
+    def test_blocked_chain_completes_after_resume(self, engine, state_store):
+        wf = self.start(engine, create_chain_graph())
+        a = engine.claim_task(wf, timeout=1)
+        engine.complete_task(wf, a.task_id)
+        b = engine.claim_task(wf, timeout=1)
+        engine.defer_task(wf, b.task_id, "down", delay=3600)
+
+        engine.resume_blocked_tasks(wf, "service-b")
+        for _ in range(2):
+            task = engine.claim_task(wf, timeout=1)
+            engine.complete_task(wf, task.task_id)
+
+        assert state_store.get_workflow(wf).status == WorkflowStatus.COMPLETED
+
+    def test_defer_validation(self, engine):
+        with pytest.raises(ValueError, match="workflow_id"):
+            engine.defer_task("", "t", "r", delay=0)
+        with pytest.raises(ValueError, match="task_id"):
+            engine.defer_task("wf", "", "r", delay=0)
+        with pytest.raises(ValueError, match="reason"):
+            engine.defer_task("wf", "t", "", delay=0)
+        with pytest.raises(ValueError, match="service_name"):
+            engine.resume_blocked_tasks("wf", "")

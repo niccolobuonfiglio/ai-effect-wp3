@@ -223,13 +223,29 @@ class TestExecute:
             text="Internal Server Error",
         )
 
-        with pytest.raises(ControlClientError, match="HTTP 500"):
+        with pytest.raises(ControlClientError, match="HTTP 500") as exc_info:
             client.execute(
                 base_url="http://service:8080",
                 method="ProcessData",
                 workflow_id="wf-123",
                 task_id="task-456",
             )
+        assert exc_info.value.transient is True
+
+    def test_execute_connection_error_is_transient(self, client, httpx_mock: HTTPXMock):
+        """Unreachable service raises a transient ControlClientError."""
+        import httpx
+
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+
+        with pytest.raises(ControlClientError, match="Connection failed") as exc_info:
+            client.execute(
+                base_url="http://service:8080",
+                method="ProcessData",
+                workflow_id="wf-123",
+                task_id="task-456",
+            )
+        assert exc_info.value.transient is True
 
     def test_execute_invalid_response_raises(self, client, httpx_mock: HTTPXMock):
         """Invalid JSON response raises ControlClientError."""
@@ -239,13 +255,14 @@ class TestExecute:
             json={"invalid": "response"},
         )
 
-        with pytest.raises(ControlClientError, match="Invalid response"):
+        with pytest.raises(ControlClientError, match="Invalid response") as exc_info:
             client.execute(
                 base_url="http://service:8080",
                 method="ProcessData",
                 workflow_id="wf-123",
                 task_id="task-456",
             )
+        assert exc_info.value.transient is False
 
     def test_execute_empty_base_url_raises(self, client):
         """Empty base_url raises ValueError."""
@@ -355,11 +372,12 @@ class TestGetStatus:
             text="Not Found",
         )
 
-        with pytest.raises(ControlClientError, match="HTTP 404"):
+        with pytest.raises(ControlClientError, match="HTTP 404") as exc_info:
             client.get_status(
                 base_url="http://service:8080",
                 task_id="task-123",
             )
+        assert exc_info.value.transient is False
 
     def test_get_status_empty_base_url_raises(self, client):
         """Empty base_url raises ValueError."""

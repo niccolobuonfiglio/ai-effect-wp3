@@ -22,6 +22,9 @@ class TaskStatus(str, Enum):
 
     PENDING = "pending"
     RUNNING = "running"
+    # Waiting for an unhealthy service; re-queued automatically after a delay
+    # or immediately when the service is manually recovered.
+    BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
 

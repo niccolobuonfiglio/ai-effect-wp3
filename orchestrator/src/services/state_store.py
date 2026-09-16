@@ -157,8 +157,13 @@ class RedisStateStore:
         status: TaskStatus,
         output_refs: list[DataReference] | None = None,
         error: str | None = None,
+        clear_error: bool = False,
     ) -> TaskState:
-        """Update task status and optionally set output refs."""
+        """Update task status and optionally set output refs.
+
+        ``clear_error`` resets a previously stored error (ignored if ``error``
+        is given).
+        """
         if not workflow_id:
             raise ValueError("workflow_id is required")
         if not task_id:
@@ -173,6 +178,8 @@ class RedisStateStore:
             update_data["output_refs"] = output_refs
         if error is not None:
             update_data["error"] = error
+        elif clear_error:
+            update_data["error"] = None
 
         updated = state.model_copy(update=update_data)
         key = self._task_key(workflow_id, task_id)

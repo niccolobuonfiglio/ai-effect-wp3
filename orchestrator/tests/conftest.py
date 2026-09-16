@@ -1,8 +1,12 @@
-"""Pytest configuration and fixtures."""
+"""Shared pytest configuration.
 
+Puts ``src`` on the import path so tests import ``services.*`` and ``api.*``
+the same way the application does.
+"""
+
+import os
 import sys
-from pathlib import Path
 
-# Add src to path for imports
-src_path = Path(__file__).parent.parent / "src"
-sys.path.insert(0, str(src_path))
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)

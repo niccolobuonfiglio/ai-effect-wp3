@@ -1,9 +1,50 @@
 """Logging configuration for the orchestrator."""
 
+import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
+
+ALERTS_LOGGER = "orchestrator.alerts"
+
+# Attributes every LogRecord has; anything else was passed via ``extra``.
+_RESERVED_ATTRS = frozenset(
+    vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()
+) | {"message", "asctime", "taskName"}
+
+
+def get_alerts_logger() -> logging.Logger:
+    """Logger for operational alerts meant to be forwarded to TEF monitoring."""
+    return logging.getLogger(ALERTS_LOGGER)
+
+
+class JsonFormatter(logging.Formatter):
+    """Formats each record as a single-line JSON object.
+
+    Standard fields (timestamp, level, logger, message) are always present;
+    any fields passed through ``extra=`` are merged in at the top level.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.fromtimestamp(
+                record.created, tz=timezone.utc
+            ).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in vars(record).items():
+            if key in _RESERVED_ATTRS or key.startswith("_"):
+                continue
+            # extra fields may override the record timestamp, e.g. an alert's
+            # own event time
+            payload[key] = value
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
 
 
 class SizeAndTimeRotatingHandler(TimedRotatingFileHandler):
@@ -42,6 +83,8 @@ def configure_logging(
     max_bytes: int = 5 * 1024 * 1024,  # 5 MB
     backup_count: int = 7,
     console: bool = True,
+    log_format: str | None = None,
+    alerts_file: str | None = "alerts.jsonl",
 ) -> logging.Logger:
     """Configure root logger with console and rotating file handlers.
 
@@ -52,6 +95,10 @@ def configure_logging(
         max_bytes: Max file size before rotation.
         backup_count: Number of backup files to keep.
         console: Whether to also log to console.
+        log_format: "text" or "json"; defaults to the LOG_FORMAT env var,
+            then "text".
+        alerts_file: File in ``log_dir`` receiving only alert records, always
+            as JSON lines. None disables it.
 
     Returns:
         Configured root logger.
@@ -64,9 +111,16 @@ def configure_logging(
     # Clear existing handlers
     logger.handlers.clear()
 
-    formatter = logging.Formatter(
-        "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-    )
+    log_format = (log_format or os.environ.get("LOG_FORMAT", "text")).lower()
+    if log_format not in ("text", "json"):
+        raise ValueError(f"log_format must be 'text' or 'json', got {log_format!r}")
+
+    if log_format == "json":
+        formatter: logging.Formatter = JsonFormatter()
+    else:
+        formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+        )
 
     # File handler with size and time rotation
     file_handler = SizeAndTimeRotatingHandler(
@@ -86,5 +140,23 @@ def configure_logging(
         console_handler.setLevel(level)
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
+
+    # Dedicated JSON-lines alert stream for TEF monitoring. Alerts still
+    # propagate to the root handlers above.
+    alerts_logger = get_alerts_logger()
+    for handler in alerts_logger.handlers:
+        handler.close()
+    alerts_logger.handlers.clear()
+    if alerts_file:
+        alerts_handler = SizeAndTimeRotatingHandler(
+            filename=os.path.join(log_dir, alerts_file),
+            when="midnight",
+            interval=1,
+            max_bytes=max_bytes,
+            backup_count=backup_count,
+            encoding="utf-8",
+        )
+        alerts_handler.setFormatter(JsonFormatter())
+        alerts_logger.addHandler(alerts_handler)
 
     return logger

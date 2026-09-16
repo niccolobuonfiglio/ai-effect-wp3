@@ -9,6 +9,7 @@ import time
 
 import redis
 
+from services.circuit_breaker import CircuitBreaker
 from services.control_client import ControlClient
 from services.dockerinfo_parser import ServiceEndpoint
 from services.log_service import configure_logging
@@ -36,6 +37,18 @@ class WorkerDaemon:
         task_queue = RedisTaskQueue(redis_client)
         self.engine = WorkflowEngine(state_store, task_queue, redis_client)
         self.control_client = ControlClient()
+
+        # Shared circuit breaker: state lives in Redis, so every worker
+        # replica and the API observe the same service health.
+        self.breaker = CircuitBreaker(
+            redis_client,
+            failure_threshold=int(os.environ.get("CIRCUIT_FAILURE_THRESHOLD", "3")),
+            reset_timeout=float(os.environ.get("CIRCUIT_RESET_TIMEOUT", "60")),
+            degraded_threshold=int(os.environ.get("CIRCUIT_DEGRADED_THRESHOLD", "1")),
+        )
+        self.blocked_retry_delay = float(
+            os.environ.get("BLOCKED_TASK_RETRY_DELAY", "30")
+        )
 
     def load_endpoints(self, workflow_id: str) -> dict[str, ServiceEndpoint]:
         """Load service endpoints for a workflow from Redis."""
@@ -91,7 +104,13 @@ class WorkerDaemon:
 
         services_key = self.load_services_key(workflow_id)
         client = ControlClient(api_key=services_key) if services_key else self.control_client
-        worker = Worker(self.engine, client, endpoints)
+        worker = Worker(
+            self.engine,
+            client,
+            endpoints,
+            breaker=self.breaker,
+            blocked_retry_delay=self.blocked_retry_delay,
+        )
         return worker.process_task(workflow_id, timeout=0)
 
     def run(self) -> None:

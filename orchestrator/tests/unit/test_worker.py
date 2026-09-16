@@ -406,3 +406,180 @@ class TestServiceCall:
         call_args = mock_client.execute.call_args
         assert call_args.kwargs["workflow_id"] == "wf-123"
         assert call_args.kwargs["task_id"] == "task-123"
+
+
+class TestProcessTaskWithBreaker:
+    """Tests for circuit-breaker driven blocking of tasks."""
+
+    @pytest.fixture
+    def breaker(self):
+        import fakeredis
+
+        from services.circuit_breaker import CircuitBreaker
+
+        return CircuitBreaker(
+            fakeredis.FakeRedis(decode_responses=True),
+            failure_threshold=1,
+            reset_timeout=3600,
+        )
+
+    @pytest.fixture
+    def guarded_worker(self, mock_engine, mock_client, endpoints, breaker):
+        return Worker(
+            mock_engine,
+            mock_client,
+            endpoints,
+            poll_interval=0.01,
+            breaker=breaker,
+            blocked_retry_delay=15,
+        )
+
+    def test_releases_due_tasks_before_claiming(self, guarded_worker, mock_engine):
+        mock_engine.claim_task.return_value = None
+
+        guarded_worker.process_task("wf-123")
+
+        mock_engine.release_due_tasks.assert_called_once_with("wf-123")
+
+    def test_open_circuit_defers_instead_of_failing(
+        self, guarded_worker, mock_engine, mock_client, breaker, sample_task
+    ):
+        breaker.record_failure("service-a", "http://service-a:50051", "down")
+        mock_engine.claim_task.return_value = sample_task
+
+        result = guarded_worker.process_task("wf-123")
+
+        assert result is True
+        mock_client.execute.assert_not_called()
+        mock_engine.fail_task.assert_not_called()
+        mock_engine.defer_task.assert_called_once()
+        args, kwargs = mock_engine.defer_task.call_args
+        assert args[:2] == ("wf-123", "task-123")
+        assert "Circuit open" in args[2]
+        assert "/orchestrator/health/services/service-a/recover" in args[2]
+        assert kwargs["delay"] == 15
+
+    def test_connection_error_opens_circuit_and_defers(
+        self, guarded_worker, mock_engine, mock_client, breaker, sample_task
+    ):
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.side_effect = ControlClientError(
+            "Connection failed: refused", transient=True
+        )
+
+        result = guarded_worker.process_task("wf-123")
+
+        assert result is True
+        mock_engine.fail_task.assert_not_called()
+        mock_engine.defer_task.assert_called_once()
+        assert "unavailable" in mock_engine.defer_task.call_args[0][2]
+        assert breaker.get_health("service-a").status == "UNHEALTHY"
+
+    def test_non_transient_error_fails_without_touching_breaker(
+        self, guarded_worker, mock_engine, mock_client, breaker, sample_task
+    ):
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.side_effect = ControlClientError("HTTP 400: bad request")
+
+        guarded_worker.process_task("wf-123")
+
+        mock_engine.fail_task.assert_called_once()
+        mock_engine.defer_task.assert_not_called()
+        health = breaker.get_health("service-a")
+        assert health.status == "HEALTHY"
+        assert health.failure_count == 0
+
+    def test_service_reported_failure_does_not_open_circuit(
+        self, guarded_worker, mock_engine, mock_client, breaker, sample_task
+    ):
+        """A service that answers 'failed' is reachable: fail the task only."""
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="failed",
+            error="('Connection broken: IncompleteRead(0 bytes read)')",
+        )
+
+        guarded_worker.process_task("wf-123")
+
+        mock_engine.fail_task.assert_called_once()
+        mock_engine.defer_task.assert_not_called()
+        health = breaker.get_health("service-a")
+        assert health.circuit_state == "closed"
+        assert health.failure_count == 0
+        assert breaker.allow("service-a") is True
+
+    def test_http_5xx_counts_as_unavailable(
+        self, guarded_worker, mock_engine, mock_client, breaker, sample_task
+    ):
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.side_effect = ControlClientError(
+            "HTTP 503: unavailable", transient=True
+        )
+
+        guarded_worker.process_task("wf-123")
+
+        mock_engine.defer_task.assert_called_once()
+        assert breaker.get_health("service-a").circuit_state == "open"
+
+    def test_transient_error_during_poll_defers(
+        self, guarded_worker, mock_engine, mock_client, sample_task
+    ):
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="running", task_id="svc-task-1"
+        )
+        mock_client.get_status.side_effect = ControlClientError(
+            "Request timed out", transient=True
+        )
+
+        guarded_worker.process_task("wf-123")
+
+        mock_engine.fail_task.assert_not_called()
+        mock_engine.defer_task.assert_called_once()
+
+    def test_service_reported_failure_during_poll_still_fails(
+        self, guarded_worker, mock_engine, mock_client, breaker, sample_task
+    ):
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="running", task_id="svc-task-1"
+        )
+        mock_client.get_status.return_value = StatusResponse(
+            status="failed", error="Out of memory"
+        )
+
+        guarded_worker.process_task("wf-123")
+
+        mock_engine.fail_task.assert_called_once()
+        mock_engine.defer_task.assert_not_called()
+        assert breaker.get_health("service-a").failure_count == 0
+
+    def test_recovered_service_is_called_again(
+        self, guarded_worker, mock_engine, mock_client, breaker, sample_task, sample_output
+    ):
+        breaker.record_failure("service-a", "http://service-a:50051", "down")
+        breaker.reset("service-a")
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="complete", output=sample_output
+        )
+
+        guarded_worker.process_task("wf-123")
+
+        mock_client.execute.assert_called_once()
+        mock_engine.complete_task.assert_called_once()
+
+    def test_without_breaker_transient_error_fails(
+        self, worker, mock_engine, mock_client, sample_task
+    ):
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.side_effect = ControlClientError("refused", transient=True)
+
+        worker.process_task("wf-123")
+
+        mock_engine.fail_task.assert_called_once()
+        mock_engine.defer_task.assert_not_called()
+
+    def test_negative_retry_delay_rejected(self, mock_engine, mock_client, endpoints):
+        with pytest.raises(ValueError, match="blocked_retry_delay"):
+            Worker(mock_engine, mock_client, endpoints, blocked_retry_delay=-1)

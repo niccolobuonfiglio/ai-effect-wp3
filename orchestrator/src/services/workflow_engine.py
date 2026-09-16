@@ -203,6 +203,67 @@ class WorkflowEngine:
 
         return task
 
+    def defer_task(
+        self, workflow_id: str, task_id: str, reason: str, delay: float
+    ) -> TaskState:
+        """Mark a task BLOCKED and re-queue it after ``delay`` seconds.
+
+        Unlike ``fail_task`` the workflow keeps running, so it can continue once
+        the blocking service is healthy again.
+        """
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+        if not reason:
+            raise ValueError("reason is required")
+
+        task = self._state_store.update_task_status(
+            workflow_id, task_id, TaskStatus.BLOCKED, error=reason
+        )
+        self._task_queue.schedule_task(workflow_id, task_id, delay)
+        return task
+
+    def release_due_tasks(self, workflow_id: str) -> int:
+        """Re-queue blocked tasks whose retry delay has elapsed."""
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+
+        released = self._task_queue.release_due_tasks(
+            workflow_id, on_release=lambda t: self._mark_released(workflow_id, t)
+        )
+        return len(released)
+
+    def resume_blocked_tasks(self, workflow_id: str, service_name: str) -> int:
+        """Immediately re-queue tasks of a running workflow blocked on a service.
+
+        Returns the number of tasks re-queued.
+        """
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not service_name:
+            raise ValueError("service_name is required")
+
+        workflow = self._state_store.get_workflow(workflow_id)
+        if workflow.status != WorkflowStatus.RUNNING:
+            return 0
+
+        prefix = f"{service_name}:"
+        matching = [
+            task_id
+            for task_id in self._task_queue.delayed_tasks(workflow_id)
+            if self._state_store.get_task(workflow_id, task_id).node_key.startswith(prefix)
+        ]
+        released = self._task_queue.release_tasks(
+            workflow_id, matching, on_release=lambda t: self._mark_released(workflow_id, t)
+        )
+        return len(released)
+
+    def _mark_released(self, workflow_id: str, task_id: str) -> None:
+        self._state_store.update_task_status(
+            workflow_id, task_id, TaskStatus.PENDING, clear_error=True
+        )
+
     def get_workflow_status(self, workflow_id: str) -> WorkflowState:
         """Get current workflow state."""
         if not workflow_id:

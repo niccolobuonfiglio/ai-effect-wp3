@@ -9,7 +9,16 @@ from models.data_reference import DataReference
 
 
 class ControlClientError(Exception):
-    """Raised when control call fails."""
+    """Raised when control call fails.
+
+    ``transient`` is True when the service could not be reached or answered
+    with a 5xx - i.e. the failure says something about service availability
+    rather than about the request.
+    """
+
+    def __init__(self, message: str, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
 
     pass
 
@@ -113,15 +122,16 @@ class ControlClient:
             with httpx.Client(timeout=self._timeout) as client:
                 response = client.post(url, json=request.model_dump(mode="json"), headers=self._headers)
         except httpx.ConnectError as e:
-            raise ControlClientError(f"Connection failed: {e}") from e
+            raise ControlClientError(f"Connection failed: {e}", transient=True) from e
         except httpx.TimeoutException as e:
-            raise ControlClientError(f"Request timed out: {e}") from e
+            raise ControlClientError(f"Request timed out: {e}", transient=True) from e
         except httpx.RequestError as e:
-            raise ControlClientError(f"Request failed: {e}") from e
+            raise ControlClientError(f"Request failed: {e}", transient=True) from e
 
         if response.status_code >= 400:
             raise ControlClientError(
-                f"HTTP {response.status_code}: {response.text}"
+                f"HTTP {response.status_code}: {response.text}",
+                transient=response.status_code >= 500,
             )
 
         try:
@@ -143,15 +153,16 @@ class ControlClient:
             with httpx.Client(timeout=self._timeout) as client:
                 response = client.get(url, headers=self._headers)
         except httpx.ConnectError as e:
-            raise ControlClientError(f"Connection failed: {e}") from e
+            raise ControlClientError(f"Connection failed: {e}", transient=True) from e
         except httpx.TimeoutException as e:
-            raise ControlClientError(f"Request timed out: {e}") from e
+            raise ControlClientError(f"Request timed out: {e}", transient=True) from e
         except httpx.RequestError as e:
-            raise ControlClientError(f"Request failed: {e}") from e
+            raise ControlClientError(f"Request failed: {e}", transient=True) from e
 
         if response.status_code >= 400:
             raise ControlClientError(
-                f"HTTP {response.status_code}: {response.text}"
+                f"HTTP {response.status_code}: {response.text}",
+                transient=response.status_code >= 500,
             )
 
         try:
@@ -173,15 +184,16 @@ class ControlClient:
             with httpx.Client(timeout=self._timeout) as client:
                 response = client.get(url, headers=self._headers)
         except httpx.ConnectError as e:
-            raise ControlClientError(f"Connection failed: {e}") from e
+            raise ControlClientError(f"Connection failed: {e}", transient=True) from e
         except httpx.TimeoutException as e:
-            raise ControlClientError(f"Request timed out: {e}") from e
+            raise ControlClientError(f"Request timed out: {e}", transient=True) from e
         except httpx.RequestError as e:
-            raise ControlClientError(f"Request failed: {e}") from e
+            raise ControlClientError(f"Request failed: {e}", transient=True) from e
 
         if response.status_code >= 400:
             raise ControlClientError(
-                f"HTTP {response.status_code}: {response.text}"
+                f"HTTP {response.status_code}: {response.text}",
+                transient=response.status_code >= 500,
             )
 
         try:

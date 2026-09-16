@@ -22,6 +22,7 @@ services:
       - HOST=0.0.0.0
       - PORT=8000
       - ORCHESTRATOR_API_KEY=${ORCHESTRATOR_API_KEY:-}
+      - LOG_FORMAT=${LOG_FORMAT:-text}
     depends_on:
       redis:
         condition: service_healthy
@@ -38,6 +39,9 @@ services:
       - REDIS_URL=redis://redis:6379
       - WORKER_POLL_INTERVAL=1.0
       - ORCHESTRATOR_API_KEY=${ORCHESTRATOR_API_KEY:-}
+      - LOG_FORMAT=${LOG_FORMAT:-text}
+      - CIRCUIT_FAILURE_THRESHOLD=1
+      - BLOCKED_TASK_RETRY_DELAY=${BLOCKED_TASK_RETRY_DELAY:-30}
     depends_on:
       redis:
         condition: service_healthy

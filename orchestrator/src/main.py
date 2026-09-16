@@ -10,8 +10,10 @@ import uvicorn
 
 from api.app import OrchestratorAPI
 from services.blueprint_parser import BlueprintParser
+from services.circuit_breaker import CircuitBreaker
 from services.dockerinfo_parser import DockerInfoParser
 from services.log_service import configure_logging
+from services.service_registry import ServiceRegistry
 from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
 from services.workflow_engine import WorkflowEngine
@@ -25,6 +27,20 @@ def get_redis_client() -> redis.Redis:
     return redis.Redis.from_url(redis_url, decode_responses=True)
 
 
+def get_circuit_breaker(redis_client: redis.Redis) -> CircuitBreaker:
+    """Create circuit breaker from environment.
+
+    State lives in Redis, so the API process and every worker replica share a
+    single view of service health.
+    """
+    return CircuitBreaker(
+        redis_client,
+        failure_threshold=int(os.environ.get("CIRCUIT_FAILURE_THRESHOLD", "3")),
+        reset_timeout=float(os.environ.get("CIRCUIT_RESET_TIMEOUT", "60")),
+        degraded_threshold=int(os.environ.get("CIRCUIT_DEGRADED_THRESHOLD", "1")),
+    )
+
+
 def create_app() -> "uvicorn.ASGIApplication":
     """Create FastAPI application with all dependencies."""
     redis_client = get_redis_client()
@@ -33,8 +49,17 @@ def create_app() -> "uvicorn.ASGIApplication":
     engine = WorkflowEngine(state_store, task_queue, redis_client)
     blueprint_parser = BlueprintParser()
     dockerinfo_parser = DockerInfoParser()
+    breaker = get_circuit_breaker(redis_client)
+    registry = ServiceRegistry(redis_client, breaker, engine)
 
-    api = OrchestratorAPI(engine, blueprint_parser, dockerinfo_parser, redis_client)
+    api = OrchestratorAPI(
+        engine,
+        blueprint_parser,
+        dockerinfo_parser,
+        redis_client,
+        breaker=breaker,
+        registry=registry,
+    )
     return api.create_app()
 
 
@@ -69,6 +94,11 @@ def main() -> int:
 
     logger.info("Starting orchestrator API server")
     logger.info(f"Redis: {os.environ.get('REDIS_URL', 'redis://localhost:6379')}")
+    logger.info(
+        "Circuit breaker: threshold=%s reset_timeout=%ss",
+        os.environ.get("CIRCUIT_FAILURE_THRESHOLD", "3"),
+        os.environ.get("CIRCUIT_RESET_TIMEOUT", "60"),
+    )
 
     app = create_app()
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
