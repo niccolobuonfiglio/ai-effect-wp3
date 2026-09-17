@@ -7,6 +7,7 @@ from models.data_reference import DataReference
 from services.circuit_breaker import CircuitBreaker
 from services.control_client import ControlClient, ControlClientError
 from services.dockerinfo_parser import ServiceEndpoint
+from services.privacy import DataPolicy, DataPolicyError
 from services.workflow_engine import WorkflowEngine
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class Worker:
         poll_interval: float = 5.0,
         breaker: CircuitBreaker | None = None,
         blocked_retry_delay: float = 30.0,
+        policy: DataPolicy | None = None,
     ):
         """Initialize worker with dependencies.
 
@@ -41,6 +43,7 @@ class Worker:
                 When set, tasks for unavailable services are parked (BLOCKED)
                 instead of failing the workflow.
             blocked_retry_delay: Seconds before a BLOCKED task is re-queued.
+            policy: Limits on the data references a service may return.
         """
         if engine is None:
             raise ValueError("engine is required")
@@ -59,6 +62,7 @@ class Worker:
         self._poll_interval = poll_interval
         self._breaker = breaker
         self._blocked_retry_delay = blocked_retry_delay
+        self._policy = policy or DataPolicy.from_env()
 
     def process_task(self, workflow_id: str, timeout: float = 0) -> bool:
         """Process single task from queue.
@@ -83,7 +87,7 @@ class Worker:
 
             # Look up endpoint
             endpoint = self._get_endpoint(container_name)
-            base_url = f"http://{endpoint.address}:{endpoint.port}"
+            base_url = endpoint.base_url
 
             # Circuit breaker gate: skip the call entirely if the service is
             # known to be down, until an operator recovers it or the reset
@@ -146,6 +150,19 @@ class Worker:
             else:
                 self._engine.fail_task(
                     workflow_id, task.task_id, f"Unknown status: {response.status}"
+                )
+                return True
+
+            # A service that returns a huge inline payload would put that data
+            # into Redis and the API; reject it instead.
+            try:
+                self._policy.check_all(output_refs)
+            except DataPolicyError as e:
+                self._engine.fail_task(
+                    workflow_id,
+                    task.task_id,
+                    f"Service '{container_name}' returned data that breaks the "
+                    f"orchestrator data policy: {e}",
                 )
                 return True
 

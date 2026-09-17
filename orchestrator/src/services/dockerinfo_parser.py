@@ -1,9 +1,13 @@
 """Parser for AI-Effect dockerinfo.json files."""
 
 import json
+import os
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, field_validator
+
+SCHEMES = ("http", "https")
+DEFAULT_SCHEME = "http"
 
 
 class DockerInfoParseError(Exception):
@@ -19,6 +23,19 @@ class ServiceEndpoint(BaseModel):
 
     address: str
     port: int
+    scheme: str = DEFAULT_SCHEME
+
+    @property
+    def base_url(self) -> str:
+        """URL the orchestrator calls this service on."""
+        return f"{self.scheme}://{self.address}:{self.port}"
+
+    @field_validator("scheme")
+    @classmethod
+    def scheme_supported(cls, v: str) -> str:
+        if v not in SCHEMES:
+            raise ValueError(f"scheme must be one of: {', '.join(SCHEMES)}")
+        return v
 
     @field_validator("address")
     @classmethod
@@ -43,6 +60,7 @@ class DockerInfoEntry(BaseModel):
     container_name: str
     ip_address: str
     port: str
+    scheme: str | None = None
 
     @field_validator("container_name")
     @classmethod
@@ -82,7 +100,19 @@ class DockerInfoSchema(BaseModel):
 
 
 class DockerInfoParser:
-    """Parses dockerinfo.json into service endpoint mapping."""
+    """Parses dockerinfo.json into service endpoint mapping.
+
+    Args:
+        default_scheme: Scheme for entries that do not name one. Defaults to
+            the SERVICE_SCHEME environment variable, then "http". Set it to
+            "https" when the services are served behind TLS.
+    """
+
+    def __init__(self, default_scheme: str | None = None):
+        scheme = default_scheme or os.environ.get("SERVICE_SCHEME") or DEFAULT_SCHEME
+        if scheme not in SCHEMES:
+            raise ValueError(f"default_scheme must be one of: {', '.join(SCHEMES)}")
+        self._default_scheme = scheme
 
     def parse_file(self, path: str) -> dict[str, ServiceEndpoint]:
         """Parse dockerinfo from JSON file."""
@@ -121,7 +151,16 @@ class DockerInfoParser:
                     f"Invalid port for {entry.container_name}: {entry.port}"
                 )
 
-            endpoint = ServiceEndpoint(address=entry.ip_address, port=port)
+            try:
+                endpoint = ServiceEndpoint(
+                    address=entry.ip_address,
+                    port=port,
+                    scheme=entry.scheme or self._default_scheme,
+                )
+            except ValueError as e:
+                raise DockerInfoParseError(
+                    f"Invalid endpoint for {entry.container_name}: {e}"
+                )
             endpoints[entry.container_name] = endpoint
 
         return endpoints

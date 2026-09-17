@@ -35,6 +35,8 @@ from models.data_reference import DataReference
 from services.blueprint_parser import BlueprintParseError, BlueprintParser
 from services.circuit_breaker import CircuitBreaker
 from services.dockerinfo_parser import DockerInfoParseError, DockerInfoParser
+from services.privacy import DataPolicy, DataPolicyError
+from services.secrets import SecretBox
 from services.service_registry import ServiceRegistry
 from services.state_store import WorkflowNotFoundError, TaskNotFoundError
 from services.workflow_engine import WorkflowEngine
@@ -51,6 +53,8 @@ class OrchestratorAPI:
         redis_client: Redis,
         breaker: CircuitBreaker | None = None,
         registry: ServiceRegistry | None = None,
+        policy: DataPolicy | None = None,
+        secrets: SecretBox | None = None,
     ):
         """Initialize API with dependencies."""
         if engine is None:
@@ -69,6 +73,21 @@ class OrchestratorAPI:
         self._breaker = breaker or CircuitBreaker(redis_client)
         self._registry = registry or ServiceRegistry(
             redis_client, self._breaker, engine
+        )
+        self._policy = policy or DataPolicy.from_env()
+        self._secrets = secrets or SecretBox.from_env()
+
+    def _reference_response(self, reference: DataReference) -> "DataReferenceResponse":
+        """Build an API view of a reference, masking inline payloads."""
+        return DataReferenceResponse(
+            protocol=reference.protocol.value,
+            uri=self._policy.masked_uri(reference),
+            format=(
+                reference.format
+                if isinstance(reference.format, str)
+                else reference.format.value
+            ),
+            metadata=reference.metadata,
         )
 
     def create_app(self) -> FastAPI:
@@ -104,7 +123,10 @@ class OrchestratorAPI:
 
             # Store services API key for worker to use when calling services
             if request.services_api_key:
-                self._redis.set(f"services_key:{workflow_id}", request.services_api_key)
+                self._redis.set(
+                    f"services_key:{workflow_id}",
+                    self._secrets.encrypt(request.services_api_key),
+                )
 
             # Store endpoints for worker lookup
             endpoints_key = f"endpoints:{workflow_id}"
@@ -125,6 +147,12 @@ class OrchestratorAPI:
                 try:
                     initial_inputs = [DataReference(**inp) for inp in request.inputs]
                 except Exception as e:
+                    raise HTTPException(
+                        status_code=400, detail=f"Invalid inputs: {e}"
+                    )
+                try:
+                    self._policy.check_all(initial_inputs)
+                except DataPolicyError as e:
                     raise HTTPException(
                         status_code=400, detail=f"Invalid inputs: {e}"
                     )
@@ -181,21 +209,11 @@ class OrchestratorAPI:
                     updated_at=task.updated_at,
                     error=task.error,
                     input_refs=[
-                        DataReferenceResponse(
-                            protocol=r.protocol.value,
-                            uri=r.uri,
-                            format=r.format if isinstance(r.format, str) else r.format.value,
-                            metadata=r.metadata,
-                        )
+                        self._reference_response(r)
                         for r in task.input_refs
                     ],
                     output_refs=[
-                        DataReferenceResponse(
-                            protocol=r.protocol.value,
-                            uri=r.uri,
-                            format=r.format if isinstance(r.format, str) else r.format.value,
-                            metadata=r.metadata,
-                        )
+                        self._reference_response(r)
                         for r in task.output_refs
                     ],
                 )
@@ -225,21 +243,11 @@ class OrchestratorAPI:
                 updated_at=task.updated_at,
                 error=task.error,
                 input_refs=[
-                    DataReferenceResponse(
-                        protocol=r.protocol.value,
-                        uri=r.uri,
-                        format=r.format if isinstance(r.format, str) else r.format.value,
-                        metadata=r.metadata,
-                    )
+                    self._reference_response(r)
                     for r in task.input_refs
                 ],
                 output_refs=[
-                    DataReferenceResponse(
-                        protocol=r.protocol.value,
-                        uri=r.uri,
-                        format=r.format if isinstance(r.format, str) else r.format.value,
-                        metadata=r.metadata,
-                    )
+                    self._reference_response(r)
                     for r in task.output_refs
                 ],
             )

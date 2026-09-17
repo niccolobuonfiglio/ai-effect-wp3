@@ -7,6 +7,7 @@ from redis import Redis
 from models.data_reference import DataReference
 from models.graph import ExecutionGraph, GraphNode
 from models.state import TaskState, TaskStatus, WorkflowState, WorkflowStatus
+from services.privacy import sanitize_error
 from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
 
@@ -193,6 +194,7 @@ class WorkflowEngine:
         if not error:
             raise ValueError("error is required")
 
+        error = sanitize_error(error)
         task = self._state_store.update_task_status(
             workflow_id, task_id, TaskStatus.FAILED, error=error
         )
@@ -219,7 +221,7 @@ class WorkflowEngine:
             raise ValueError("reason is required")
 
         task = self._state_store.update_task_status(
-            workflow_id, task_id, TaskStatus.BLOCKED, error=reason
+            workflow_id, task_id, TaskStatus.BLOCKED, error=sanitize_error(reason)
         )
         self._task_queue.schedule_task(workflow_id, task_id, delay)
         return task

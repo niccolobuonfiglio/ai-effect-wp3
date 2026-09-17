@@ -88,12 +88,25 @@ class OutputResponse(BaseModel):
 class ControlClient:
     """HTTP client for service control endpoints."""
 
-    def __init__(self, timeout: float = 30.0, api_key: str | None = None):
-        """Initialize client with timeout and optional bearer token."""
+    def __init__(
+        self,
+        timeout: float = 30.0,
+        api_key: str | None = None,
+        verify: bool | str = True,
+    ):
+        """Initialize client with timeout and optional bearer token.
+
+        Args:
+            timeout: Per-request timeout in seconds.
+            api_key: Bearer token sent to the services.
+            verify: TLS verification for https endpoints - True, False, or the
+                path to a CA bundle.
+        """
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         self._timeout = timeout
         self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._verify = verify
 
     def execute(
         self,
@@ -119,7 +132,7 @@ class ControlClient:
         url = f"{base_url.rstrip('/')}/control/execute"
 
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._timeout, verify=self._verify) as client:
                 response = client.post(url, json=request.model_dump(mode="json"), headers=self._headers)
         except httpx.ConnectError as e:
             raise ControlClientError(f"Connection failed: {e}", transient=True) from e
@@ -150,7 +163,7 @@ class ControlClient:
         url = f"{base_url.rstrip('/')}/control/status/{task_id}"
 
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._timeout, verify=self._verify) as client:
                 response = client.get(url, headers=self._headers)
         except httpx.ConnectError as e:
             raise ControlClientError(f"Connection failed: {e}", transient=True) from e
@@ -181,7 +194,7 @@ class ControlClient:
         url = f"{base_url.rstrip('/')}/control/output/{task_id}"
 
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=self._timeout, verify=self._verify) as client:
                 response = client.get(url, headers=self._headers)
         except httpx.ConnectError as e:
             raise ControlClientError(f"Connection failed: {e}", transient=True) from e

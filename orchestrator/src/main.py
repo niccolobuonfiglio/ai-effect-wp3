@@ -99,6 +99,14 @@ def main() -> int:
         os.environ.get("CIRCUIT_FAILURE_THRESHOLD", "3"),
         os.environ.get("CIRCUIT_RESET_TIMEOUT", "60"),
     )
+    logger.info(
+        "Data policy: allow_inline=%s max_inline_bytes=%s; service scheme=%s; "
+        "services key encryption=%s",
+        os.environ.get("ALLOW_INLINE", "true"),
+        os.environ.get("MAX_INLINE_BYTES", "65536"),
+        os.environ.get("SERVICE_SCHEME", "http"),
+        "on" if os.environ.get("ORCHESTRATOR_SECRET") else "off",
+    )
 
     app = create_app()
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

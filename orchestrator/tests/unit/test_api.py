@@ -447,3 +447,180 @@ class TestHealthCheck:
 
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
+
+
+class TestDataPolicyOnSubmission:
+    """Inline payloads are capped at submission time."""
+
+    def submit(self, client, blueprint, dockerinfo, inputs):
+        return client.post(
+            "/workflows",
+            json={"blueprint": blueprint, "dockerinfo": dockerinfo, "inputs": inputs},
+        )
+
+    @pytest.fixture
+    def parsers(self, mock_blueprint_parser, mock_dockerinfo_parser):
+        mock_blueprint_parser.parse_json.return_value = MagicMock()
+        mock_dockerinfo_parser.parse_json.return_value = {}
+
+    def inline_input(self, size):
+        import base64
+
+        return {
+            "protocol": "inline",
+            "uri": base64.b64encode(b"x" * size).decode(),
+            "format": "csv",
+        }
+
+    def test_small_inline_input_accepted(
+        self, client, parsers, valid_blueprint, valid_dockerinfo
+    ):
+        response = self.submit(
+            client, valid_blueprint, valid_dockerinfo, [self.inline_input(64)]
+        )
+
+        assert response.status_code == 200
+
+    def test_oversized_inline_input_rejected(
+        self,
+        mock_engine,
+        mock_blueprint_parser,
+        mock_dockerinfo_parser,
+        mock_redis,
+        parsers,
+        valid_blueprint,
+        valid_dockerinfo,
+    ):
+        from services.privacy import DataPolicy
+
+        api = OrchestratorAPI(
+            mock_engine,
+            mock_blueprint_parser,
+            mock_dockerinfo_parser,
+            mock_redis,
+            policy=DataPolicy(max_inline_bytes=32),
+        )
+        client = TestClient(api.create_app())
+
+        response = self.submit(
+            client, valid_blueprint, valid_dockerinfo, [self.inline_input(500)]
+        )
+
+        assert response.status_code == 400
+        assert "exceeds the limit" in response.json()["detail"]
+        mock_engine.start_workflow.assert_not_called()
+
+
+class TestInlineMasking:
+    """Inline payloads are not echoed back through the API."""
+
+    @pytest.fixture
+    def task_with_inline(self):
+        from models.data_reference import DataReference, Format
+
+        task = create_mock_task(status=TaskStatus.COMPLETED)
+        return task.model_copy(
+            update={
+                "input_refs": [
+                    DataReference(protocol="file", uri="/shared/in.csv", format="csv")
+                ],
+                "output_refs": [
+                    DataReference.from_inline_data(b"secret,payload\n" * 4, Format.CSV)
+                ],
+            }
+        )
+
+    def test_task_list_masks_inline_output(self, client, mock_engine, task_with_inline):
+        mock_engine.get_workflow_status.return_value = create_mock_workflow()
+        mock_engine.get_all_tasks.return_value = [task_with_inline]
+
+        body = client.get("/workflows/wf-123/tasks").json()
+        refs = body["tasks"][0]["output_refs"]
+
+        assert refs[0]["uri"] == "<inline data, 60 bytes>"
+        assert "secret" not in response_text(body)
+
+    def test_task_list_keeps_locations(self, client, mock_engine, task_with_inline):
+        mock_engine.get_workflow_status.return_value = create_mock_workflow()
+        mock_engine.get_all_tasks.return_value = [task_with_inline]
+
+        body = client.get("/workflows/wf-123/tasks").json()
+
+        assert body["tasks"][0]["input_refs"][0]["uri"] == "/shared/in.csv"
+
+    def test_single_task_masks_inline_output(
+        self, client, mock_engine, task_with_inline
+    ):
+        mock_engine._state_store.get_task.return_value = task_with_inline
+
+        body = client.get("/workflows/wf-123/tasks/task-123").json()
+
+        assert body["output_refs"][0]["uri"].startswith("<inline data,")
+
+
+def response_text(body) -> str:
+    import json as _json
+
+    return _json.dumps(body)
+
+
+class TestServicesKeyStorage:
+    """The per-workflow services key is encrypted before it reaches Redis."""
+
+    def submit_with_key(self, client, blueprint, dockerinfo, key="super-secret-key"):
+        return client.post(
+            "/workflows",
+            json={
+                "blueprint": blueprint,
+                "dockerinfo": dockerinfo,
+                "services_api_key": key,
+            },
+        )
+
+    def build(self, mock_engine, bp, di, redis, **kwargs):
+        bp.parse_json.return_value = MagicMock()
+        di.parse_json.return_value = {}
+        api = OrchestratorAPI(mock_engine, bp, di, redis, **kwargs)
+        return TestClient(api.create_app())
+
+    def stored_value(self, mock_redis):
+        calls = [
+            c for c in mock_redis.set.call_args_list
+            if str(c[0][0]).startswith("services_key:")
+        ]
+        assert len(calls) == 1
+        return calls[0][0][1]
+
+    def test_key_encrypted_when_secret_configured(
+        self, mock_engine, mock_blueprint_parser, mock_dockerinfo_parser, mock_redis,
+        valid_blueprint, valid_dockerinfo,
+    ):
+        from services.secrets import PREFIX, SecretBox
+
+        box = SecretBox("a-passphrase")
+        client = self.build(
+            mock_engine, mock_blueprint_parser, mock_dockerinfo_parser, mock_redis,
+            secrets=box,
+        )
+
+        self.submit_with_key(client, valid_blueprint, valid_dockerinfo)
+        stored = self.stored_value(mock_redis)
+
+        assert stored.startswith(PREFIX)
+        assert "super-secret-key" not in stored
+        assert box.decrypt(stored) == "super-secret-key"
+
+    def test_key_stored_plainly_without_secret(
+        self, mock_engine, mock_blueprint_parser, mock_dockerinfo_parser, mock_redis,
+        valid_blueprint, valid_dockerinfo,
+    ):
+        from services.secrets import SecretBox
+
+        client = self.build(
+            mock_engine, mock_blueprint_parser, mock_dockerinfo_parser, mock_redis,
+            secrets=SecretBox(None),
+        )
+
+        self.submit_with_key(client, valid_blueprint, valid_dockerinfo)
+
+        assert self.stored_value(mock_redis) == "super-secret-key"

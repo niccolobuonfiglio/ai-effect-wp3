@@ -583,3 +583,76 @@ class TestProcessTaskWithBreaker:
     def test_negative_retry_delay_rejected(self, mock_engine, mock_client, endpoints):
         with pytest.raises(ValueError, match="blocked_retry_delay"):
             Worker(mock_engine, mock_client, endpoints, blocked_retry_delay=-1)
+
+
+class TestDataPolicyAndScheme:
+    """Tests for endpoint schemes and limits on returned data."""
+
+    @pytest.fixture
+    def https_endpoints(self):
+        from services.dockerinfo_parser import ServiceEndpoint as SE
+
+        return {"service-a": SE(address="service-a", port=8443, scheme="https")}
+
+    def test_https_endpoint_is_called_over_https(
+        self, mock_engine, mock_client, https_endpoints, sample_task, sample_output
+    ):
+        worker = Worker(mock_engine, mock_client, https_endpoints, poll_interval=0.01)
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="complete", output=sample_output
+        )
+
+        worker.process_task("wf-123")
+
+        assert mock_client.execute.call_args.kwargs["base_url"] == "https://service-a:8443"
+
+    def test_oversized_inline_output_fails_task(
+        self, mock_engine, mock_client, endpoints, sample_task
+    ):
+        from models.data_reference import DataReference, Format
+        from services.privacy import DataPolicy
+
+        worker = Worker(
+            mock_engine,
+            mock_client,
+            endpoints,
+            poll_interval=0.01,
+            policy=DataPolicy(max_inline_bytes=16),
+        )
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="complete",
+            output=DataReference.from_inline_data(b"x" * 500, Format.CSV),
+        )
+
+        result = worker.process_task("wf-123")
+
+        assert result is True
+        mock_engine.complete_task.assert_not_called()
+        mock_engine.fail_task.assert_called_once()
+        assert "data policy" in mock_engine.fail_task.call_args[0][2]
+
+    def test_small_inline_output_accepted(
+        self, mock_engine, mock_client, endpoints, sample_task
+    ):
+        from models.data_reference import DataReference, Format
+        from services.privacy import DataPolicy
+
+        worker = Worker(
+            mock_engine,
+            mock_client,
+            endpoints,
+            poll_interval=0.01,
+            policy=DataPolicy(max_inline_bytes=1024),
+        )
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="complete",
+            output=DataReference.from_inline_data(b"small", Format.CSV),
+        )
+
+        worker.process_task("wf-123")
+
+        mock_engine.complete_task.assert_called_once()
+        mock_engine.fail_task.assert_not_called()

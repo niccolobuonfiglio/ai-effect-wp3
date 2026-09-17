@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from redis import Redis
 
 from services.log_service import get_alerts_logger
+from services.privacy import sanitize_error
 
 logger = logging.getLogger(__name__)
 alerts_logger = get_alerts_logger()
@@ -244,6 +245,7 @@ class CircuitBreaker:
         if not service_name or not service_name.strip():
             raise ValueError("service_name is required")
 
+        error = sanitize_error(error)
         data = self._load(service_name)
         count = int(data.get("failure_count", 0)) + 1
         now = self._now()

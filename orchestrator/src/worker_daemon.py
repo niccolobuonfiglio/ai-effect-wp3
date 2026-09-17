@@ -13,6 +13,8 @@ from services.circuit_breaker import CircuitBreaker
 from services.control_client import ControlClient
 from services.dockerinfo_parser import ServiceEndpoint
 from services.log_service import configure_logging
+from services.privacy import DataPolicy
+from services.secrets import SecretBox, SecretDecryptionError
 from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
 from services.worker import Worker
@@ -36,7 +38,11 @@ class WorkerDaemon:
         state_store = RedisStateStore(redis_client)
         task_queue = RedisTaskQueue(redis_client)
         self.engine = WorkflowEngine(state_store, task_queue, redis_client)
-        self.control_client = ControlClient()
+
+        # TLS verification for https service endpoints; a CA bundle path is
+        # also accepted for private certificates.
+        self.verify = self._tls_verify(os.environ.get("SERVICE_TLS_VERIFY", "true"))
+        self.control_client = ControlClient(verify=self.verify)
 
         # Shared circuit breaker: state lives in Redis, so every worker
         # replica and the API observe the same service health.
@@ -49,6 +55,18 @@ class WorkerDaemon:
         self.blocked_retry_delay = float(
             os.environ.get("BLOCKED_TASK_RETRY_DELAY", "30")
         )
+        self.policy = DataPolicy.from_env()
+        self.secrets = SecretBox.from_env()
+
+    @staticmethod
+    def _tls_verify(value: str) -> bool | str:
+        """Read SERVICE_TLS_VERIFY as a flag, or as a path to a CA bundle."""
+        setting = (value or "").strip()
+        if setting.lower() in ("0", "false", "no", "off"):
+            return False
+        if setting.lower() in ("", "1", "true", "yes", "on"):
+            return True
+        return setting
 
     def load_endpoints(self, workflow_id: str) -> dict[str, ServiceEndpoint]:
         """Load service endpoints for a workflow from Redis."""
@@ -89,8 +107,16 @@ class WorkerDaemon:
         return running
 
     def load_services_key(self, workflow_id: str) -> str | None:
-        """Load services API key for a workflow from Redis."""
-        return self.redis_client.get(f"services_key:{workflow_id}")
+        """Load and decrypt the services API key for a workflow."""
+        stored = self.redis_client.get(f"services_key:{workflow_id}")
+        try:
+            return self.secrets.decrypt(stored)
+        except SecretDecryptionError as e:
+            logger.error(
+                "Cannot read services API key for workflow %s: %s", workflow_id, e,
+                extra={"event": "services_key_unreadable", "workflow_id": workflow_id},
+            )
+            return None
 
     def process_workflow(self, workflow_id: str) -> bool:
         """Process one task for a workflow.
@@ -103,13 +129,18 @@ class WorkerDaemon:
             return False
 
         services_key = self.load_services_key(workflow_id)
-        client = ControlClient(api_key=services_key) if services_key else self.control_client
+        client = (
+            ControlClient(api_key=services_key, verify=self.verify)
+            if services_key
+            else self.control_client
+        )
         worker = Worker(
             self.engine,
             client,
             endpoints,
             breaker=self.breaker,
             blocked_retry_delay=self.blocked_retry_delay,
+            policy=self.policy,
         )
         return worker.process_task(workflow_id, timeout=0)
 

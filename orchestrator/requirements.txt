@@ -3,6 +3,7 @@ grpcio-tools>=1.50.0
 protobuf>=4.25.8
 pydantic>=2.0.0
 redis>=5.0.0
+cryptography>=42.0.0
 httpx>=0.25.0
 httpx2>=0.1.0
 fastapi>=0.100.0

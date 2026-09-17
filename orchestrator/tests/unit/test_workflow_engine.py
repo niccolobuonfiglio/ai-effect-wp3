@@ -754,3 +754,40 @@ class TestBlockedTasks:
             engine.defer_task("wf", "t", "", delay=0)
         with pytest.raises(ValueError, match="service_name"):
             engine.resume_blocked_tasks("wf", "")
+
+
+class TestErrorSanitising:
+    """Errors stored on tasks and workflows are redacted and capped."""
+
+    def failing_workflow(self, engine, error, workflow_id="wf-san"):
+        engine.initialize_workflow(workflow_id, create_single_node_graph())
+        engine.start_workflow(workflow_id)
+        task = engine.claim_task(workflow_id, timeout=1)
+        engine.fail_task(workflow_id, task.task_id, error)
+        return workflow_id, task.task_id
+
+    def test_email_removed_from_task_and_workflow(self, engine, state_store):
+        wf, task_id = self.failing_workflow(engine, "bad row for jane.doe@example.eu")
+
+        assert "jane.doe@example.eu" not in state_store.get_task(wf, task_id).error
+        assert "jane.doe@example.eu" not in state_store.get_workflow(wf).error
+
+    def test_long_error_truncated(self, engine, state_store):
+        wf, task_id = self.failing_workflow(engine, "x" * 2000)
+
+        assert len(state_store.get_task(wf, task_id).error) < 600
+
+    def test_ordinary_error_unchanged(self, engine, state_store):
+        message = "Connection failed: [Errno 111] Connection refused"
+        wf, task_id = self.failing_workflow(engine, message)
+
+        assert state_store.get_task(wf, task_id).error == message
+
+    def test_blocked_reason_sanitised(self, engine, state_store):
+        engine.initialize_workflow("wf-san2", create_single_node_graph())
+        engine.start_workflow("wf-san2")
+        task = engine.claim_task("wf-san2", timeout=1)
+
+        engine.defer_task("wf-san2", task.task_id, "down for user@example.eu", delay=60)
+
+        assert "user@example.eu" not in state_store.get_task("wf-san2", task.task_id).error

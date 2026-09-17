@@ -484,3 +484,22 @@ class TestServiceHealthModel:
         assert data["failure_count"] == 3
         assert data["last_error"] == "boom"
         assert data["last_success"] is None
+
+
+class TestErrorSanitising:
+    def test_last_error_is_redacted(self, breaker):
+        breaker.record_failure(SERVICE, BASE_URL, "failed for jane.doe@example.eu")
+
+        assert "jane.doe@example.eu" not in breaker.get_health(SERVICE).last_error
+
+    def test_last_error_is_capped(self, breaker):
+        breaker.record_failure(SERVICE, BASE_URL, "y" * 3000)
+
+        assert len(breaker.get_health(SERVICE).last_error) < 600
+
+    def test_alert_carries_the_sanitised_error(self, breaker, caplog):
+        with caplog.at_level(logging.ERROR, logger=ALERTS_LOGGER):
+            fail(breaker, 3, error="boom for jane.doe@example.eu")
+
+        record = next(r for r in caplog.records if getattr(r, "alert", None) == "SERVICE_DOWN")
+        assert "jane.doe@example.eu" not in record.last_error

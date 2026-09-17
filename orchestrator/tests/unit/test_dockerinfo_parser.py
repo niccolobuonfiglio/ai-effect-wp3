@@ -370,3 +370,60 @@ class TestEndpointMapping:
         assert len(endpoints) == 1
         assert endpoints["service-a"].address == "second"
         assert endpoints["service-a"].port == 9090
+
+
+class TestServiceScheme:
+    """Tests for http/https endpoint schemes."""
+
+    @staticmethod
+    def dockerinfo(**extra):
+        entry = {"container_name": "svc", "ip_address": "svc-host", "port": "8080"}
+        entry.update(extra)
+        return {"docker_info_list": [entry]}
+
+    def test_defaults_to_http(self):
+        endpoints = DockerInfoParser().parse_json(self.dockerinfo())
+
+        assert endpoints["svc"].scheme == "http"
+        assert endpoints["svc"].base_url == "http://svc-host:8080"
+
+    def test_entry_can_request_https(self):
+        endpoints = DockerInfoParser().parse_json(self.dockerinfo(scheme="https"))
+
+        assert endpoints["svc"].base_url == "https://svc-host:8080"
+
+    def test_default_scheme_argument(self):
+        endpoints = DockerInfoParser(default_scheme="https").parse_json(self.dockerinfo())
+
+        assert endpoints["svc"].base_url == "https://svc-host:8080"
+
+    def test_default_scheme_from_env(self, monkeypatch):
+        monkeypatch.setenv("SERVICE_SCHEME", "https")
+        endpoints = DockerInfoParser().parse_json(self.dockerinfo())
+
+        assert endpoints["svc"].base_url == "https://svc-host:8080"
+
+    def test_entry_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("SERVICE_SCHEME", "https")
+        endpoints = DockerInfoParser().parse_json(self.dockerinfo(scheme="http"))
+
+        assert endpoints["svc"].base_url == "http://svc-host:8080"
+
+    def test_unknown_entry_scheme_rejected(self):
+        with pytest.raises(DockerInfoParseError, match="scheme"):
+            DockerInfoParser().parse_json(self.dockerinfo(scheme="ftp"))
+
+    def test_unknown_default_scheme_rejected(self):
+        with pytest.raises(ValueError, match="default_scheme"):
+            DockerInfoParser(default_scheme="ftp")
+
+    def test_endpoint_round_trips_through_json(self):
+        """Endpoints are stored in Redis as JSON and rebuilt by the worker."""
+        endpoint = ServiceEndpoint(address="svc", port=8080, scheme="https")
+
+        assert ServiceEndpoint(**json.loads(endpoint.model_dump_json())).base_url == (
+            "https://svc:8080"
+        )
+
+    def test_old_stored_endpoint_without_scheme(self):
+        assert ServiceEndpoint(**{"address": "svc", "port": 8080}).scheme == "http"
