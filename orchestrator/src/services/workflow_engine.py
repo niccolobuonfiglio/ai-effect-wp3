@@ -143,6 +143,7 @@ class WorkflowEngine:
         task = self._state_store.update_task_status(
             workflow_id, task_id, TaskStatus.COMPLETED, output_refs=output_refs
         )
+        self._task_queue.reset_attempts(workflow_id, task_id)
 
         # Remove this task from dependents' dependency sets
         dependent_ids = self._redis.smembers(
@@ -198,6 +199,7 @@ class WorkflowEngine:
         task = self._state_store.update_task_status(
             workflow_id, task_id, TaskStatus.FAILED, error=error
         )
+        self._task_queue.reset_attempts(workflow_id, task_id)
 
         self._state_store.update_workflow_status(
             workflow_id, WorkflowStatus.FAILED, error=f"Task {task_id} failed: {error}"
@@ -225,6 +227,18 @@ class WorkflowEngine:
         )
         self._task_queue.schedule_task(workflow_id, task_id, delay)
         return task
+
+    def record_blocked_attempt(self, workflow_id: str, task_id: str) -> int:
+        """Count a deferral of this task and return the count (1 for the first).
+
+        The worker uses it to grow the retry delay; the count is cleared when
+        the task completes or fails.
+        """
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+        return self._task_queue.increment_attempts(workflow_id, task_id)
 
     def release_due_tasks(self, workflow_id: str) -> int:
         """Re-queue blocked tasks whose retry delay has elapsed."""

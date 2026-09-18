@@ -25,7 +25,7 @@ from test_service import ControlServiceRunner
 @pytest.fixture(scope="module")
 def test_service():
     """Start test service for module."""
-    runner = ControlServiceRunner(port=18082)
+    runner = ControlServiceRunner()
     runner.start()
     yield runner
     runner.stop()
@@ -66,7 +66,7 @@ def endpoints(test_service):
     """Endpoints pointing to test service."""
     # Parse host:port from base_url
     url = test_service.base_url
-    # http://127.0.0.1:18082 -> 127.0.0.1, 18082
+    # http://127.0.0.1:<port> -> 127.0.0.1, <port>
     host_port = url.replace("http://", "")
     host, port = host_port.split(":")
 

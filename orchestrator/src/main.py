@@ -38,6 +38,7 @@ def get_circuit_breaker(redis_client: redis.Redis) -> CircuitBreaker:
         failure_threshold=int(os.environ.get("CIRCUIT_FAILURE_THRESHOLD", "3")),
         reset_timeout=float(os.environ.get("CIRCUIT_RESET_TIMEOUT", "60")),
         degraded_threshold=int(os.environ.get("CIRCUIT_DEGRADED_THRESHOLD", "1")),
+        initial_reset_timeout=float(os.environ.get("CIRCUIT_RESET_INITIAL", "5")),
     )
 
 
@@ -95,8 +96,9 @@ def main() -> int:
     logger.info("Starting orchestrator API server")
     logger.info(f"Redis: {os.environ.get('REDIS_URL', 'redis://localhost:6379')}")
     logger.info(
-        "Circuit breaker: threshold=%s reset_timeout=%ss",
+        "Circuit breaker: threshold=%s reset_timeout=%s-%ss",
         os.environ.get("CIRCUIT_FAILURE_THRESHOLD", "3"),
+        os.environ.get("CIRCUIT_RESET_INITIAL", "5"),
         os.environ.get("CIRCUIT_RESET_TIMEOUT", "60"),
     )
     logger.info(

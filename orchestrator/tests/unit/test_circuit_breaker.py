@@ -503,3 +503,89 @@ class TestErrorSanitising:
 
         record = next(r for r in caplog.records if getattr(r, "alert", None) == "SERVICE_DOWN")
         assert "jane.doe@example.eu" not in record.last_error
+
+
+class TestProbeBackoff:
+    """With initial_reset_timeout the wait before a probe grows while the
+    service stays down, and starts over after it recovers."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        state = {"now": 1_000_000.0}
+        monkeypatch.setattr("services.circuit_breaker.time.time", lambda: state["now"])
+        return state
+
+    @pytest.fixture
+    def backoff_breaker(self, redis_client):
+        return CircuitBreaker(
+            redis_client, failure_threshold=1, reset_timeout=60, initial_reset_timeout=5
+        )
+
+    def open_circuit(self, breaker):
+        breaker.record_failure(SERVICE, BASE_URL, "refused")
+
+    def test_first_probe_after_initial_wait(self, backoff_breaker, clock):
+        self.open_circuit(backoff_breaker)
+
+        clock["now"] += 4.9
+        assert backoff_breaker.allow(SERVICE) is False
+        clock["now"] += 0.1
+        assert backoff_breaker.allow(SERVICE) is True
+
+    def test_wait_doubles_on_each_failed_probe(self, backoff_breaker, clock):
+        self.open_circuit(backoff_breaker)
+        waits = []
+        for _ in range(6):
+            opened = clock["now"]
+            while not backoff_breaker.allow(SERVICE):
+                clock["now"] += 1
+            waits.append(clock["now"] - opened)
+            backoff_breaker.record_failure(SERVICE, BASE_URL, "still refused")
+
+        assert waits == [5, 10, 20, 40, 60, 60]
+
+    def test_success_starts_over(self, backoff_breaker, clock):
+        self.open_circuit(backoff_breaker)
+        clock["now"] += 5
+        backoff_breaker.allow(SERVICE)
+        backoff_breaker.record_failure(SERVICE, BASE_URL, "still refused")  # streak 2
+
+        clock["now"] += 10
+        assert backoff_breaker.allow(SERVICE) is True
+        backoff_breaker.record_success(SERVICE, BASE_URL)
+
+        self.open_circuit(backoff_breaker)                                  # streak 1 again
+        clock["now"] += 5
+        assert backoff_breaker.allow(SERVICE) is True
+
+    def test_manual_reset_starts_over(self, backoff_breaker, clock):
+        self.open_circuit(backoff_breaker)
+        clock["now"] += 5
+        backoff_breaker.allow(SERVICE)
+        backoff_breaker.record_failure(SERVICE, BASE_URL, "still refused")  # streak 2
+
+        backoff_breaker.reset(SERVICE)
+        self.open_circuit(backoff_breaker)
+        clock["now"] += 5
+        assert backoff_breaker.allow(SERVICE) is True
+
+    def test_retry_after_reflects_current_wait(self, backoff_breaker, clock):
+        from datetime import datetime, timezone
+
+        self.open_circuit(backoff_breaker)
+        retry_after = datetime.fromisoformat(backoff_breaker.get_health(SERVICE).retry_after)
+
+        assert retry_after.timestamp() == pytest.approx(clock["now"] + 5)
+
+    def test_without_initial_every_wait_is_reset_timeout(self, redis_client, clock):
+        breaker = CircuitBreaker(redis_client, failure_threshold=1, reset_timeout=60)
+        breaker.record_failure(SERVICE, BASE_URL, "refused")
+
+        clock["now"] += 59
+        assert breaker.allow(SERVICE) is False
+        clock["now"] += 1
+        assert breaker.allow(SERVICE) is True
+
+    def test_invalid_initial_rejected(self, redis_client):
+        with pytest.raises(ValueError, match="initial_reset_timeout"):
+            CircuitBreaker(redis_client, initial_reset_timeout=0)

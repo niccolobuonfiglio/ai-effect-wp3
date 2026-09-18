@@ -791,3 +791,35 @@ class TestErrorSanitising:
         engine.defer_task("wf-san2", task.task_id, "down for user@example.eu", delay=60)
 
         assert "user@example.eu" not in state_store.get_task("wf-san2", task.task_id).error
+
+
+class TestBlockedAttempts:
+    """The engine counts deferrals per task and clears them when it ends."""
+
+    def start(self, engine, workflow_id="wf-att"):
+        engine.initialize_workflow(workflow_id, create_single_node_graph())
+        engine.start_workflow(workflow_id)
+        return workflow_id, engine.claim_task(workflow_id, timeout=1)
+
+    def test_counts_deferrals(self, engine):
+        wf, task = self.start(engine)
+
+        assert engine.record_blocked_attempt(wf, task.task_id) == 1
+        assert engine.record_blocked_attempt(wf, task.task_id) == 2
+
+    def test_completion_clears_count(self, engine, task_queue):
+        wf, task = self.start(engine)
+        engine.record_blocked_attempt(wf, task.task_id)
+        engine.record_blocked_attempt(wf, task.task_id)
+
+        engine.complete_task(wf, task.task_id)
+
+        assert task_queue.increment_attempts(wf, task.task_id) == 1
+
+    def test_failure_clears_count(self, engine, task_queue):
+        wf, task = self.start(engine, "wf-att2")
+        engine.record_blocked_attempt(wf, task.task_id)
+
+        engine.fail_task(wf, task.task_id, "boom")
+
+        assert task_queue.increment_attempts(wf, task.task_id) == 1

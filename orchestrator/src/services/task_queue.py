@@ -20,6 +20,25 @@ class RedisTaskQueue:
     def _delayed_key(self, workflow_id: str) -> str:
         return f"delayed:{workflow_id}"
 
+    def _attempts_key(self, workflow_id: str) -> str:
+        return f"attempts:{workflow_id}"
+
+    def increment_attempts(self, workflow_id: str, task_id: str) -> int:
+        """Count one more deferral of a task; returns the new count (1, 2, …)."""
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+        return int(self._redis.hincrby(self._attempts_key(workflow_id), task_id, 1))
+
+    def reset_attempts(self, workflow_id: str, task_id: str) -> None:
+        """Forget a task's deferral count, e.g. once it has finished."""
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+        self._redis.hdel(self._attempts_key(workflow_id), task_id)
+
     def enqueue_task(self, workflow_id: str, task_id: str) -> None:
         """Add task to workflow queue (FIFO)."""
         if not workflow_id:
@@ -146,4 +165,8 @@ class RedisTaskQueue:
         if not workflow_id:
             raise ValueError("workflow_id is required")
 
-        self._redis.delete(self._queue_key(workflow_id), self._delayed_key(workflow_id))
+        self._redis.delete(
+            self._queue_key(workflow_id),
+            self._delayed_key(workflow_id),
+            self._attempts_key(workflow_id),
+        )

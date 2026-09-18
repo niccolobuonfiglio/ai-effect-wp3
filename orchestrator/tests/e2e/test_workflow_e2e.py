@@ -4,7 +4,9 @@ Tests the full flow: API -> WorkflowEngine -> Worker -> Service -> Completion
 """
 
 import threading
+import sys
 import time
+from pathlib import Path
 
 import pytest
 import redis
@@ -22,6 +24,9 @@ from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
 from services.worker import Worker
 from services.workflow_engine import WorkflowEngine
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "fixtures"))
+from test_service import free_port, health_body, wait_until_ready  # noqa: E402
 
 
 # Inline test service (sequential pattern)
@@ -60,7 +65,7 @@ def create_test_service() -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        return {"status": "ok"}
+        return health_body()
 
     return app
 
@@ -68,9 +73,9 @@ def create_test_service() -> FastAPI:
 class ServiceRunner:
     """Runs test service in background thread."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 19080):
+    def __init__(self, host: str = "127.0.0.1", port: int | None = None):
         self.host = host
-        self.port = port
+        self.port = port if port is not None else free_port(host)
         self._server = None
         self._thread = None
 
@@ -87,17 +92,7 @@ class ServiceRunner:
         self._wait_for_ready()
 
     def _wait_for_ready(self, timeout: float = 5.0) -> None:
-        import httpx
-
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                with httpx.Client() as client:
-                    client.get(f"{self.base_url}/health")
-                    return
-            except httpx.ConnectError:
-                time.sleep(0.1)
-        raise RuntimeError("Test service did not start")
+        wait_until_ready(self.base_url, timeout)
 
     def stop(self) -> None:
         if self._server:
@@ -116,7 +111,7 @@ def redis_container():
 @pytest.fixture(scope="module")
 def test_service():
     """Start test service."""
-    service = ServiceRunner(port=19080)
+    service = ServiceRunner()
     service.start()
     yield service
     service.stop()
@@ -206,7 +201,7 @@ class TestSingleNodeWorkflow:
                 {
                     "container_name": "test-service",
                     "ip_address": "127.0.0.1",
-                    "port": "19080",
+                    "port": str(test_service.port),
                 }
             ]
         }
@@ -307,12 +302,12 @@ class TestMultiNodeWorkflow:
                 {
                     "container_name": "service-a",
                     "ip_address": "127.0.0.1",
-                    "port": "19080",
+                    "port": str(test_service.port),
                 },
                 {
                     "container_name": "service-b",
                     "ip_address": "127.0.0.1",
-                    "port": "19080",
+                    "port": str(test_service.port),
                 },
             ]
         }
@@ -377,7 +372,7 @@ class TestWorkflowFailure:
                 {
                     "container_name": "test-service",
                     "ip_address": "127.0.0.1",
-                    "port": "19080",
+                    "port": str(test_service.port),
                 }
             ]
         }

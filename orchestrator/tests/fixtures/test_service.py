@@ -1,5 +1,11 @@
-"""Test service implementing control interface for integration tests."""
+"""Test service implementing control interface for integration tests.
 
+Also holds the helpers every in-process test service uses (here and in
+``tests/e2e``): a free port per run, and a readiness check that confirms the
+answer comes from the test service itself.
+"""
+
+import socket
 import threading
 import time
 from typing import Any
@@ -7,6 +13,54 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+
+# Returned by every test service's /health. A readiness check that only waits
+# for *some* answer would accept a different server already bound to the port
+# (e.g. a use-case container), and the tests would then run against it.
+TEST_SERVICE_MARKER = "orchestrator-test-service"
+
+
+def free_port(host: str = "127.0.0.1") -> int:
+    """Ask the OS for a currently unused TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return sock.getsockname()[1]
+
+
+def health_body() -> dict:
+    """Body every test service returns from GET /health."""
+    return {"status": "ok", "service": TEST_SERVICE_MARKER}
+
+
+def wait_until_ready(base_url: str, timeout: float = 5.0) -> None:
+    """Wait until the test service at ``base_url`` answers /health.
+
+    Raises:
+        RuntimeError: nothing answered in time, or something *else* answered.
+    """
+    import httpx
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = httpx.get(f"{base_url}/health", timeout=1.0)
+        except httpx.TransportError:
+            time.sleep(0.1)
+            continue
+
+        try:
+            identity = response.json().get("service")
+        except ValueError:
+            identity = None
+        if response.status_code == 200 and identity == TEST_SERVICE_MARKER:
+            return
+        raise RuntimeError(
+            f"{base_url} is answered by a different server "
+            f"(HTTP {response.status_code}, service={identity!r}); "
+            f"the port is probably taken by another container"
+        )
+    raise RuntimeError(f"Test service at {base_url} did not start in {timeout}s")
 
 
 class ExecuteRequest(BaseModel):
@@ -109,6 +163,10 @@ def create_test_app() -> FastAPI:
             },
         }
 
+    @app.get("/health")
+    def health() -> dict:
+        return health_body()
+
     @app.post("/reset")
     def reset() -> dict:
         """Reset task store for testing."""
@@ -128,9 +186,16 @@ def create_test_app() -> FastAPI:
 class ControlServiceRunner:
     """Runs control service in background thread for testing."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 18080):
+    def __init__(self, host: str = "127.0.0.1", port: int | None = None):
+        """Args:
+            host: Interface to bind.
+            port: Fixed port, or None to pick a free one. A fixed port can
+                collide with a running use case (the file-based pipeline
+                publishes 18081-18084), and the readiness check would then be
+                answered by that container instead of this test service.
+        """
         self.host = host
-        self.port = port
+        self.port = port if port is not None else free_port(host)
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -155,18 +220,8 @@ class ControlServiceRunner:
         self._wait_for_ready()
 
     def _wait_for_ready(self, timeout: float = 5.0) -> None:
-        """Wait for server to be ready."""
-        import httpx
-
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                with httpx.Client() as client:
-                    client.post(f"{self.base_url}/reset")
-                    return
-            except httpx.ConnectError:
-                time.sleep(0.1)
-        raise RuntimeError("Test service did not start in time")
+        """Wait until this test service - and not another server - answers."""
+        wait_until_ready(self.base_url, timeout)
 
     def stop(self) -> None:
         """Stop the test service."""

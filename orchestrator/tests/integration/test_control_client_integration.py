@@ -16,7 +16,7 @@ from test_service import ControlServiceRunner
 @pytest.fixture(scope="module")
 def test_service():
     """Start test service for module."""
-    runner = ControlServiceRunner(port=18081)
+    runner = ControlServiceRunner()
     runner.start()
     yield runner
     runner.stop()

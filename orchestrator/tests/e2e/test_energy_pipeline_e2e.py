@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import redis
@@ -23,6 +24,9 @@ from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
 from services.worker import Worker
 from services.workflow_engine import WorkflowEngine
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "fixtures"))
+from test_service import free_port, health_body, wait_until_ready  # noqa: E402
 
 
 # Inline service implementations for testing
@@ -67,7 +71,7 @@ def create_input_provider() -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        return health_body()
 
     return app
 
@@ -99,7 +103,7 @@ def create_data_generator() -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        return health_body()
 
     return app
 
@@ -123,7 +127,7 @@ def create_data_analyzer() -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        return health_body()
 
     return app
 
@@ -147,7 +151,7 @@ def create_report_generator() -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        return health_body()
 
     return app
 
@@ -155,10 +159,10 @@ def create_report_generator() -> FastAPI:
 class ServiceRunner:
     """Runs a service in background thread."""
 
-    def __init__(self, app: FastAPI, host: str = "127.0.0.1", port: int = 8080):
+    def __init__(self, app: FastAPI, host: str = "127.0.0.1", port: int | None = None):
         self.app = app
         self.host = host
-        self.port = port
+        self.port = port if port is not None else free_port(host)
         self._server = None
         self._thread = None
 
@@ -176,17 +180,7 @@ class ServiceRunner:
         self._wait_for_ready()
 
     def _wait_for_ready(self, timeout: float = 5.0) -> None:
-        import httpx
-
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                with httpx.Client() as client:
-                    client.get(f"{self.base_url}/health")
-                    return
-            except httpx.ConnectError:
-                time.sleep(0.1)
-        raise RuntimeError(f"Service did not start on port {self.port}")
+        wait_until_ready(self.base_url, timeout)
 
     def stop(self) -> None:
         if self._server:
@@ -206,10 +200,10 @@ def redis_container():
 def services():
     """Start all pipeline services."""
     runners = {
-        "input_provider1": ServiceRunner(create_input_provider(), port=19081),
-        "data_generator1": ServiceRunner(create_data_generator(), port=19082),
-        "data_analyzer1": ServiceRunner(create_data_analyzer(), port=19083),
-        "report_generator1": ServiceRunner(create_report_generator(), port=19084),
+        "input_provider1": ServiceRunner(create_input_provider()),
+        "data_generator1": ServiceRunner(create_data_generator()),
+        "data_analyzer1": ServiceRunner(create_data_analyzer()),
+        "report_generator1": ServiceRunner(create_report_generator()),
     }
 
     for runner in runners.values():
@@ -372,22 +366,22 @@ class TestEnergyPipelineE2E:
                 {
                     "container_name": "input_provider1",
                     "ip_address": "127.0.0.1",
-                    "port": "19081",
+                    "port": str(services["input_provider1"].port),
                 },
                 {
                     "container_name": "data_generator1",
                     "ip_address": "127.0.0.1",
-                    "port": "19082",
+                    "port": str(services["data_generator1"].port),
                 },
                 {
                     "container_name": "data_analyzer1",
                     "ip_address": "127.0.0.1",
-                    "port": "19083",
+                    "port": str(services["data_analyzer1"].port),
                 },
                 {
                     "container_name": "report_generator1",
                     "ip_address": "127.0.0.1",
-                    "port": "19084",
+                    "port": str(services["report_generator1"].port),
                 },
             ]
         }

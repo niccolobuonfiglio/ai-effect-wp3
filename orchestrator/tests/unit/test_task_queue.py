@@ -286,3 +286,34 @@ class TestDelayedTasks:
         queue.clear_queue("wf-1")
 
         assert queue.delayed_tasks("wf-1") == []
+
+
+class TestRetryAttempts:
+    """Per-task deferral counts that drive the retry backoff."""
+
+    def test_counts_up_from_one(self, queue):
+        assert [queue.increment_attempts("wf-1", "task-1") for _ in range(3)] == [1, 2, 3]
+
+    def test_counts_are_per_task(self, queue):
+        queue.increment_attempts("wf-1", "task-1")
+
+        assert queue.increment_attempts("wf-1", "task-2") == 1
+
+    def test_reset_starts_over(self, queue):
+        queue.increment_attempts("wf-1", "task-1")
+        queue.increment_attempts("wf-1", "task-1")
+        queue.reset_attempts("wf-1", "task-1")
+
+        assert queue.increment_attempts("wf-1", "task-1") == 1
+
+    def test_clear_queue_removes_counts(self, queue):
+        queue.increment_attempts("wf-1", "task-1")
+        queue.clear_queue("wf-1")
+
+        assert queue.increment_attempts("wf-1", "task-1") == 1
+
+    def test_ids_required(self, queue):
+        with pytest.raises(ValueError, match="workflow_id"):
+            queue.increment_attempts("", "task-1")
+        with pytest.raises(ValueError, match="task_id"):
+            queue.reset_attempts("wf-1", "")

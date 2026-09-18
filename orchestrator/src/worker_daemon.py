@@ -51,9 +51,13 @@ class WorkerDaemon:
             failure_threshold=int(os.environ.get("CIRCUIT_FAILURE_THRESHOLD", "3")),
             reset_timeout=float(os.environ.get("CIRCUIT_RESET_TIMEOUT", "60")),
             degraded_threshold=int(os.environ.get("CIRCUIT_DEGRADED_THRESHOLD", "1")),
+            initial_reset_timeout=float(os.environ.get("CIRCUIT_RESET_INITIAL", "5")),
         )
         self.blocked_retry_delay = float(
             os.environ.get("BLOCKED_TASK_RETRY_DELAY", "30")
+        )
+        self.blocked_retry_initial = float(
+            os.environ.get("BLOCKED_TASK_RETRY_INITIAL", "2")
         )
         self.policy = DataPolicy.from_env()
         self.secrets = SecretBox.from_env()
@@ -140,6 +144,7 @@ class WorkerDaemon:
             endpoints,
             breaker=self.breaker,
             blocked_retry_delay=self.blocked_retry_delay,
+            blocked_retry_initial=self.blocked_retry_initial,
             policy=self.policy,
         )
         return worker.process_task(workflow_id, timeout=0)

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from redis import Redis
 
+from services.backoff import backoff_delay
 from services.log_service import get_alerts_logger
 from services.privacy import sanitize_error
 
@@ -84,9 +85,14 @@ class CircuitBreaker:
     Args:
         redis_client: Shared Redis connection.
         failure_threshold: Consecutive failures before the circuit opens.
-        reset_timeout: Seconds before an open circuit allows one probe call.
+        reset_timeout: Longest wait before an open circuit allows one probe
+            call.
         degraded_threshold: Failure count at which a closed circuit reports
             DEGRADED rather than HEALTHY.
+        initial_reset_timeout: Wait before the first probe after the circuit
+            opens. Each consecutive re-open doubles it, up to
+            ``reset_timeout``; a successful call starts over. None (the
+            default) means no backoff: every wait is ``reset_timeout``.
     """
 
     def __init__(
@@ -95,6 +101,7 @@ class CircuitBreaker:
         failure_threshold: int = 3,
         reset_timeout: float = 60.0,
         degraded_threshold: int = 1,
+        initial_reset_timeout: float | None = None,
     ):
         if redis_client is None:
             raise ValueError("redis_client is required")
@@ -104,10 +111,15 @@ class CircuitBreaker:
             raise ValueError("reset_timeout must be positive")
         if degraded_threshold <= 0:
             raise ValueError("degraded_threshold must be positive")
+        if initial_reset_timeout is not None and initial_reset_timeout <= 0:
+            raise ValueError("initial_reset_timeout must be positive")
 
         self._redis = redis_client
         self._threshold = failure_threshold
         self._reset_timeout = reset_timeout
+        self._initial_reset_timeout = (
+            reset_timeout if initial_reset_timeout is None else initial_reset_timeout
+        )
         self._degraded_threshold = degraded_threshold
 
     # ------------------------------------------------------------------
@@ -126,6 +138,15 @@ class CircuitBreaker:
 
     def _save(self, service_name: str, data: dict) -> None:
         self._redis.hset(REGISTRY_KEY, service_name, json.dumps(data))
+
+    def _probe_wait(self, data: dict) -> float:
+        """Seconds an open circuit waits before its next probe.
+
+        Grows with ``open_streak``, the number of times in a row the circuit
+        has opened without a successful call in between.
+        """
+        streak = max(1, int(data.get("open_streak", 1)))
+        return backoff_delay(streak, self._initial_reset_timeout, self._reset_timeout)
 
     @staticmethod
     def _now() -> str:
@@ -189,7 +210,7 @@ class CircuitBreaker:
             return True
 
         opened_ts = float(data.get("opened_ts", 0))
-        if time.time() - opened_ts >= self._reset_timeout:
+        if time.time() - opened_ts >= self._probe_wait(data):
             data["state"] = STATE_HALF_OPEN
             self._save(service_name, data)
             logger.info(
@@ -267,6 +288,7 @@ class CircuitBreaker:
             data["state"] = STATE_OPEN
             data["opened_ts"] = time.time()
             data["opened_at"] = now
+            data["open_streak"] = int(data.get("open_streak", 0)) + 1
             self._save(service_name, data)
             self._alert(
                 logging.ERROR,
@@ -381,7 +403,7 @@ class CircuitBreaker:
         retry_after = None
         if state == STATE_OPEN and "opened_ts" in data:
             retry_after = datetime.fromtimestamp(
-                float(data["opened_ts"]) + self._reset_timeout, tz=timezone.utc
+                float(data["opened_ts"]) + self._probe_wait(data), tz=timezone.utc
             ).isoformat()
 
         return ServiceHealth(

@@ -656,3 +656,62 @@ class TestDataPolicyAndScheme:
 
         mock_engine.complete_task.assert_called_once()
         mock_engine.fail_task.assert_not_called()
+
+
+class TestBlockedRetryBackoff:
+    """Retry delays grow with each deferral of the same task."""
+
+    @pytest.fixture
+    def breaker(self):
+        import fakeredis
+
+        from services.circuit_breaker import CircuitBreaker
+
+        return CircuitBreaker(fakeredis.FakeRedis(decode_responses=True), failure_threshold=100)
+
+    def worker(self, mock_engine, mock_client, endpoints, breaker, **kwargs):
+        return Worker(
+            mock_engine, mock_client, endpoints, poll_interval=0.01, breaker=breaker, **kwargs
+        )
+
+    def delays_for(self, worker, mock_engine, mock_client, sample_task, attempts):
+        mock_engine.claim_task.return_value = sample_task
+        mock_engine.record_blocked_attempt.side_effect = attempts
+        mock_client.execute.side_effect = ControlClientError("Connection failed", transient=True)
+        for _ in attempts:
+            worker.process_task("wf-123")
+        return [c.kwargs["delay"] for c in mock_engine.defer_task.call_args_list]
+
+    def test_delays_double_up_to_the_cap(
+        self, mock_engine, mock_client, endpoints, breaker, sample_task
+    ):
+        worker = self.worker(
+            mock_engine, mock_client, endpoints, breaker,
+            blocked_retry_delay=30, blocked_retry_initial=2,
+        )
+
+        delays = self.delays_for(worker, mock_engine, mock_client, sample_task, [1, 2, 3, 4, 5, 6])
+
+        assert delays == [2, 4, 8, 16, 30, 30]
+
+    def test_without_initial_delay_is_fixed(
+        self, mock_engine, mock_client, endpoints, breaker, sample_task
+    ):
+        worker = self.worker(mock_engine, mock_client, endpoints, breaker, blocked_retry_delay=30)
+
+        delays = self.delays_for(worker, mock_engine, mock_client, sample_task, [1, 2, 3])
+
+        assert delays == [30, 30, 30]
+
+    def test_attempt_recorded_for_the_right_task(
+        self, mock_engine, mock_client, endpoints, breaker, sample_task
+    ):
+        worker = self.worker(mock_engine, mock_client, endpoints, breaker, blocked_retry_initial=2)
+
+        self.delays_for(worker, mock_engine, mock_client, sample_task, [1])
+
+        mock_engine.record_blocked_attempt.assert_called_once_with("wf-123", "task-123")
+
+    def test_invalid_initial_rejected(self, mock_engine, mock_client, endpoints):
+        with pytest.raises(ValueError, match="blocked_retry_initial"):
+            Worker(mock_engine, mock_client, endpoints, blocked_retry_initial=0)

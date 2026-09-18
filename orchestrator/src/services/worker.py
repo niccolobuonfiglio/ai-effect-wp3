@@ -4,6 +4,7 @@ import logging
 import time
 
 from models.data_reference import DataReference
+from services.backoff import backoff_delay
 from services.circuit_breaker import CircuitBreaker
 from services.control_client import ControlClient, ControlClientError
 from services.dockerinfo_parser import ServiceEndpoint
@@ -31,6 +32,7 @@ class Worker:
         breaker: CircuitBreaker | None = None,
         blocked_retry_delay: float = 30.0,
         policy: DataPolicy | None = None,
+        blocked_retry_initial: float | None = None,
     ):
         """Initialize worker with dependencies.
 
@@ -42,7 +44,11 @@ class Worker:
             breaker: Optional circuit breaker tracking per-service health.
                 When set, tasks for unavailable services are parked (BLOCKED)
                 instead of failing the workflow.
-            blocked_retry_delay: Seconds before a BLOCKED task is re-queued.
+            blocked_retry_delay: Longest wait before a BLOCKED task is
+                re-queued.
+            blocked_retry_initial: Wait before the first retry; it doubles on
+                each further deferral, up to ``blocked_retry_delay``. None
+                means no backoff: every wait is ``blocked_retry_delay``.
             policy: Limits on the data references a service may return.
         """
         if engine is None:
@@ -55,6 +61,8 @@ class Worker:
             raise ValueError("poll_interval must be positive")
         if blocked_retry_delay < 0:
             raise ValueError("blocked_retry_delay must be non-negative")
+        if blocked_retry_initial is not None and blocked_retry_initial <= 0:
+            raise ValueError("blocked_retry_initial must be positive")
 
         self._engine = engine
         self._client = client
@@ -62,6 +70,7 @@ class Worker:
         self._poll_interval = poll_interval
         self._breaker = breaker
         self._blocked_retry_delay = blocked_retry_delay
+        self._blocked_retry_initial = blocked_retry_initial
         self._policy = policy or DataPolicy.from_env()
 
     def process_task(self, workflow_id: str, timeout: float = 0) -> bool:
@@ -220,22 +229,31 @@ class Worker:
         )
         return True
 
+    def _retry_delay(self, attempt: int) -> float:
+        """Wait before retry ``attempt`` of a blocked task."""
+        if self._blocked_retry_delay == 0:
+            return 0.0
+        initial = self._blocked_retry_initial or self._blocked_retry_delay
+        return backoff_delay(attempt, initial, self._blocked_retry_delay)
+
     def _defer(self, workflow_id: str, task_id: str, reason: str) -> None:
         """Park a task until its service is healthy, keeping the workflow alive."""
-        self._engine.defer_task(
-            workflow_id, task_id, reason, delay=self._blocked_retry_delay
-        )
+        attempt = int(self._engine.record_blocked_attempt(workflow_id, task_id))
+        delay = self._retry_delay(attempt)
+        self._engine.defer_task(workflow_id, task_id, reason, delay=delay)
         logger.warning(
-            "Task %s of workflow %s blocked, retry in %ss: %s",
+            "Task %s of workflow %s blocked (attempt %d), retry in %ss: %s",
             task_id,
             workflow_id,
-            self._blocked_retry_delay,
+            attempt,
+            delay,
             reason,
             extra={
                 "event": "task_blocked",
                 "workflow_id": workflow_id,
                 "task_id": task_id,
-                "retry_delay": self._blocked_retry_delay,
+                "attempt": attempt,
+                "retry_delay": delay,
             },
         )
 
