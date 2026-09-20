@@ -24,8 +24,10 @@ services:
       - ORCHESTRATOR_API_KEY=${ORCHESTRATOR_API_KEY:-}
       - ORCHESTRATOR_SECRET=${ORCHESTRATOR_SECRET:-}
       - LOG_FORMAT=${LOG_FORMAT:-text}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-7}
       - CIRCUIT_FAILURE_THRESHOLD=${CIRCUIT_FAILURE_THRESHOLD:-3}
       - CIRCUIT_RESET_INITIAL=${CIRCUIT_RESET_INITIAL:-5}
+      - ALERT_REPEAT_SECONDS=${ALERT_REPEAT_SECONDS:-900}
       - CIRCUIT_RESET_TIMEOUT=${CIRCUIT_RESET_TIMEOUT:-60}
       - CIRCUIT_DEGRADED_THRESHOLD=${CIRCUIT_DEGRADED_THRESHOLD:-1}
       - SERVICE_SCHEME=${SERVICE_SCHEME:-http}
@@ -37,6 +39,10 @@ services:
         condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      # Shared by API and workers: each process writes its own log and alert
+      # files, and the dashboard (served by the API) reads them all.
+      - orchestrator_logs:/app/src/logs
 
   worker:
     restart: unless-stopped
@@ -49,12 +55,15 @@ services:
       - WORKER_POLL_INTERVAL=1.0
       - ORCHESTRATOR_API_KEY=${ORCHESTRATOR_API_KEY:-}
       - LOG_FORMAT=${LOG_FORMAT:-text}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-7}
       - CIRCUIT_FAILURE_THRESHOLD=${CIRCUIT_FAILURE_THRESHOLD:-3}
       - CIRCUIT_RESET_INITIAL=${CIRCUIT_RESET_INITIAL:-5}
+      - ALERT_REPEAT_SECONDS=${ALERT_REPEAT_SECONDS:-900}
       - CIRCUIT_RESET_TIMEOUT=${CIRCUIT_RESET_TIMEOUT:-60}
       - CIRCUIT_DEGRADED_THRESHOLD=${CIRCUIT_DEGRADED_THRESHOLD:-1}
       - BLOCKED_TASK_RETRY_INITIAL=${BLOCKED_TASK_RETRY_INITIAL:-2}
       - BLOCKED_TASK_RETRY_DELAY=${BLOCKED_TASK_RETRY_DELAY:-30}
+      - BLOCKED_TASK_MAX_AGE=${BLOCKED_TASK_MAX_AGE:-0}
       - ORCHESTRATOR_SECRET=${ORCHESTRATOR_SECRET:-}
       - SERVICE_SCHEME=${SERVICE_SCHEME:-http}
       - SERVICE_TLS_VERIFY=${SERVICE_TLS_VERIFY:-true}
@@ -71,6 +80,13 @@ services:
       - services
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      # Shared by API and workers: each process writes its own log and alert
+      # files, and the dashboard (served by the API) reads them all.
+      - orchestrator_logs:/app/src/logs
+
+volumes:
+  orchestrator_logs:
 
 networks:
   services:

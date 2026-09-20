@@ -715,3 +715,79 @@ class TestBlockedRetryBackoff:
     def test_invalid_initial_rejected(self, mock_engine, mock_client, endpoints):
         with pytest.raises(ValueError, match="blocked_retry_initial"):
             Worker(mock_engine, mock_client, endpoints, blocked_retry_initial=0)
+
+
+class TestBlockedMaxAge:
+    """A task blocked for too long fails instead of waiting forever."""
+
+    @pytest.fixture
+    def breaker(self):
+        import fakeredis
+
+        from services.circuit_breaker import CircuitBreaker
+
+        return CircuitBreaker(fakeredis.FakeRedis(decode_responses=True), failure_threshold=100)
+
+    def worker(self, mock_engine, mock_client, endpoints, breaker, **kwargs):
+        return Worker(
+            mock_engine, mock_client, endpoints, poll_interval=0.01, breaker=breaker, **kwargs
+        )
+
+    def run_once(self, worker, mock_engine, mock_client, sample_task, age):
+        mock_engine.claim_task.return_value = sample_task
+        mock_engine.record_blocked_attempt.return_value = 5
+        mock_engine.blocked_age.return_value = age
+        mock_client.execute.side_effect = ControlClientError("Connection failed", transient=True)
+        return worker.process_task("wf-123")
+
+    def test_still_blocks_below_the_limit(
+        self, mock_engine, mock_client, endpoints, breaker, sample_task
+    ):
+        worker = self.worker(mock_engine, mock_client, endpoints, breaker, blocked_max_age=3600)
+
+        self.run_once(worker, mock_engine, mock_client, sample_task, age=600)
+
+        mock_engine.defer_task.assert_called_once()
+        mock_engine.fail_task.assert_not_called()
+
+    def test_fails_above_the_limit(
+        self, mock_engine, mock_client, endpoints, breaker, sample_task
+    ):
+        worker = self.worker(mock_engine, mock_client, endpoints, breaker, blocked_max_age=3600)
+
+        result = self.run_once(worker, mock_engine, mock_client, sample_task, age=3601)
+
+        assert result is True
+        mock_engine.defer_task.assert_not_called()
+        mock_engine.fail_task.assert_called_once()
+        reason = mock_engine.fail_task.call_args[0][2]
+        assert "3601s" in reason and "3600s" in reason and "5 attempts" in reason
+        assert "Connection failed" in reason
+        assert "will be retried" not in reason        # it is giving up
+        assert "resubmit the workflow" in reason
+
+    def test_no_limit_by_default(
+        self, mock_engine, mock_client, endpoints, breaker, sample_task
+    ):
+        worker = self.worker(mock_engine, mock_client, endpoints, breaker)
+
+        self.run_once(worker, mock_engine, mock_client, sample_task, age=10_000_000)
+
+        mock_engine.defer_task.assert_called_once()
+        mock_engine.fail_task.assert_not_called()
+
+    def test_expiry_is_logged(
+        self, mock_engine, mock_client, endpoints, breaker, sample_task, caplog
+    ):
+        import logging
+
+        worker = self.worker(mock_engine, mock_client, endpoints, breaker, blocked_max_age=60)
+
+        with caplog.at_level(logging.ERROR, logger="services.worker"):
+            self.run_once(worker, mock_engine, mock_client, sample_task, age=61)
+
+        assert any(getattr(r, "event", None) == "blocked_task_expired" for r in caplog.records)
+
+    def test_negative_limit_rejected(self, mock_engine, mock_client, endpoints):
+        with pytest.raises(ValueError, match="blocked_max_age"):
+            Worker(mock_engine, mock_client, endpoints, blocked_max_age=-1)

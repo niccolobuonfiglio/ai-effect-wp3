@@ -4,9 +4,10 @@ Exposed as a factory returning an ``APIRouter`` so the routes can be mounted by
 ``OrchestratorAPI`` while keeping their dependencies explicit.
 
 Endpoints:
-    GET  /orchestrator/health/services
-    GET  /orchestrator/health/services/{service_name}
-    POST /orchestrator/health/services/{service_name}/recover
+    GET    /orchestrator/health/services
+    GET    /orchestrator/health/services/{service_name}
+    POST   /orchestrator/health/services/{service_name}/recover
+    DELETE /orchestrator/health/services/{service_name}
 """
 
 import logging
@@ -14,6 +15,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.models import (
+    DeregisterResponse,
     ErrorResponse,
     RecoveryResponse,
     RegisteredServiceResponse,
@@ -121,6 +123,30 @@ def create_health_router(
                 f"Circuit breaker reset; service marked healthy. "
                 f"{resumed} blocked task(s) re-queued."
             ),
+        )
+
+    @router.delete(
+        "/services/{service_name}",
+        response_model=DeregisterResponse,
+        responses={404: {"model": ErrorResponse}},
+        summary="Forget a service",
+    )
+    def deregister_service(service_name: str) -> DeregisterResponse:
+        """Remove a service from the registry and drop its health record.
+
+        Services are registered when a workflow is submitted and stay listed
+        afterwards, so services of use cases that are no longer running keep
+        appearing. This removes one. It is re-registered automatically if
+        another workflow uses it again.
+        """
+        if not registry.deregister(service_name):
+            raise HTTPException(
+                status_code=404, detail=f"Service not found: {service_name}"
+            )
+        return DeregisterResponse(
+            service_name=service_name,
+            removed=True,
+            message="Service removed from the registry and its health record dropped",
         )
 
     return router

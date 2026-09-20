@@ -2,10 +2,12 @@
 
 import os
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from redis import Redis
 
 _bearer = HTTPBearer(auto_error=False)
@@ -20,6 +22,7 @@ def _verify_orchestrator_key(
     if not credentials or credentials.credentials != api_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+from api.dashboard_routes import create_dashboard_router
 from api.health_routes import create_health_router
 from api.models import (
     DataReferenceResponse,
@@ -35,11 +38,16 @@ from models.data_reference import DataReference
 from services.blueprint_parser import BlueprintParseError, BlueprintParser
 from services.circuit_breaker import CircuitBreaker
 from services.dockerinfo_parser import DockerInfoParseError, DockerInfoParser
+from services.log_reader import LogReader
 from services.privacy import DataPolicy, DataPolicyError
 from services.secrets import SecretBox
 from services.service_registry import ServiceRegistry
 from services.state_store import WorkflowNotFoundError, TaskNotFoundError
+from services.workflow_catalog import WorkflowCatalog
 from services.workflow_engine import WorkflowEngine
+
+# The dashboard page served at /ui (a single static HTML file).
+UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
 
 class OrchestratorAPI:
@@ -55,6 +63,8 @@ class OrchestratorAPI:
         registry: ServiceRegistry | None = None,
         policy: DataPolicy | None = None,
         secrets: SecretBox | None = None,
+        catalog: WorkflowCatalog | None = None,
+        log_reader: LogReader | None = None,
     ):
         """Initialize API with dependencies."""
         if engine is None:
@@ -76,6 +86,8 @@ class OrchestratorAPI:
         )
         self._policy = policy or DataPolicy.from_env()
         self._secrets = secrets or SecretBox.from_env()
+        self._catalog = catalog or WorkflowCatalog(redis_client)
+        self._log_reader = log_reader or LogReader()
 
     def _reference_response(self, reference: DataReference) -> "DataReferenceResponse":
         """Build an API view of a reference, masking inline payloads."""
@@ -159,6 +171,9 @@ class OrchestratorAPI:
 
             # Initialize and start workflow
             self._engine.initialize_workflow(workflow_id, graph)
+            # Record it for the dashboard: the list view and, since the engine
+            # keeps no blueprint, the graph view.
+            self._catalog.register(workflow_id, request.blueprint)
             self._engine.start_workflow(workflow_id, initial_inputs)
 
             return WorkflowSubmitResponse(workflow_id=workflow_id, status="running")
@@ -270,6 +285,9 @@ class OrchestratorAPI:
             # Delete endpoints
             self._redis.delete(f"endpoints:{workflow_id}")
 
+            # Remove it from the dashboard's catalog
+            self._catalog.forget(workflow_id)
+
             # Clear queue
             self._engine._task_queue.clear_queue(workflow_id)
 
@@ -287,5 +305,21 @@ class OrchestratorAPI:
                 dependencies=[Depends(_verify_orchestrator_key)],
             )
         )
+
+        # Dashboard data routes (list, graph, logs, alerts)
+        app.include_router(
+            create_dashboard_router(
+                self._engine,
+                self._catalog,
+                self._registry,
+                log_reader=self._log_reader,
+                dependencies=[Depends(_verify_orchestrator_key)],
+            )
+        )
+
+        # Dashboard page. It holds no data itself; every call it makes goes
+        # through the routes above and needs the API key when one is set.
+        if UI_DIR.is_dir():
+            app.mount("/ui", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
 
         return app

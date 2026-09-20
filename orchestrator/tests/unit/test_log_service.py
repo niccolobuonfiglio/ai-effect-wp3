@@ -117,3 +117,40 @@ class TestConfigureLogging:
         configure_logging(log_dir=str(tmp_path), console=False)
 
         assert len(get_alerts_logger().handlers) == 1
+
+    def test_prunes_files_of_processes_that_are_gone(self, tmp_path, restore_logging):
+        import os
+        import time
+
+        stale = tmp_path / "worker-dead.log"
+        stale.write_text("old\n")
+        old = time.time() - 30 * 86400
+        os.utime(stale, (old, old))
+
+        configure_logging(log_dir=str(tmp_path), log_file="worker-me.log",
+                          alerts_file="alerts-worker-me.jsonl", console=False)
+
+        assert not stale.exists()
+        assert (tmp_path / "worker-me.log").exists()
+
+    def test_keeps_own_files_alive(self, tmp_path, restore_logging):
+        from services.log_retention import keepalive_paths
+
+        configure_logging(log_dir=str(tmp_path), log_file="worker-me.log",
+                          alerts_file="alerts-worker-me.jsonl", console=False)
+
+        assert keepalive_paths() == [tmp_path / "worker-me.log", tmp_path / "alerts-worker-me.jsonl"]
+
+    def test_retention_can_be_turned_off(self, tmp_path, restore_logging):
+        import os
+        import time
+
+        stale = tmp_path / "worker-dead.log"
+        stale.write_text("old\n")
+        old = time.time() - 30 * 86400
+        os.utime(stale, (old, old))
+
+        configure_logging(log_dir=str(tmp_path), console=False, manage_retention=False)
+
+        assert stale.exists()
+

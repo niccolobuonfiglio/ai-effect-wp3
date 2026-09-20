@@ -1,0 +1,9 @@
+# Keep local artefacts out of the build context and the image.
+# src/logs matters: the logs volume is seeded from the image on first use, so
+# log files baked into the image would show up in the dashboard.
+.venv/
+src/logs/
+**/__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/

@@ -52,6 +52,7 @@ class WorkerDaemon:
             reset_timeout=float(os.environ.get("CIRCUIT_RESET_TIMEOUT", "60")),
             degraded_threshold=int(os.environ.get("CIRCUIT_DEGRADED_THRESHOLD", "1")),
             initial_reset_timeout=float(os.environ.get("CIRCUIT_RESET_INITIAL", "5")),
+            alert_repeat_seconds=float(os.environ.get("ALERT_REPEAT_SECONDS", "900")),
         )
         self.blocked_retry_delay = float(
             os.environ.get("BLOCKED_TASK_RETRY_DELAY", "30")
@@ -59,6 +60,8 @@ class WorkerDaemon:
         self.blocked_retry_initial = float(
             os.environ.get("BLOCKED_TASK_RETRY_INITIAL", "2")
         )
+        # 0 (the default) keeps a blocked task waiting for as long as it takes.
+        self.blocked_max_age = float(os.environ.get("BLOCKED_TASK_MAX_AGE", "0"))
         self.policy = DataPolicy.from_env()
         self.secrets = SecretBox.from_env()
 
@@ -145,6 +148,7 @@ class WorkerDaemon:
             breaker=self.breaker,
             blocked_retry_delay=self.blocked_retry_delay,
             blocked_retry_initial=self.blocked_retry_initial,
+            blocked_max_age=self.blocked_max_age,
             policy=self.policy,
         )
         return worker.process_task(workflow_id, timeout=0)
@@ -184,10 +188,14 @@ class WorkerDaemon:
 
 
 def main() -> int:
-    # Configure logging with file rotation
+    # Logging with file rotation. The API and all worker replicas share one
+    # logs volume, so each replica writes its own files; the dashboard merges
+    # them.
+    host = os.environ.get("HOSTNAME", "worker")
     configure_logging(
         log_dir="logs",
-        log_file="worker_daemon.log",
+        log_file=f"worker-{host}.log",
+        alerts_file=f"alerts-worker-{host}.jsonl",
         level=logging.INFO,
     )
 

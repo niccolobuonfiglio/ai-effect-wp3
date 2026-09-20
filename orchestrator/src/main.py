@@ -39,6 +39,7 @@ def get_circuit_breaker(redis_client: redis.Redis) -> CircuitBreaker:
         reset_timeout=float(os.environ.get("CIRCUIT_RESET_TIMEOUT", "60")),
         degraded_threshold=int(os.environ.get("CIRCUIT_DEGRADED_THRESHOLD", "1")),
         initial_reset_timeout=float(os.environ.get("CIRCUIT_RESET_INITIAL", "5")),
+        alert_repeat_seconds=float(os.environ.get("ALERT_REPEAT_SECONDS", "900")),
     )
 
 
@@ -87,9 +88,11 @@ def main() -> int:
     args = parser.parse_args()
 
     # Configure logging with file rotation
+    # Shares the logs volume with the workers; see worker_daemon.main().
     configure_logging(
         log_dir="logs",
         log_file="orchestrator.log",
+        alerts_file=f"alerts-api-{os.environ.get('HOSTNAME', 'api')}.jsonl",
         level=getattr(logging, args.log_level.upper()),
     )
 

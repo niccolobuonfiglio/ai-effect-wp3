@@ -317,3 +317,40 @@ class TestRetryAttempts:
             queue.increment_attempts("", "task-1")
         with pytest.raises(ValueError, match="task_id"):
             queue.reset_attempts("wf-1", "")
+
+
+class TestBlockedSince:
+    """When a task was first blocked, for the maximum-blocked-time limit."""
+
+    def test_first_call_records_now(self, queue):
+        marked = queue.mark_blocked("wf-1", "task-1", now=1000.0)
+
+        assert marked == 1000.0
+
+    def test_later_calls_keep_the_first_time(self, queue):
+        queue.mark_blocked("wf-1", "task-1", now=1000.0)
+
+        assert queue.mark_blocked("wf-1", "task-1", now=5000.0) == 1000.0
+
+    def test_per_task(self, queue):
+        queue.mark_blocked("wf-1", "task-1", now=1000.0)
+
+        assert queue.mark_blocked("wf-1", "task-2", now=5000.0) == 5000.0
+
+    def test_reset_attempts_clears_it(self, queue):
+        queue.mark_blocked("wf-1", "task-1", now=1000.0)
+        queue.reset_attempts("wf-1", "task-1")
+
+        assert queue.mark_blocked("wf-1", "task-1", now=5000.0) == 5000.0
+
+    def test_clear_queue_clears_it(self, queue):
+        queue.mark_blocked("wf-1", "task-1", now=1000.0)
+        queue.clear_queue("wf-1")
+
+        assert queue.mark_blocked("wf-1", "task-1", now=5000.0) == 5000.0
+
+    def test_ids_required(self, queue):
+        with pytest.raises(ValueError, match="workflow_id"):
+            queue.mark_blocked("", "task-1")
+        with pytest.raises(ValueError, match="task_id"):
+            queue.mark_blocked("wf-1", "")

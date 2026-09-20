@@ -362,6 +362,11 @@ class TestAuthDependency:
         )
         return TestClient(app)
 
+    def test_deregister_rejects_missing_credentials(self, secured_client, registry):
+        registry.register("databroker", DATABROKER)
+
+        assert secured_client.delete(f"{BASE}/databroker").status_code == 401
+
     def test_rejects_missing_credentials(self, secured_client, registry):
         registry.register("databroker", DATABROKER)
         assert secured_client.get(BASE).status_code == 401
@@ -566,3 +571,35 @@ class TestRecoveryResumesWorkflows:
 
         assert body["status"] == "HEALTHY"
         assert body["resumed_tasks"] == 0
+
+
+class TestDeregisterService:
+    """Services of use cases that no longer run can be removed from the list."""
+
+    def test_removes_the_service(self, client, registry, breaker):
+        registry.register("databroker", DATABROKER)
+        kill(breaker, "databroker", "http://databroker:8080")
+
+        response = client.delete(f"{BASE}/databroker")
+
+        assert response.status_code == 200
+        assert response.json()["removed"] is True
+        assert client.get(f"{BASE}/databroker").status_code == 404
+        assert client.get(BASE).json()["total"] == 0
+
+    def test_unknown_service_404(self, client):
+        assert client.delete(f"{BASE}/never-seen").status_code == 404
+
+    def test_service_known_only_to_the_breaker(self, client, breaker):
+        breaker.record_failure("stray", "http://stray:8080", "boom")
+
+        assert client.delete(f"{BASE}/stray").status_code == 200
+        assert client.get(f"{BASE}/stray").status_code == 404
+
+    def test_registering_again_brings_it_back(self, client, registry):
+        registry.register("databroker", DATABROKER)
+        client.delete(f"{BASE}/databroker")
+
+        registry.register("databroker", DATABROKER)
+
+        assert client.get(f"{BASE}/databroker").json()["status"] == "HEALTHY"

@@ -115,3 +115,18 @@ class TestMain:
 
                     call_kwargs = mock_uvicorn.call_args
                     assert call_kwargs[1]["log_level"] == "debug"
+
+
+class TestLogFiles:
+    def test_api_alerts_file_carries_hostname(self):
+        """API and workers share one logs volume; each process has its own alerts file."""
+        with patch("main.create_app", return_value=MagicMock()), \
+             patch("main.uvicorn.run"), \
+             patch("main.configure_logging") as configure, \
+             patch.dict(os.environ, {"HOSTNAME": "api123"}), \
+             patch("sys.argv", ["main.py"]):
+            main()
+
+        kwargs = configure.call_args.kwargs
+        assert kwargs["log_file"] == "orchestrator.log"
+        assert kwargs["alerts_file"] == "alerts-api-api123.jsonl"

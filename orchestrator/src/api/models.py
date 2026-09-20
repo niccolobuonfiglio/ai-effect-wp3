@@ -145,6 +145,16 @@ class RecoveryResponse(BaseModel):
     resumed_tasks: int = 0
 
 
+class DeregisterResponse(BaseModel):
+    """Response from removing a service from the registry."""
+
+    model_config = ConfigDict(frozen=True)
+
+    service_name: str
+    removed: bool
+    message: str
+
+
 class RegisteredServiceResponse(BaseModel):
     """Registration details for a known service."""
 
@@ -157,3 +167,69 @@ class RegisteredServiceResponse(BaseModel):
     first_seen: str
     last_seen: str
     workflow_ids: list[str] = []
+
+
+class WorkflowSummaryResponse(BaseModel):
+    """One entry of the workflow list shown by the dashboard."""
+
+    model_config = ConfigDict(frozen=True)
+
+    workflow_id: str
+    name: str | None = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    error: str | None = None
+
+
+class WorkflowListResponse(BaseModel):
+    """All known workflows, newest first."""
+
+    model_config = ConfigDict(frozen=True)
+
+    workflows: list[WorkflowSummaryResponse] = []
+    total: int
+
+
+class GraphNodeResponse(BaseModel):
+    """A blueprint node with its task status and its service's health."""
+
+    model_config = ConfigDict(frozen=True)
+
+    key: str  # container:operation, the task's node_key
+    container_name: str
+    operation: str | None = None
+    node_type: str | None = None
+    status: str  # pending | running | blocked | completed | failed
+    service_status: str | None = None  # HEALTHY | DEGRADED | UNHEALTHY
+    circuit_state: str | None = None
+
+
+class GraphEdgeResponse(BaseModel):
+    """A connection between two nodes."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source: str
+    target: str
+
+
+class WorkflowGraphResponse(BaseModel):
+    """A workflow's graph with live status, for drawing."""
+
+    model_config = ConfigDict(frozen=True)
+
+    workflow_id: str
+    name: str | None = None
+    status: str
+    nodes: list[GraphNodeResponse] = []
+    edges: list[GraphEdgeResponse] = []
+
+
+class AlertListResponse(BaseModel):
+    """Recent alerts from all orchestrator processes, newest first."""
+
+    model_config = ConfigDict(frozen=True)
+
+    alerts: list[dict[str, Any]] = []
+    total: int

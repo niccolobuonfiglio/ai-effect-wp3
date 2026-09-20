@@ -1,6 +1,7 @@
 """Workflow engine for orchestrating task execution."""
 
 import hashlib
+import time
 
 from redis import Redis
 
@@ -239,6 +240,14 @@ class WorkflowEngine:
         if not task_id:
             raise ValueError("task_id is required")
         return self._task_queue.increment_attempts(workflow_id, task_id)
+
+    def blocked_age(self, workflow_id: str, task_id: str) -> float:
+        """Seconds since this task was first blocked (0 the first time)."""
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+        return max(0.0, time.time() - self._task_queue.mark_blocked(workflow_id, task_id))
 
     def release_due_tasks(self, workflow_id: str) -> int:
         """Re-queue blocked tasks whose retry delay has elapsed."""

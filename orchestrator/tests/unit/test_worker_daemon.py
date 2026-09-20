@@ -33,6 +33,8 @@ def clean_env(monkeypatch):
         "BLOCKED_TASK_RETRY_DELAY",
         "BLOCKED_TASK_RETRY_INITIAL",
         "CIRCUIT_RESET_INITIAL",
+        "BLOCKED_TASK_MAX_AGE",
+        "ALERT_REPEAT_SECONDS",
         "ALLOW_INLINE",
         "MAX_INLINE_BYTES",
     ):
@@ -96,6 +98,8 @@ class TestConfiguration:
         assert daemon.verify is True
         assert daemon.blocked_retry_delay == 30.0
         assert daemon.blocked_retry_initial == 2.0
+        assert daemon.blocked_max_age == 0.0          # no limit unless configured
+        assert daemon.breaker._alert_repeat == 900.0
         assert daemon.breaker._initial_reset_timeout == 5.0
         assert daemon.breaker._reset_timeout == 60.0
         assert daemon.secrets.enabled is False
@@ -105,12 +109,16 @@ class TestConfiguration:
         monkeypatch.setenv("BLOCKED_TASK_RETRY_DELAY", "5")
         monkeypatch.setenv("ORCHESTRATOR_SECRET", "passphrase")
         monkeypatch.setenv("MAX_INLINE_BYTES", "128")
+        monkeypatch.setenv("BLOCKED_TASK_MAX_AGE", "3600")
+        monkeypatch.setenv("ALERT_REPEAT_SECONDS", "60")
 
         daemon = WorkerDaemon(redis_client)
 
         assert daemon.blocked_retry_delay == 5.0
         assert daemon.secrets.enabled is True
         assert daemon.policy.max_inline_bytes == 128
+        assert daemon.blocked_max_age == 3600.0
+        assert daemon.breaker._alert_repeat == 60.0
 
     @pytest.mark.parametrize(
         "raw, expected",
@@ -256,6 +264,7 @@ class TestProcessWorkflow:
         assert kwargs["policy"] is daemon.policy
         assert kwargs["blocked_retry_delay"] == daemon.blocked_retry_delay
         assert kwargs["blocked_retry_initial"] == daemon.blocked_retry_initial
+        assert kwargs["blocked_max_age"] == daemon.blocked_max_age
         assert worker_cls.call_args.args[1] is daemon.control_client
         worker_cls.return_value.process_task.assert_called_once_with("wf-1", timeout=0)
 
@@ -326,6 +335,21 @@ class TestRunLoop:
 
 
 class TestMain:
+    def test_each_replica_writes_its_own_files(self, monkeypatch):
+        """Replicas share one logs volume, so file names carry the hostname."""
+        import redis
+
+        monkeypatch.setenv("HOSTNAME", "abc123")
+        client = MagicMock()
+        client.ping.side_effect = redis.ConnectionError("refused")
+        with patch.object(worker_daemon, "configure_logging") as configure, \
+             patch.object(worker_daemon.redis.Redis, "from_url", return_value=client):
+            worker_daemon.main()
+
+        kwargs = configure.call_args.kwargs
+        assert kwargs["log_file"] == "worker-abc123.log"
+        assert kwargs["alerts_file"] == "alerts-worker-abc123.jsonl"
+
     def test_returns_1_when_redis_unreachable(self):
         import redis
 

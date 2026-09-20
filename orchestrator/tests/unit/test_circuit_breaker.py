@@ -589,3 +589,94 @@ class TestProbeBackoff:
     def test_invalid_initial_rejected(self, redis_client):
         with pytest.raises(ValueError, match="initial_reset_timeout"):
             CircuitBreaker(redis_client, initial_reset_timeout=0)
+
+
+class TestAlertDeduplication:
+    """One outage emits one alert plus periodic reminders, not one per probe."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        state = {"now": 2_000_000.0}
+        monkeypatch.setattr("services.circuit_breaker.time.time", lambda: state["now"])
+        return state
+
+    @pytest.fixture
+    def breaker(self, redis_client):
+        return CircuitBreaker(
+            redis_client, failure_threshold=1, reset_timeout=60,
+            initial_reset_timeout=5, alert_repeat_seconds=900,
+        )
+
+    def downs(self, caplog):
+        return [r for r in caplog.records if getattr(r, "alert", None) == "SERVICE_DOWN"]
+
+    def fail_probe_cycle(self, breaker, clock, times):
+        """Let the circuit re-open ``times`` times, waiting for each probe."""
+        for _ in range(times):
+            while not breaker.allow(SERVICE):
+                clock["now"] += 5
+            breaker.record_failure(SERVICE, BASE_URL, "still refused")
+
+    def test_one_alert_per_outage(self, breaker, clock, caplog):
+        with caplog.at_level(logging.ERROR, logger=ALERTS_LOGGER):
+            breaker.record_failure(SERVICE, BASE_URL, "refused")   # goes down
+            self.fail_probe_cycle(breaker, clock, 5)               # 5 failed probes
+
+        assert len(self.downs(caplog)) == 1
+
+    def test_reminder_after_the_repeat_interval(self, breaker, clock, caplog):
+        with caplog.at_level(logging.ERROR, logger=ALERTS_LOGGER):
+            breaker.record_failure(SERVICE, BASE_URL, "refused")
+            clock["now"] += 901
+            self.fail_probe_cycle(breaker, clock, 1)
+
+        alerts = self.downs(caplog)
+        assert len(alerts) == 2
+        assert alerts[0].repeat is False and alerts[1].repeat is True
+        assert alerts[1].open_count == 2
+        assert alerts[1].down_since == alerts[0].down_since   # same outage
+
+    def test_new_outage_alerts_again(self, breaker, clock, caplog):
+        with caplog.at_level(logging.INFO, logger=ALERTS_LOGGER):
+            breaker.record_failure(SERVICE, BASE_URL, "refused")
+            clock["now"] += 5
+            breaker.allow(SERVICE)
+            breaker.record_success(SERVICE, BASE_URL)            # recovered
+            breaker.record_failure(SERVICE, BASE_URL, "refused")  # down again
+
+        alerts = self.downs(caplog)
+        assert len(alerts) == 2
+        assert alerts[1].repeat is False
+        assert alerts[1].down_since != alerts[0].down_since
+
+    def test_manual_recovery_starts_a_new_outage(self, breaker, clock, caplog):
+        with caplog.at_level(logging.INFO, logger=ALERTS_LOGGER):
+            breaker.record_failure(SERVICE, BASE_URL, "refused")
+            breaker.reset(SERVICE)
+            breaker.record_failure(SERVICE, BASE_URL, "refused")
+
+        assert len(self.downs(caplog)) == 2
+
+    def test_reminders_can_be_disabled(self, redis_client, clock, caplog):
+        breaker = CircuitBreaker(
+            redis_client, failure_threshold=1, reset_timeout=60,
+            initial_reset_timeout=5, alert_repeat_seconds=0,
+        )
+        with caplog.at_level(logging.ERROR, logger=ALERTS_LOGGER):
+            breaker.record_failure(SERVICE, BASE_URL, "refused")
+            clock["now"] += 10_000
+            self.fail_probe_cycle(breaker, clock, 3)
+
+        assert len(self.downs(caplog)) == 1
+
+    def test_health_is_unaffected_by_deduplication(self, breaker, clock):
+        breaker.record_failure(SERVICE, BASE_URL, "refused")
+        self.fail_probe_cycle(breaker, clock, 2)
+
+        health = breaker.get_health(SERVICE)
+        assert health.status == "UNHEALTHY"
+        assert health.failure_count == 3
+
+    def test_invalid_repeat_interval(self, redis_client):
+        with pytest.raises(ValueError, match="alert_repeat_seconds"):
+            CircuitBreaker(redis_client, alert_repeat_seconds=-1)

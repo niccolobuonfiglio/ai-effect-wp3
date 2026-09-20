@@ -221,6 +221,21 @@ def test_outage_blocks_task_and_recovery_resumes_same_workflow(outage):
     logs = compose(ORCHESTRATOR_COMPOSE, "logs", "--since", since, "worker")
     assert f"SERVICE DOWN: {SERVICE}" in logs
 
+    # The same outage as the dashboard sees it.
+    listed = api("GET", "/workflows").json()["workflows"]
+    assert any(w["workflow_id"] == wf and w["status"] == "running" for w in listed)
+
+    graph = {n["key"]: n for n in api("GET", f"/workflows/{wf}/graph").json()["nodes"]}
+    assert graph[f"{SERVICE}:AnalyzeData"]["status"] == "blocked"
+    assert graph[f"{SERVICE}:AnalyzeData"]["service_status"] == "UNHEALTHY"
+    assert graph["input_provider1:GetConfiguration"]["status"] == "completed"
+
+    # Alerts from all worker replicas are read from the shared logs volume.
+    alerts = api("GET", "/orchestrator/alerts?limit=100").json()["alerts"]
+    assert any(a["alert"] == "SERVICE_DOWN" and a["service_name"] == SERVICE for a in alerts)
+
+    assert wf in api("GET", f"/workflows/{wf}/logs").text
+
     # --- recovery ----------------------------------------------------------
     start_service()
     response = api("POST", f"/orchestrator/health/services/{SERVICE}/recover")
@@ -273,6 +288,13 @@ def test_service_back_within_seconds_costs_seconds_not_a_minute(outage):
     assert outcome == "completed", workflow(wf)
     assert elapsed < 20, f"took {elapsed:.1f}s after the service came back"
     assert service_health(SERVICE)["circuit_state"] == "closed"
+
+
+def test_dashboard_page_is_served():
+    response = httpx.get(f"{API}/ui/", timeout=5)
+
+    assert response.status_code == 200
+    assert "Orchestrator Dashboard" in response.text
 
 
 def test_service_is_healthy_again_for_new_workflows():

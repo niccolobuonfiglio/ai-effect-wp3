@@ -93,6 +93,9 @@ class CircuitBreaker:
             opens. Each consecutive re-open doubles it, up to
             ``reset_timeout``; a successful call starts over. None (the
             default) means no backoff: every wait is ``reset_timeout``.
+        alert_repeat_seconds: One outage emits one ``SERVICE_DOWN`` alert, then
+            at most one reminder per this interval while it lasts (default 900,
+            15 minutes). 0 means no reminders: one alert per outage.
     """
 
     def __init__(
@@ -102,6 +105,7 @@ class CircuitBreaker:
         reset_timeout: float = 60.0,
         degraded_threshold: int = 1,
         initial_reset_timeout: float | None = None,
+        alert_repeat_seconds: float = 900.0,
     ):
         if redis_client is None:
             raise ValueError("redis_client is required")
@@ -113,6 +117,8 @@ class CircuitBreaker:
             raise ValueError("degraded_threshold must be positive")
         if initial_reset_timeout is not None and initial_reset_timeout <= 0:
             raise ValueError("initial_reset_timeout must be positive")
+        if alert_repeat_seconds < 0:
+            raise ValueError("alert_repeat_seconds must be non-negative")
 
         self._redis = redis_client
         self._threshold = failure_threshold
@@ -121,6 +127,7 @@ class CircuitBreaker:
             reset_timeout if initial_reset_timeout is None else initial_reset_timeout
         )
         self._degraded_threshold = degraded_threshold
+        self._alert_repeat = alert_repeat_seconds
 
     # ------------------------------------------------------------------
     # internals
@@ -285,11 +292,30 @@ class CircuitBreaker:
         ) and data.get("state") != STATE_OPEN
 
         if should_open:
+            opened_ts = time.time()
+            streak = int(data.get("open_streak", 0)) + 1
             data["state"] = STATE_OPEN
-            data["opened_ts"] = time.time()
+            data["opened_ts"] = opened_ts
             data["opened_at"] = now
-            data["open_streak"] = int(data.get("open_streak", 0)) + 1
+            data["open_streak"] = streak
+            if streak == 1:
+                data["down_since"] = now  # start of this outage
+
+            # One alert when the service goes down, then at most one reminder
+            # per alert_repeat_seconds while it stays down: a long outage would
+            # otherwise emit one alert per failed probe.
+            last_alert = float(data.get("last_alert_ts", 0))
+            reminder_due = bool(self._alert_repeat) and (
+                opened_ts - last_alert >= self._alert_repeat
+            )
+            alerting = streak == 1 or reminder_due
+            if alerting:
+                data["last_alert_ts"] = opened_ts
             self._save(service_name, data)
+
+            if not alerting:
+                return
+
             self._alert(
                 logging.ERROR,
                 "SERVICE_DOWN",
@@ -297,6 +323,9 @@ class CircuitBreaker:
                 service_name,
                 base_url,
                 now,
+                repeat=streak > 1,
+                down_since=data.get("down_since", now),
+                open_count=streak,
                 failure_count=count,
                 failure_threshold=self._threshold,
                 last_error=error,

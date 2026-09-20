@@ -30,7 +30,10 @@ TRUNCATED = " ... [truncated]"
 # Conservative patterns: identifiers that are personal data in almost any
 # context, plus long opaque blobs that are usually payload rather than message.
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_LONG_DIGITS = re.compile(r"(?<!\d)\d{9,}(?!\d)")
+# Only standalone runs of digits: a long number inside an identifier (a
+# workflow id such as wf-578150909e59, task_91277dc9, a hostname) is not a
+# personal identifier, and redacting it would make logs unreadable.
+_LONG_DIGITS = re.compile(r"(?<![\w-])\d{9,}(?![\w-])")
 # A blob is a long base64-looking token that mixes cases and digits. The
 # lookaheads keep ordinary text out: a long file path or a repeated word is
 # lower case only, so it stays readable in the error message.

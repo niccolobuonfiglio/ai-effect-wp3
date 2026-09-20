@@ -427,3 +427,23 @@ class TestServiceScheme:
 
     def test_old_stored_endpoint_without_scheme(self):
         assert ServiceEndpoint(**{"address": "svc", "port": 8080}).scheme == "http"
+
+
+class TestExtraFields:
+    """Exports may carry fields the orchestrator does not use."""
+
+    def test_webui_fields_are_ignored(self):
+        endpoints = DockerInfoParser().parse_json({"docker_info_list": [{
+            "container_name": "svc", "ip_address": "svc-host", "port": "8080",
+            "webui_port": "18090", "webui_url": "http://localhost:18090",
+        }]})
+
+        assert endpoints["svc"].base_url == "http://svc-host:8080"
+
+    def test_scheme_is_still_honoured(self):
+        endpoints = DockerInfoParser().parse_json({"docker_info_list": [{
+            "container_name": "svc", "ip_address": "svc-host", "port": "8443",
+            "scheme": "https", "webui_url": "http://x",
+        }]})
+
+        assert endpoints["svc"].base_url == "https://svc-host:8443"

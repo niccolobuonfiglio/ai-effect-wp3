@@ -823,3 +823,40 @@ class TestBlockedAttempts:
         engine.fail_task(wf, task.task_id, "boom")
 
         assert task_queue.increment_attempts(wf, task.task_id) == 1
+
+
+class TestBlockedAge:
+    """How long a task has been blocked, for the maximum-blocked-time limit."""
+
+    def start(self, engine, workflow_id="wf-age"):
+        engine.initialize_workflow(workflow_id, create_single_node_graph())
+        engine.start_workflow(workflow_id)
+        return workflow_id, engine.claim_task(workflow_id, timeout=1)
+
+    def test_zero_on_first_block(self, engine):
+        wf, task = self.start(engine)
+
+        assert engine.blocked_age(wf, task.task_id) < 1
+
+    def test_grows_from_the_first_block(self, engine, task_queue):
+        wf, task = self.start(engine)
+        import time
+
+        task_queue.mark_blocked(wf, task.task_id, now=time.time() - 120)
+
+        assert 119 < engine.blocked_age(wf, task.task_id) < 130
+
+    def test_completion_resets_it(self, engine, task_queue):
+        import time
+
+        wf, task = self.start(engine, "wf-age2")
+        task_queue.mark_blocked(wf, task.task_id, now=time.time() - 120)
+        engine.complete_task(wf, task.task_id)
+
+        assert engine.blocked_age(wf, task.task_id) < 1
+
+    def test_validation(self, engine):
+        with pytest.raises(ValueError, match="workflow_id"):
+            engine.blocked_age("", "t")
+        with pytest.raises(ValueError, match="task_id"):
+            engine.blocked_age("wf", "")

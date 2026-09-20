@@ -41,6 +41,18 @@ class TestSanitizeError:
         assert "198412345678" not in out
         assert "row 7" in out
 
+    def test_identifiers_are_not_mangled(self):
+        """A long digit run inside an id is not a personal identifier."""
+        message = "Task task_91277dc9 of workflow wf-578150909e59 blocked; host worker-7a27d6e566bd"
+
+        assert sanitize_error(message) == message
+
+    def test_standalone_number_next_to_punctuation_is_redacted(self):
+        out = sanitize_error("card=4111111111111111, row 3")
+
+        assert "4111111111111111" not in out
+        assert "row 3" in out
+
     def test_short_numbers_kept(self):
         out = sanitize_error("HTTP 503 after 30 seconds, task 12345678")
 

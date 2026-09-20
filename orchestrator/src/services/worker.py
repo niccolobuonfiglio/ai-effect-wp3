@@ -33,6 +33,7 @@ class Worker:
         blocked_retry_delay: float = 30.0,
         policy: DataPolicy | None = None,
         blocked_retry_initial: float | None = None,
+        blocked_max_age: float | None = None,
     ):
         """Initialize worker with dependencies.
 
@@ -49,6 +50,9 @@ class Worker:
             blocked_retry_initial: Wait before the first retry; it doubles on
                 each further deferral, up to ``blocked_retry_delay``. None
                 means no backoff: every wait is ``blocked_retry_delay``.
+            blocked_max_age: Fail a task that has been blocked for longer than
+                this many seconds, instead of retrying it forever. None or 0
+                means no limit.
             policy: Limits on the data references a service may return.
         """
         if engine is None:
@@ -63,6 +67,8 @@ class Worker:
             raise ValueError("blocked_retry_delay must be non-negative")
         if blocked_retry_initial is not None and blocked_retry_initial <= 0:
             raise ValueError("blocked_retry_initial must be positive")
+        if blocked_max_age is not None and blocked_max_age < 0:
+            raise ValueError("blocked_max_age must be non-negative")
 
         self._engine = engine
         self._client = client
@@ -71,6 +77,7 @@ class Worker:
         self._breaker = breaker
         self._blocked_retry_delay = blocked_retry_delay
         self._blocked_retry_initial = blocked_retry_initial
+        self._blocked_max_age = blocked_max_age
         self._policy = policy or DataPolicy.from_env()
 
     def process_task(self, workflow_id: str, timeout: float = 0) -> bool:
@@ -107,10 +114,10 @@ class Worker:
                     self._defer(
                         workflow_id,
                         task.task_id,
+                        container_name,
                         f"Circuit open for service '{container_name}' at "
                         f"{base_url} - service marked UNHEALTHY, call not "
-                        f"attempted. Recover via POST /orchestrator/health/"
-                        f"services/{container_name}/recover",
+                        f"attempted",
                     )
                     return True
 
@@ -223,9 +230,8 @@ class Worker:
         self._defer(
             workflow_id,
             task_id,
-            f"Service '{container_name}' unavailable: {error}. Task will be "
-            f"retried; recover via POST /orchestrator/health/services/"
-            f"{container_name}/recover",
+            container_name,
+            f"Service '{container_name}' unavailable: {error}",
         )
         return True
 
@@ -236,10 +242,48 @@ class Worker:
         initial = self._blocked_retry_initial or self._blocked_retry_delay
         return backoff_delay(attempt, initial, self._blocked_retry_delay)
 
-    def _defer(self, workflow_id: str, task_id: str, reason: str) -> None:
-        """Park a task until its service is healthy, keeping the workflow alive."""
+    def _defer(
+        self, workflow_id: str, task_id: str, container_name: str, cause: str
+    ) -> None:
+        """Park a task until its service is healthy, keeping the workflow alive.
+
+        ``cause`` says why the task cannot run now; the advice to the operator
+        is added here, so a task that gives up does not claim it will be
+        retried. A task blocked for longer than ``blocked_max_age`` fails
+        instead, so a workflow waiting on a service that never returns does not
+        stay ``running`` forever.
+        """
         attempt = int(self._engine.record_blocked_attempt(workflow_id, task_id))
+        age = float(self._engine.blocked_age(workflow_id, task_id))
+        if self._blocked_max_age and age > self._blocked_max_age:
+            self._engine.fail_task(
+                workflow_id,
+                task_id,
+                f"{cause}. Giving up after {int(age)}s blocked (limit "
+                f"{int(self._blocked_max_age)}s) and {attempt} attempts; "
+                f"resubmit the workflow once the service is back",
+            )
+            logger.error(
+                "Task %s of workflow %s failed after %ds blocked: %s",
+                task_id,
+                workflow_id,
+                int(age),
+                cause,
+                extra={
+                    "event": "blocked_task_expired",
+                    "workflow_id": workflow_id,
+                    "task_id": task_id,
+                    "blocked_seconds": int(age),
+                    "attempts": attempt,
+                },
+            )
+            return
+
         delay = self._retry_delay(attempt)
+        reason = (
+            f"{cause}. Task will be retried; recover via POST "
+            f"/orchestrator/health/services/{container_name}/recover"
+        )
         self._engine.defer_task(workflow_id, task_id, reason, delay=delay)
         logger.warning(
             "Task %s of workflow %s blocked (attempt %d), retry in %ss: %s",

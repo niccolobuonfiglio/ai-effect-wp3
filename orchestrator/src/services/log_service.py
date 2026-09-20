@@ -6,6 +6,9 @@ import os
 import time
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+
+from services.log_retention import prune_stale_files, start_keepalive
 
 ALERTS_LOGGER = "orchestrator.alerts"
 
@@ -85,6 +88,7 @@ def configure_logging(
     console: bool = True,
     log_format: str | None = None,
     alerts_file: str | None = "alerts.jsonl",
+    manage_retention: bool = True,
 ) -> logging.Logger:
     """Configure root logger with console and rotating file handlers.
 
@@ -99,6 +103,9 @@ def configure_logging(
             then "text".
         alerts_file: File in ``log_dir`` receiving only alert records, always
             as JSON lines. None disables it.
+        manage_retention: Delete files of processes that are gone (untouched
+            for ``LOG_RETENTION_DAYS``) and keep this process's own files
+            fresh; see ``services.log_retention``.
 
     Returns:
         Configured root logger.
@@ -158,5 +165,12 @@ def configure_logging(
         )
         alerts_handler.setFormatter(JsonFormatter())
         alerts_logger.addHandler(alerts_handler)
+
+    # The logs directory is shared by all processes and each writes its own
+    # files, so files of recreated containers would otherwise pile up.
+    if manage_retention:
+        own = [name for name in (log_file, alerts_file) if name]
+        prune_stale_files(log_dir, keep=set(own))
+        start_keepalive([Path(log_dir) / name for name in own])
 
     return logger

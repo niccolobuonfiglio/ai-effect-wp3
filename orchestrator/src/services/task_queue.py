@@ -23,6 +23,25 @@ class RedisTaskQueue:
     def _attempts_key(self, workflow_id: str) -> str:
         return f"attempts:{workflow_id}"
 
+    def _blocked_since_key(self, workflow_id: str) -> str:
+        return f"blocked_since:{workflow_id}"
+
+    def mark_blocked(self, workflow_id: str, task_id: str, now: float | None = None) -> float:
+        """Record when a task was *first* blocked; returns that moment.
+
+        Later calls keep the original time, so the age of an outage is measured
+        from the first deferral rather than the last one.
+        """
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+
+        now = time.time() if now is None else now
+        key = self._blocked_since_key(workflow_id)
+        self._redis.hsetnx(key, task_id, now)
+        return float(self._redis.hget(key, task_id))
+
     def increment_attempts(self, workflow_id: str, task_id: str) -> int:
         """Count one more deferral of a task; returns the new count (1, 2, …)."""
         if not workflow_id:
@@ -32,12 +51,13 @@ class RedisTaskQueue:
         return int(self._redis.hincrby(self._attempts_key(workflow_id), task_id, 1))
 
     def reset_attempts(self, workflow_id: str, task_id: str) -> None:
-        """Forget a task's deferral count, e.g. once it has finished."""
+        """Forget a task's deferral count and start time once it has finished."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
         if not task_id:
             raise ValueError("task_id is required")
         self._redis.hdel(self._attempts_key(workflow_id), task_id)
+        self._redis.hdel(self._blocked_since_key(workflow_id), task_id)
 
     def enqueue_task(self, workflow_id: str, task_id: str) -> None:
         """Add task to workflow queue (FIFO)."""
@@ -169,4 +189,5 @@ class RedisTaskQueue:
             self._queue_key(workflow_id),
             self._delayed_key(workflow_id),
             self._attempts_key(workflow_id),
+            self._blocked_since_key(workflow_id),
         )
