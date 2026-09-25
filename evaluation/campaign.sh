@@ -1,0 +1,58 @@
+#!/bin/bash
+# Layer 3 of the evaluation: every scenario, on both versions, in alternating blocks.
+#
+#   evaluation/campaign.sh <out-dir> [blocks] [reps-per-block]
+#
+# Default: 2 blocks x 5 repetitions = n=10 per scenario and version (n=30 for
+# nominal). Blocks alternate the order OLD/NEW so that slow drift (thermal,
+# caches, background load) does not line up with one version. Each block
+# restarts the stack, so each starts from an empty Redis.
+set -uo pipefail
+
+OUT="${1:?usage: campaign.sh <out-dir> [blocks] [reps-per-block]}"
+BLOCKS="${2:-2}"
+REPS="${3:-5}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$HERE/.venv/bin/python"
+mkdir -p "$OUT"
+"$HERE/env_snapshot.sh" "$OUT" >/dev/null
+
+# The file-based pipeline carries the fault scenarios; its services must be up.
+UC="$HERE/../use-cases/file_based_energy_pipeline/docker-compose.yml"
+docker compose -f "$UC" up -d
+
+# NEW's lease is shortened for the worker-death scenario only; everything else
+# runs with the shipped defaults of each version.
+scenarios=(nominal burst outage short-outage request-error concurrent-outage worker-death)
+
+run_block() {  # version
+    local v=$1
+    for s in "${scenarios[@]}"; do
+        local reps=$REPS extra=()
+        [ "$s" = nominal ] && { reps=$((REPS * 3)); extra=(--warmup 2); }
+        [ "$s" = worker-death ] && extra=(--timeout 120)   # lease 20 s + slack; OLD never finishes
+        if [ "$s" = worker-death ] && [ "$v" = new ]; then
+            LEASE_SECONDS=20 "$HERE/stack.sh" new >/dev/null
+        fi
+        (cd "$HERE" && "$PY" runner.py --version "$v" --scenario "$s" --reps "$reps" \
+            --use-case file_based --out "$OUT" "${extra[@]}") | tee -a "$OUT/campaign.log"
+        if [ "$s" = worker-death ] && [ "$v" = new ]; then
+            "$HERE/stack.sh" new >/dev/null   # back to the default lease
+        fi
+    done
+    # CPU/RAM are sampled in a separate burst run: "docker stats" itself costs
+    # CPU and would bias the latency and throughput measured above.
+    (cd "$HERE" && "$PY" runner.py --version "$v" --scenario burst --reps 2 --stats \
+        --use-case file_based --out "$OUT/resources") | tee -a "$OUT/campaign.log"
+}
+
+for b in $(seq 1 "$BLOCKS"); do
+    if (( b % 2 )); then order=(old new); else order=(new old); fi
+    for v in "${order[@]}"; do
+        echo "### block $b: $v" | tee -a "$OUT/campaign.log"
+        "$HERE/stack.sh" "$v" >/dev/null || exit 1
+        run_block "$v"
+    done
+done
+
+"$PY" "$HERE/analyze.py" "$OUT"
