@@ -62,41 +62,108 @@ Each of these would have made the comparison unfair or wrong:
     service keys left in Redis, and a fresh stack has none. One workflow with
     a service key now runs first, on both versions. OLD then shows the
     published DEFECT CONFIRMED.
-11. **Preconditions are written into the protocol:** the API keys for the
-   authentication tests, committing before Task 3.3 runs on NEW, and freeing
-   the ports.
+11. **The T3.3 script 50 preparation hung on VILLASnode.** Script 01 restarts
+    VILLASnode, which crashes on its second restart (use-case defect F2). The
+    preparation now recreates it first and prints its progress.
+12. **The campaign wrote its trials to the wrong folder.** It changed into
+    `evaluation/` before starting the runner but passed a relative results
+    path, which created `evaluation/evaluation/results/...`. The path is now
+    made absolute.
+13. **Unexplained failures could not be diagnosed.** Trial records for burst
+    and concurrent-outage now keep the status and task errors of every
+    workflow that did not complete.
+14. **Preconditions are written into the protocol:** the API keys for the
+    authentication tests, committing before Task 3.3 runs on NEW, and freeing
+    the ports.
 
-## 3. Results so far
+## 3. Results
 
-### Deterministic results (they will repeat in every trial)
+All numbers below come from the final run in
+`results/final-2026-09-25/` (NEW commit `1c42faa`, OLD `486ccc7`). How that
+folder came about is described in its `NOTES.md`. The `results/` folder is not
+under version control.
+
+### Layer 2: own suites and differential tests
 
 - **Non-regression:** all 351 of OLD's tests pass on NEW, so NEW keeps
   everything OLD's tests check.
 - **A real OLD defect:** OLD fails 1 of its own tests (`execute()` has no
   `parameters` argument). NEW passes all 841 of its tests.
 - **Differential tests:** all 4 fail on OLD and pass on NEW.
-  - **Fan-in race:** OLD lost one branch's input in 111 of 200 trials and
-    queued the join twice in 78. NEW had neither.
+  - **Fan-in race (300 trials, 2 ms jitter):** OLD lost one branch's input in
+    165 trials and queued the join more or less than once in 149. NEW had
+    neither.
   - **Idle worker hang:** an OLD worker blocks forever on an empty queue; NEW
     returns at once.
   - **Worker death:** a task whose worker dies stays `running` forever on OLD;
     NEW picks it up again.
   - **Stuck service:** a service that never finishes holds an OLD worker
     forever; NEW gives up after a time limit.
-- **Behaviour in the scenarios:**
 
-  | Scenario | OLD | NEW |
-  |---|---|---|
-  | Short outage, no operator | workflow fails | completes by itself |
-  | Worker killed mid-task | task stuck forever | recovers in about 19 s |
-  | Service down before submission | fails; the resubmit re-runs 2 finished tasks | task waits, outage detected in about 6 s, nothing re-run |
-  | Outage visibility | no health API, no alert | health status plus a SERVICE_DOWN alert |
+### Layer 1: Task 3.3 German suite
 
-- **Independent suite so far:** the Task 3.3 German suite runs on both
-  versions. With the fixed driver, scripts 00, 02, 40 and 99 give PASS, 11
-  gives DEFECT CONFIRMED (a packaged-input defect in the use case, not the
-  orchestrator) and 60 gives READY on both. The final verdicts come from the
-  rerun with the fixed driver.
+Every script gives the same verdict on both versions: PASS for 00, 02, 40 and
+99; RECORDED for 01; DEFECT CONFIRMED for 11 (a data problem in the use case)
+and 50 (see below); READY for 60.
+
+- This is strong evidence of **non-regression**: an independent suite finds
+  nothing that NEW broke.
+- It is **not evidence of improvement**: these scripts test authentication,
+  input validation and service keys, not outages, recovery or scheduling.
+- Script 60 gives READY because the VILLASnode image, which blocked the
+  official closure run, is present on this machine (digest in `env.json`).
+  That is not a result of NEW.
+
+### Layer 3: fault-injection campaign (n = 10 per version, 30 for nominal)
+
+| Scenario | Metric | OLD | NEW | Test |
+|---|---|---|---|---|
+| short-outage, no operator | jobs completed | 0/10 | **10/10** | Fisher p < 0.001 |
+| worker-death | jobs completed | 0/10 | **10/10** (about 19 s) | Fisher p < 0.001 |
+| outage | re-executed tasks (median) | 2 | **0** | MWU p < 0.001, δ = −1 |
+| outage | recovery time (median) | 1.9 s | 1.2 s | p = 0.24, not significant |
+| outage | detection / first alert | not supported | about 7 s | exists only in NEW |
+| concurrent-outage, 10 workflows | operator actions | 11 | **2** | p < 0.001, δ = −1 |
+| concurrent-outage | re-executed tasks | 20 | **0** | p < 0.001, δ = −1 |
+| concurrent-outage | recovery time | 9.6 s | **1.8 s** | p < 0.001, δ = −1 |
+| burst | idle workers stuck in BRPOP (median) | 1 | 0 | the OLD hang, seen live |
+| nominal | end-to-end latency (median) | 0.70 s | 0.70 s | TOST ±5 %: ratio 1.007, p = 0.0498 |
+| request-error | jobs completed | 0/10 | 0/10 | same behaviour |
+
+How to read it:
+
+- **Overhead:** NEW's fault-free latency is equivalent to OLD's within ±5 %,
+  but p = 0.0498 only just passes. Report it as "no measurable overhead, at
+  the margin of the test", not as proven equivalence.
+- **Recovery time for a single outage** does not differ significantly. The
+  gain there is that no finished work is repeated and the workflow keeps its
+  identity, not speed.
+- **Operator actions** tie at 2 for a single outage. NEW saves actions only
+  when several workflows are hit (2 vs 11 with 10 workflows).
+- **At-least-once:** NEW re-executed exactly 1 task in every worker-death
+  trial. The paused service still finishes the orphaned request, and then the
+  reclaimed task runs again. Report this as a trade-off.
+
+### Not usable as orchestrator results: burst and concurrent-outage completion
+
+Burst completion (6/10 on both versions) and concurrent-outage completion
+(OLD 10/10, NEW 8/10, Fisher p = 0.47) are distorted by a defect in the test
+pipeline, not in either orchestrator.
+
+The `file_based_energy_pipeline` services read and write fixed file names
+shared by every workflow (for example `data/analyzed_energy.csv` and
+`data/energy_report.csv`). When workflows run at the same time, one can read a
+file another is still writing, and fails with `No columns to parse from file`.
+This was reproduced with the runner on OLD: 5 of 20 bursts had a failed
+workflow, all with that error (`diagnostics/burst-race-old-20reps.jsonl` in the
+results folder).
+
+The asymmetry in concurrent-outage follows from the operator model. NEW's
+recovery re-queues all 10 blocked workflows at once, so they overlap and can
+collide. OLD's operator resubmits them one at a time, so they never overlap.
+Burst throughput (OLD 561, NEW 707 workflows/min, p = 0.003) is affected by
+the same failures. OLD's idle worker stuck in BRPOP is a genuine factor in
+that gap too, but the two cannot be separated in this data.
 
 ### Finding: the service-key defect is not fixed in NEW
 
@@ -112,23 +179,16 @@ completes (`TTL -1`):
 NEW improves confidentiality only when it is configured to. It does not change
 the key's lifecycle.
 
-### Limits to keep in mind
-
-- All the timings (latency, throughput, recovery seconds) are single smoke
-  runs, and they flipped direction between runs. The overhead question stays
-  open until the campaign has run.
-- Operator actions tie in the single-outage scenario. NEW saves actions only
-  with several workflows at once (2 vs 4 with 3 workflows).
-- NEW can run a task twice after a worker dies: the paused service still
-  finishes the old request, and then the reclaimed task runs again. This is
-  at-least-once behaviour and should be reported as a trade-off.
-
 ## 4. Still to do
 
-1. Commit `evaluation/`.
-2. Run the Task 3.3 suites on both versions (`run_t33.sh german old|new <run>`,
-   with `ORCHESTRATOR_API_KEY` and `SERVICE_API_KEY` exported).
-3. Run `campaign.sh <run> 2 5` (about 3–4 hours).
-
-After that, the tables and figures in `results/<run>/thesis/` can go straight
-into the chapter.
+1. Decide how to handle the pipeline race:
+   - **(a)** make the pipeline services write per-workflow file names (the
+     same fixed pipeline for both versions), then rerun only burst and
+     concurrent-outage; or
+   - **(b)** keep the data and report the race as a use-case defect, drawing
+     no conclusions from those two completion rates.
+2. Decide whether to fix the service-key lifecycle in NEW (then rerun T3.3
+   script 50) or report it as an open limitation.
+3. Commit the modified `campaign.sh`, `runner.py` and the docs.
+4. Optional: Portugal (needs the external TEF checkout) and Dutch
+   (`run_t33.sh prepare-dutch`).

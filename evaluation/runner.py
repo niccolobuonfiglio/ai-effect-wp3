@@ -330,6 +330,7 @@ def sc_burst(stack: Stack, rec: dict, args) -> None:
         60 * k / rec["makespan_seconds"] if rec["makespan_seconds"] else None
     )
     rec["job_completed"] = rec["completed_workflows"] == k
+    _record_failures(stack, rec, wfs)
     # V-A4: after the burst, idle workers should not sit in a blocking BRPOP
     time.sleep(3)
     rec["brpop_clients_after"] = stack.brpop_clients()
@@ -486,20 +487,38 @@ def sc_concurrent_outage(stack: Stack, rec: dict, args) -> None:
         rec["operator_actions"] += 1
         rec["resumed_tasks"] = body.get("resumed_tasks")
         finals = [wait_for(lambda w=w: stack.finished(w), args.timeout)[0] for w in wfs]
+        carriers = wfs
     else:
-        finals = []
+        finals, carriers = [], []
         for w in wfs:
             f = stack.finished(w)
             if f == "failed":
                 w = stack.submit()
                 rec["operator_actions"] += 1
             finals.append(wait_for(lambda w=w: stack.finished(w), args.timeout)[0])
+            carriers.append(w)
+    _record_failures(stack, rec, carriers)
     rec["workflows"] = k
     rec["jobs"] = k
     rec["completed_workflows"] = sum(f == "completed" for f in finals)
     rec["job_completed"] = rec["completed_workflows"] == k
     rec["recovery_seconds"] = time.monotonic() - restored_at if rec["job_completed"] else None
     _alerts(stack, rec, target, t_fault)
+
+
+def _record_failures(stack: Stack, rec: dict, wfs: list[str]) -> None:
+    """Keep the status and task errors of every workflow that did not complete."""
+    out = []
+    for wf in wfs:
+        status = stack.status(wf)
+        if status != "completed":
+            out.append({
+                "workflow_id": wf,
+                "status": status,
+                "tasks": {k: {"status": t["status"], "error": t.get("error")}
+                          for k, t in stack.tasks(wf).items() if t["status"] != "completed"},
+            })
+    rec["unfinished_workflows"] = out
 
 
 def _observe_detection(stack: Stack, rec: dict, target: str, t_fault: float, window: float):

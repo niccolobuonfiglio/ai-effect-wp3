@@ -15,6 +15,7 @@ REPS="${3:-5}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$HERE/.venv/bin/python"
 mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"   # absolute: the runner is started from evaluation/
 "$HERE/env_snapshot.sh" "$OUT" >/dev/null
 
 # The runner sends no service key, so neither the orchestrators nor the
