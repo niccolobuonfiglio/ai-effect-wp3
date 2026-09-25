@@ -17,6 +17,11 @@ PY="$HERE/.venv/bin/python"
 mkdir -p "$OUT"
 "$HERE/env_snapshot.sh" "$OUT" >/dev/null
 
+# The runner sends no service key, so neither the orchestrators nor the
+# pipeline may run with one: a key left in the shell would make every call fail
+# on both versions. Starting the pipeline here also recreates it without one.
+unset ORCHESTRATOR_API_KEY SERVICE_API_KEY ORCHESTRATOR_SECRET
+
 # The file-based pipeline carries the fault scenarios; its services must be up.
 UC="$HERE/../use-cases/file_based_energy_pipeline/docker-compose.yml"
 docker compose -f "$UC" up -d

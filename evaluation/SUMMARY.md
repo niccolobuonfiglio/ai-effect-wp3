@@ -49,7 +49,20 @@ Each of these would have made the comparison unfair or wrong:
    throughput measurement.
 7. **Use cases now match between versions.** Portugal's files differ between
    the two trees, so both versions use OLD's copy.
-8. **Preconditions are written into the protocol:** the API keys for the
+8. **API keys leaked into the measurements.** A key still exported in the
+   shell made both versions answer `401` to every test expecting an open API
+   (about 30 false failures per cell). `run_own_suites.sh` and `campaign.sh`
+   now clear the keys themselves.
+9. **The T3.3 scripts couldn't find OLD's containers.** They look them up by
+   the name `orchestrator-*`, so OLD's renamed project made scripts 01 and 50
+   stop without a result. Both versions now run as project `orchestrator`,
+   with the images rebuilt from the tree under test and NEW's restored
+   afterwards.
+10. **T3.3 script 50 passed without testing anything.** It inspects only the
+    service keys left in Redis, and a fresh stack has none. One workflow with
+    a service key now runs first, on both versions. OLD then shows the
+    published DEFECT CONFIRMED.
+11. **Preconditions are written into the protocol:** the API keys for the
    authentication tests, committing before Task 3.3 runs on NEW, and freeing
    the ports.
 
@@ -79,8 +92,25 @@ Each of these would have made the comparison unfair or wrong:
   | Service down before submission | fails; the resubmit re-runs 2 finished tasks | task waits, outage detected in about 6 s, nothing re-run |
   | Outage visibility | no health API, no alert | health status plus a SERVICE_DOWN alert |
 
-- **Independent suite so far:** Task 3.3 German scripts 00 and 02 give PASS on
-  OLD with the keys set. NEW hasn't been run yet; it needs the commit first.
+- **Independent suite so far:** the Task 3.3 German suite runs on both
+  versions. With the fixed driver, scripts 00, 02, 40 and 99 give PASS, 11
+  gives DEFECT CONFIRMED (a packaged-input defect in the use case, not the
+  orchestrator) and 60 gives READY on both. The final verdicts come from the
+  rerun with the fixed driver.
+
+### Finding: the service-key defect is not fixed in NEW
+
+T3.3 reports that workflow service keys persist in Redis without expiry. In
+NEW, a key submitted with a workflow is still in Redis after the workflow
+completes (`TTL -1`):
+
+- With the shipped defaults (`ORCHESTRATOR_SECRET` unset) it is stored in
+  plain text, exactly as in OLD.
+- With `ORCHESTRATOR_SECRET` set it is encrypted at rest, but it still never
+  expires, so T3.3 script 50 still reports DEFECT CONFIRMED.
+
+NEW improves confidentiality only when it is configured to. It does not change
+the key's lifecycle.
 
 ### Limits to keep in mind
 

@@ -84,6 +84,17 @@ author choosing tests that favour their own code.
   orchestrator changes, lost in `dutch-new`, are listed in
   `dutch-orchestrator-swap.stat` and must be discussed as a confound.
 
+- **Project name.** The suites find the orchestrator by container name
+  (`orchestrator-api`, `orchestrator-redis`), so both versions run as compose
+  project `orchestrator`, as in the official closure runs. `run_t33.sh`
+  rebuilds the images from the tree under test before the scripts and rebuilds
+  NEW's images afterwards.
+- **Script 50 (service-key lifecycle).** It only inspects the keys left in
+  Redis, so on a fresh stack it passes without testing anything. `run_t33.sh`
+  first runs one Germany workflow carrying a service key, identically on both
+  versions (logged in `50-prime.log`). Each version runs with its shipped
+  defaults, so NEW runs without `ORCHESTRATOR_SECRET` and stores the key
+  unencrypted.
 - **Clean tree.** The suites refuse a dirty repository. Commit `evaluation/`
   before running NEW. The resulting commit differs from the measured
   orchestrator commit only by this folder, so record both in the chapter.

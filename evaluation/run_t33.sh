@@ -139,45 +139,56 @@ cp "$SETTINGS" "$OUT/t33-logs/$NODE-$VERSION/Test-Settings.psd1"
 mkdir -p "$(sed -n "s/^ *EvidenceRoot *= *'\(.*\)'.*/\1/p" "$TEMPLATE")"
 
 # --- stack ---------------------------------------------------------------
-# The suites start the orchestrator with a plain "docker compose -f
-# <root>/orchestrator/docker-compose.yml up -d". Both trees name that folder
-# "orchestrator", so OLD would reuse NEW's images and containers. A .env next
-# to the compose file gives each tree its own project name without touching
-# tracked files; it is removed again afterwards if this script created it.
-case "$NODE-$VERSION" in
-    dutch-old) project=orch-dutch-old ;;
-    dutch-new) project=orch-dutch-new ;;
-    *-old)     project=orch-old ;;
-    *)         project=orchestrator ;;
-esac
-ENV_FILE="$repo_root/orchestrator/.env"
-# The suites refuse a dirty tree ("git status --porcelain"). The .env is listed
-# in .git/info/exclude, which is local and changes no tracked file.
-exclude="$(git -C "$repo_root" rev-parse --git-path info/exclude)"
-case "$exclude" in /*) ;; *) exclude="$repo_root/$exclude" ;; esac
-grep -qx '/orchestrator/.env' "$exclude" 2>/dev/null || echo '/orchestrator/.env' >>"$exclude"
+# The suites find the orchestrator by container name ("orchestrator-api",
+# "orchestrator-redis"), so every version must run as compose project
+# "orchestrator", as in the official closure runs. Both trees then share the
+# image names orchestrator-api/-worker, so the images are always rebuilt from
+# the tree under test first, and NEW's images are rebuilt again afterwards: a
+# stale OLD image must never be taken for NEW.
 if [ -n "$(git -C "$repo_root" status --porcelain)" ]; then
     echo "$repo_root is not clean; the T3.3 suites will refuse to run. Commit first:" >&2
     git -C "$repo_root" status --short >&2
     exit 1
 fi
-CREATED_ENV=""
-if [ ! -f "$ENV_FILE" ]; then
-    echo "COMPOSE_PROJECT_NAME=$project" >"$ENV_FILE"
-    CREATED_ENV=1
-elif ! grep -qx "COMPOSE_PROJECT_NAME=$project" "$ENV_FILE"; then
-    echo "$ENV_FILE exists without COMPOSE_PROJECT_NAME=$project; refusing to guess" >&2
-    exit 1
-fi
+CORE="$repo_root/orchestrator/docker-compose.yml"
+core() { docker compose -p orchestrator -f "$CORE" "$@"; }
 restore() {
     if [ -n "$BACKUP" ]; then mv "$BACKUP" "$SETTINGS"; else rm -f "$SETTINGS"; fi
-    [ -n "$CREATED_ENV" ] && rm -f "$ENV_FILE"
+    if [ "$repo_root" != "$NEW_ROOT" ]; then
+        echo "restoring NEW's orchestrator images"
+        core down --remove-orphans >/dev/null 2>&1
+        docker compose -p orchestrator -f "$NEW_ROOT/orchestrator/docker-compose.yml" build >/dev/null
+    fi
 }
-if [ "$NODE" = dutch ]; then
-    "$HERE/stack.sh" down   # the fork's orchestrator needs port 18000
-else
-    "$HERE/stack.sh" "$VERSION" || exit 1
-fi
+"$HERE/stack.sh" down >/dev/null 2>&1
+core up -d --build || exit 1
+for _ in $(seq 1 60); do curl -sf "${ORCHESTRATOR_URL:-http://localhost:18000}/health" >/dev/null && break; sleep 1; done
+live=$("$HERE/stack.sh" which)
+case "$NODE-$VERSION" in
+    dutch-*) ;;  # the fork has its own API surface; checked by the suite itself
+    *) [ "$live" = "$VERSION" ] || { echo "expected $VERSION to be live, found $live" >&2; exit 1; } ;;
+esac
+echo "live: $live (project orchestrator, built from $repo_root @ ${commit:0:7})"
+
+# Script 50 only inspects the service keys left in Redis. On a fresh stack
+# there are none and it passes without testing anything, so, as in the
+# official closure run, one workflow carrying a service key is run first.
+# Same payload and procedure on both versions.
+prime_service_key() {  # log
+    local api="${ORCHESTRATOR_URL:-http://localhost:18000}" export="$repo_root/use-cases/germany-node/export"
+    local payload wf status=""
+    payload=$(jq -n --argjson b "$(cat "$export/blueprint.json")" --argjson d "$(cat "$export/dockerinfo.json")" \
+        --arg k "${SERVICE_API_KEY:?SERVICE_API_KEY must be set for script 50}" \
+        '{blueprint:$b, dockerinfo:$d, services_api_key:$k}')
+    wf=$(curl -s -X POST "$api/workflows" -H "Authorization: Bearer ${ORCHESTRATOR_API_KEY:-}" \
+        -H 'Content-Type: application/json' -d "$payload" | jq -r .workflow_id)
+    for _ in $(seq 1 300); do
+        status=$(curl -s "$api/workflows/$wf" -H "Authorization: Bearer ${ORCHESTRATOR_API_KEY:-}" | jq -r .status)
+        case "$status" in completed|failed) break ;; esac
+        sleep 1
+    done
+    echo "primed script 50 with workflow $wf (final status: $status)" | tee "$1"
+}
 
 # --- scripts -------------------------------------------------------------
 while IFS= read -r line; do
@@ -190,6 +201,9 @@ while IFS= read -r line; do
         continue
     fi
     log="$OUT/t33-logs/$NODE-$VERSION/$script.log"
+    if [ "$NODE-$num" = "german-50" ]; then
+        prime_service_key "$OUT/t33-logs/$NODE-$VERSION/50-prime.log"
+    fi
     started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     t0=$(date +%s)
     echo "=== $NODE $VERSION $script ${args[*]}"

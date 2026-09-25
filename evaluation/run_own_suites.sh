@@ -15,6 +15,10 @@
 # coverage.json and pytest.log. Integration tests need Docker (testcontainers).
 set -uo pipefail
 
+# Both versions read these at import time; a key left in the shell turns every
+# test that expects an open API into a 401.
+unset ORCHESTRATOR_API_KEY SERVICE_API_KEY ORCHESTRATOR_SECRET
+
 OUT="${1:?usage: run_own_suites.sh <out-dir> [levels]}"
 LEVELS="${2:-unit integration}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
