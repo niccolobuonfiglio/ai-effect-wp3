@@ -176,15 +176,22 @@ echo "live: $live (project orchestrator, built from $repo_root @ ${commit:0:7})"
 # Same payload and procedure on both versions.
 prime_service_key() {  # log
     local api="${ORCHESTRATOR_URL:-http://localhost:18000}" export="$repo_root/use-cases/germany-node/export"
-    local payload wf status=""
+    local payload wf status="" t
+    # VILLASnode crashes on its second restart (use-case defect F2), and
+    # script 01 has just restarted it: start from a fresh container.
+    docker compose -f "$repo_root/use-cases/germany-node/docker-compose.yml" \
+        up -d --force-recreate villas-node >/dev/null 2>&1
+    sleep 3
     payload=$(jq -n --argjson b "$(cat "$export/blueprint.json")" --argjson d "$(cat "$export/dockerinfo.json")" \
         --arg k "${SERVICE_API_KEY:?SERVICE_API_KEY must be set for script 50}" \
         '{blueprint:$b, dockerinfo:$d, services_api_key:$k}')
     wf=$(curl -s -X POST "$api/workflows" -H "Authorization: Bearer ${ORCHESTRATOR_API_KEY:-}" \
         -H 'Content-Type: application/json' -d "$payload" | jq -r .workflow_id)
-    for _ in $(seq 1 300); do
+    echo "    preparing script 50: workflow $wf submitted, waiting up to 300 s for it to finish"
+    for t in $(seq 1 300); do
         status=$(curl -s "$api/workflows/$wf" -H "Authorization: Bearer ${ORCHESTRATOR_API_KEY:-}" | jq -r .status)
         case "$status" in completed|failed) break ;; esac
+        (( t % 15 == 0 )) && echo "    ... ${t}s, status: $status"
         sleep 1
     done
     echo "primed script 50 with workflow $wf (final status: $status)" | tee "$1"
