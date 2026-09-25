@@ -155,11 +155,12 @@ class RedisStateStore:
         workflow_id: str,
         task_id: str,
         status: TaskStatus,
+        input_refs: list[DataReference] | None = None,
         output_refs: list[DataReference] | None = None,
         error: str | None = None,
         clear_error: bool = False,
     ) -> TaskState:
-        """Update task status and optionally set output refs.
+        """Update task status and optionally set input or output refs.
 
         ``clear_error`` resets a previously stored error (ignored if ``error``
         is given).
@@ -174,6 +175,8 @@ class RedisStateStore:
             "status": status,
             "updated_at": self._utc_now(),
         }
+        if input_refs is not None:
+            update_data["input_refs"] = input_refs
         if output_refs is not None:
             update_data["output_refs"] = output_refs
         if error is not None:

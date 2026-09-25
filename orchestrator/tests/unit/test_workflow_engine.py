@@ -1,5 +1,8 @@
 """Unit tests for WorkflowEngine."""
 
+import threading
+import time
+
 import pytest
 import fakeredis
 
@@ -9,7 +12,7 @@ from models.node import Node, OperationSignature, OperationSignatureList
 from models.state import TaskStatus, WorkflowStatus
 from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
-from services.workflow_engine import WorkflowEngine
+from services.workflow_engine import NotFailedError, WorkflowEngine
 
 
 def create_node(name: str, operation: str = "Process") -> Node:
@@ -860,3 +863,363 @@ class TestBlockedAge:
             engine.blocked_age("", "t")
         with pytest.raises(ValueError, match="task_id"):
             engine.blocked_age("wf", "")
+
+
+class TestConcurrentFanIn:
+    """Two predecessors finishing at the same moment must not lose work."""
+
+    def test_simultaneous_completions_keep_both_inputs(self, engine, task_queue):
+        """A diamond join sees both outputs and is queued exactly once."""
+        graph = create_fan_in_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task_a = engine.claim_task("wf-1", timeout=1)
+        task_b = engine.claim_task("wf-1", timeout=1)
+        outputs = {
+            task_a.task_id: DataReference(
+                protocol=Protocol.S3, uri="s3://bucket/a.json", format=Format.JSON
+            ),
+            task_b.task_id: DataReference(
+                protocol=Protocol.S3, uri="s3://bucket/b.json", format=Format.JSON
+            ),
+        }
+
+        start = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def finish(task_id: str) -> None:
+            try:
+                start.wait(timeout=5)
+                engine.complete_task("wf-1", task_id, output_refs=[outputs[task_id]])
+            except Exception as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=finish, args=(task_a.task_id,)),
+            threading.Thread(target=finish, args=(task_b.task_id,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert errors == []
+        # Queued once, not twice
+        assert task_queue.queue_length("wf-1") == 1
+
+        task_c = engine.claim_task("wf-1", timeout=1)
+        assert task_c.node_key == "service-c:Process"
+        assert {ref.uri for ref in task_c.input_refs} == {
+            "s3://bucket/a.json",
+            "s3://bucket/b.json",
+        }
+        # And nothing else is left to claim
+        assert engine.claim_task("wf-1", timeout=1) is None
+
+    def test_inputs_survive_an_interleaved_completion(self, engine):
+        """A producer writing while another is mid-update does not overwrite it.
+
+        The old implementation read the join's inputs, appended and wrote the
+        whole task back, so a completion that landed in between was lost.
+        """
+        graph = create_fan_in_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task_a = engine.claim_task("wf-1", timeout=1)
+        task_b = engine.claim_task("wf-1", timeout=1)
+
+        # B finishes entirely while A is between its own steps: A's later write
+        # must not drop B's inputs.
+        engine.complete_task(
+            "wf-1",
+            task_b.task_id,
+            output_refs=[
+                DataReference(
+                    protocol=Protocol.S3, uri="s3://bucket/b.json", format=Format.JSON
+                )
+            ],
+        )
+        engine.complete_task(
+            "wf-1",
+            task_a.task_id,
+            output_refs=[
+                DataReference(
+                    protocol=Protocol.S3, uri="s3://bucket/a.json", format=Format.JSON
+                )
+            ],
+        )
+
+        task_c = engine.claim_task("wf-1", timeout=1)
+        assert len(task_c.input_refs) == 2
+
+
+class TestLeases:
+    """Tests for leasing tasks and reclaiming them from dead workers."""
+
+    def test_claim_takes_a_lease(self, engine, task_queue):
+        """A claimed task is recorded as being processed."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        assert task_queue.leased_tasks("wf-1") == [task.task_id]
+
+    def test_completion_releases_the_lease(self, engine, task_queue):
+        """A finished task holds no lease."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.complete_task("wf-1", task.task_id)
+        assert task_queue.leased_tasks("wf-1") == []
+
+    def test_failure_releases_the_lease(self, engine, task_queue):
+        """A failed task holds no lease."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.fail_task("wf-1", task.task_id, "boom")
+        assert task_queue.leased_tasks("wf-1") == []
+
+    def test_deferral_releases_the_lease(self, engine, task_queue):
+        """A blocked task holds no lease while it waits."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.defer_task("wf-1", task.task_id, "service down", delay=60)
+        assert task_queue.leased_tasks("wf-1") == []
+
+    def test_renew_lease_keeps_the_task(self, engine, task_queue):
+        """Renewing while working keeps the task out of reach of reclaim."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.renew_lease("wf-1", task.task_id)
+        assert task_queue.leased_tasks("wf-1") == [task.task_id]
+        assert engine.release_due_tasks("wf-1") == 0
+
+    def test_expired_lease_is_reclaimed(self, state_store, task_queue, redis_client):
+        """A task whose worker died goes back to pending and is re-queued."""
+        engine = WorkflowEngine(
+            state_store, task_queue, redis_client, lease_seconds=0.001
+        )
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        assert task.status == TaskStatus.RUNNING
+        time.sleep(0.01)
+
+        assert engine.release_due_tasks("wf-1") == 1
+        assert state_store.get_task("wf-1", task.task_id).status == TaskStatus.PENDING
+
+        again = engine.claim_task("wf-1", timeout=1)
+        assert again.task_id == task.task_id
+
+    def test_reclaimed_task_keeps_its_inputs(self, state_store, task_queue, redis_client):
+        """Re-running a reclaimed task gives it the same inputs, not doubled."""
+        engine = WorkflowEngine(
+            state_store, task_queue, redis_client, lease_seconds=0.001
+        )
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow(
+            "wf-1",
+            initial_inputs=[
+                DataReference(
+                    protocol=Protocol.S3, uri="s3://bucket/in.json", format=Format.JSON
+                )
+            ],
+        )
+
+        first = engine.claim_task("wf-1", timeout=1)
+        assert len(first.input_refs) == 1
+        time.sleep(0.01)
+        engine.release_due_tasks("wf-1")
+
+        second = engine.claim_task("wf-1", timeout=1)
+        assert len(second.input_refs) == 1
+
+    def test_renew_lease_requires_ids(self, engine):
+        """Missing identifiers are rejected."""
+        with pytest.raises(ValueError, match="workflow_id is required"):
+            engine.renew_lease("", "task-1")
+        with pytest.raises(ValueError, match="task_id is required"):
+            engine.renew_lease("wf-1", "")
+
+
+class TestRetryTask:
+    """Tests for retrying a single failed task."""
+
+    def test_failed_task_is_requeued(self, engine, state_store):
+        """A retried task is pending again and claimable."""
+        graph = create_chain_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.fail_task("wf-1", task.task_id, "service exploded")
+
+        retried = engine.retry_task("wf-1", task.task_id)
+        assert retried.status == TaskStatus.PENDING
+        assert retried.error is None
+
+        claimed = engine.claim_task("wf-1", timeout=1)
+        assert claimed.task_id == task.task_id
+
+    def test_workflow_runs_again(self, engine, state_store):
+        """Retrying a task takes the workflow out of failed."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.fail_task("wf-1", task.task_id, "boom")
+        assert state_store.get_workflow("wf-1").status == WorkflowStatus.FAILED
+
+        engine.retry_task("wf-1", task.task_id)
+        workflow = state_store.get_workflow("wf-1")
+        assert workflow.status == WorkflowStatus.RUNNING
+        assert workflow.error is None
+
+    def test_task_with_unmet_dependencies_is_not_queued(self, engine, task_queue):
+        """A failed task still waiting on a predecessor is not enqueued."""
+        graph = create_chain_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task_a = engine.claim_task("wf-1", timeout=1)
+        task_b_id = engine._task_id_from_node_key("service-b:Process")
+        engine.fail_task("wf-1", task_b_id, "failed out of order")
+
+        engine.retry_task("wf-1", task_b_id)
+        assert task_queue.queue_length("wf-1") == 0
+
+    def test_retrying_a_running_task_raises(self, engine):
+        """Only failed tasks can be retried."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        with pytest.raises(NotFailedError, match="only failed tasks"):
+            engine.retry_task("wf-1", task.task_id)
+
+    def test_retrying_a_completed_task_raises(self, engine):
+        """Completed work is never re-run by a retry."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.complete_task("wf-1", task.task_id)
+        with pytest.raises(NotFailedError, match="only failed tasks"):
+            engine.retry_task("wf-1", task.task_id)
+
+    def test_requires_ids(self, engine):
+        """Missing identifiers are rejected."""
+        with pytest.raises(ValueError, match="workflow_id is required"):
+            engine.retry_task("", "task-1")
+        with pytest.raises(ValueError, match="task_id is required"):
+            engine.retry_task("wf-1", "")
+
+
+class TestResumeWorkflow:
+    """Tests for resuming a failed workflow."""
+
+    def test_failed_tasks_are_requeued(self, engine, state_store, task_queue):
+        """Resume queues the failed task and leaves completed ones alone."""
+        graph = create_chain_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task_a = engine.claim_task("wf-1", timeout=1)
+        engine.complete_task("wf-1", task_a.task_id)
+        task_b = engine.claim_task("wf-1", timeout=1)
+        completed_at = state_store.get_task("wf-1", task_a.task_id).updated_at
+        engine.fail_task("wf-1", task_b.task_id, "service exploded")
+
+        retried = engine.resume_workflow("wf-1")
+
+        assert retried == [task_b.task_id]
+        assert task_queue.queue_length("wf-1") == 1
+        assert state_store.get_workflow("wf-1").status == WorkflowStatus.RUNNING
+        # The completed task is untouched, so its result is not recomputed
+        task_a_now = state_store.get_task("wf-1", task_a.task_id)
+        assert task_a_now.status == TaskStatus.COMPLETED
+        assert task_a_now.updated_at == completed_at
+
+    def test_workflow_can_finish_after_resume(self, engine, state_store):
+        """A resumed workflow runs to completion."""
+        graph = create_chain_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task_a = engine.claim_task("wf-1", timeout=1)
+        engine.complete_task("wf-1", task_a.task_id)
+        task_b = engine.claim_task("wf-1", timeout=1)
+        engine.fail_task("wf-1", task_b.task_id, "transient problem")
+
+        engine.resume_workflow("wf-1")
+        for _ in range(2):
+            task = engine.claim_task("wf-1", timeout=1)
+            engine.complete_task("wf-1", task.task_id)
+
+        assert state_store.get_workflow("wf-1").status == WorkflowStatus.COMPLETED
+
+    def test_resuming_a_running_workflow_raises(self, engine):
+        """Only failed workflows can be resumed."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        with pytest.raises(NotFailedError, match="only failed workflows"):
+            engine.resume_workflow("wf-1")
+
+    def test_requires_workflow_id(self, engine):
+        """Missing workflow id is rejected."""
+        with pytest.raises(ValueError, match="workflow_id is required"):
+            engine.resume_workflow("")
+
+
+class TestTerminalStatesCancelRetries:
+    """A blocked task that ends must not be re-queued by its pending retry."""
+
+    def test_failing_a_blocked_task_cancels_its_retry(self, engine, task_queue):
+        """Giving up on a blocked task removes it from the delayed set."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.defer_task("wf-1", task.task_id, "service down", delay=0)
+        assert task_queue.delayed_tasks("wf-1") == [task.task_id]
+
+        engine.fail_task("wf-1", task.task_id, "gave up waiting")
+
+        assert task_queue.delayed_tasks("wf-1") == []
+        assert engine.release_due_tasks("wf-1") == 0
+
+    def test_completing_a_blocked_task_cancels_its_retry(self, engine, task_queue):
+        """A task that ran after all leaves no pending retry behind."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.defer_task("wf-1", task.task_id, "service down", delay=0)
+        engine.complete_task("wf-1", task.task_id)
+
+        assert task_queue.delayed_tasks("wf-1") == []
+        assert engine.release_due_tasks("wf-1") == 0

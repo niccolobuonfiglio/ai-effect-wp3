@@ -233,3 +233,26 @@ class AlertListResponse(BaseModel):
 
     alerts: list[dict[str, Any]] = []
     total: int
+
+
+class WorkflowResumeResponse(BaseModel):
+    """Result of resuming a failed workflow."""
+
+    model_config = ConfigDict(frozen=True)
+
+    workflow_id: str
+    status: str
+    retried_tasks: list[str] = []
+    message: str
+
+
+class TaskRetryResponse(BaseModel):
+    """Result of retrying a single failed task."""
+
+    model_config = ConfigDict(frozen=True)
+
+    workflow_id: str
+    task_id: str
+    node_key: str
+    status: str
+    message: str

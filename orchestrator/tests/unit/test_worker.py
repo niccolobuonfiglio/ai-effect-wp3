@@ -764,7 +764,7 @@ class TestBlockedMaxAge:
         assert "3601s" in reason and "3600s" in reason and "5 attempts" in reason
         assert "Connection failed" in reason
         assert "will be retried" not in reason        # it is giving up
-        assert "resubmit the workflow" in reason
+        assert "/resume" in reason
 
     def test_no_limit_by_default(
         self, mock_engine, mock_client, endpoints, breaker, sample_task
@@ -791,3 +791,127 @@ class TestBlockedMaxAge:
     def test_negative_limit_rejected(self, mock_engine, mock_client, endpoints):
         with pytest.raises(ValueError, match="blocked_max_age"):
             Worker(mock_engine, mock_client, endpoints, blocked_max_age=-1)
+
+
+class TestTaskMaxRuntime:
+    """Tests for the limit on how long a task may stay running."""
+
+    def test_hung_service_fails_the_task(
+        self, mock_engine, mock_client, endpoints, sample_task
+    ):
+        """A service that never finishes fails the task instead of polling forever."""
+        worker = Worker(
+            mock_engine,
+            mock_client,
+            endpoints,
+            poll_interval=0.01,
+            task_max_runtime=0.05,
+        )
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="running", task_id="svc-task-456"
+        )
+        mock_client.get_status.return_value = StatusResponse(
+            status="running", progress=10
+        )
+
+        assert worker.process_task("wf-123") is True
+
+        mock_engine.fail_task.assert_called_once()
+        error = mock_engine.fail_task.call_args[0][2]
+        assert "did not finish within" in error
+        mock_engine.complete_task.assert_not_called()
+
+    def test_hung_service_is_not_marked_down(
+        self, mock_engine, mock_client, endpoints, sample_task
+    ):
+        """The service answered, so the circuit breaker is not tripped."""
+        breaker = MagicMock()
+        breaker.allow.return_value = True
+        worker = Worker(
+            mock_engine,
+            mock_client,
+            endpoints,
+            poll_interval=0.01,
+            breaker=breaker,
+            task_max_runtime=0.05,
+        )
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="running", task_id="svc-task-456"
+        )
+        mock_client.get_status.return_value = StatusResponse(status="running")
+
+        worker.process_task("wf-123")
+
+        breaker.record_failure.assert_not_called()
+        mock_engine.defer_task.assert_not_called()
+
+    def test_zero_means_no_limit(
+        self, mock_engine, mock_client, endpoints, sample_task, sample_output
+    ):
+        """With the limit disabled a slow task still completes."""
+        worker = Worker(
+            mock_engine,
+            mock_client,
+            endpoints,
+            poll_interval=0.01,
+            task_max_runtime=0,
+        )
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="running", task_id="svc-task-456"
+        )
+        mock_client.get_status.side_effect = [
+            StatusResponse(status="running"),
+            StatusResponse(status="running"),
+            StatusResponse(status="complete"),
+        ]
+        mock_client.get_output.return_value = OutputResponse(output=sample_output)
+
+        assert worker.process_task("wf-123") is True
+        mock_engine.complete_task.assert_called_once()
+
+    def test_negative_limit_rejected(self, mock_engine, mock_client, endpoints):
+        """A negative runtime limit is a configuration error."""
+        with pytest.raises(ValueError, match="task_max_runtime must be non-negative"):
+            Worker(mock_engine, mock_client, endpoints, task_max_runtime=-1)
+
+
+class TestLeaseRenewal:
+    """The worker must hold its lease while a task is still running."""
+
+    def test_lease_renewed_on_each_poll(
+        self, worker, mock_engine, mock_client, sample_task, sample_output
+    ):
+        """Every wait between polls is preceded by a renewal."""
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="running", task_id="svc-task-456"
+        )
+        mock_client.get_status.side_effect = [
+            StatusResponse(status="running"),
+            StatusResponse(status="running"),
+            StatusResponse(status="complete"),
+        ]
+        mock_client.get_output.return_value = OutputResponse(output=sample_output)
+
+        worker.process_task("wf-123")
+
+        assert mock_engine.renew_lease.call_count == 2
+        mock_engine.renew_lease.assert_called_with("wf-123", "task-123")
+
+    def test_no_renewal_for_an_immediate_completion(
+        self, worker, mock_engine, mock_client, sample_task, sample_output
+    ):
+        """A task that finishes at once never needs to renew."""
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(
+            status="complete", task_id="svc-task-456"
+        )
+        mock_client.get_status.return_value = StatusResponse(status="complete")
+        mock_client.get_output.return_value = OutputResponse(output=sample_output)
+
+        worker.process_task("wf-123")
+
+        mock_engine.renew_lease.assert_not_called()

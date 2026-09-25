@@ -37,7 +37,13 @@ class WorkerDaemon:
 
         state_store = RedisStateStore(redis_client)
         task_queue = RedisTaskQueue(redis_client)
-        self.engine = WorkflowEngine(state_store, task_queue, redis_client)
+        # A task whose worker dies keeps its lease until this many seconds have
+        # passed; another worker then re-runs it. It must comfortably exceed
+        # the poll interval, since polling renews the lease.
+        self.lease_seconds = float(os.environ.get("LEASE_SECONDS", "300"))
+        self.engine = WorkflowEngine(
+            state_store, task_queue, redis_client, lease_seconds=self.lease_seconds
+        )
 
         # TLS verification for https service endpoints; a CA bundle path is
         # also accepted for private certificates.
@@ -62,6 +68,8 @@ class WorkerDaemon:
         )
         # 0 (the default) keeps a blocked task waiting for as long as it takes.
         self.blocked_max_age = float(os.environ.get("BLOCKED_TASK_MAX_AGE", "0"))
+        # 0 lets a task run for as long as its service keeps reporting it.
+        self.task_max_runtime = float(os.environ.get("TASK_MAX_RUNTIME", "3600"))
         self.policy = DataPolicy.from_env()
         self.secrets = SecretBox.from_env()
 
@@ -149,6 +157,7 @@ class WorkerDaemon:
             blocked_retry_delay=self.blocked_retry_delay,
             blocked_retry_initial=self.blocked_retry_initial,
             blocked_max_age=self.blocked_max_age,
+            task_max_runtime=self.task_max_runtime,
             policy=self.policy,
         )
         return worker.process_task(workflow_id, timeout=0)

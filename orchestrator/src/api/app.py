@@ -24,6 +24,7 @@ def _verify_orchestrator_key(
 
 from api.dashboard_routes import create_dashboard_router
 from api.health_routes import create_health_router
+from api.workflow_routes import create_workflow_router
 from api.models import (
     DataReferenceResponse,
     ErrorResponse,
@@ -302,6 +303,14 @@ class OrchestratorAPI:
         app.include_router(
             create_health_router(
                 self._registry,
+                dependencies=[Depends(_verify_orchestrator_key)],
+            )
+        )
+
+        # Resume a failed workflow / retry a failed task
+        app.include_router(
+            create_workflow_router(
+                self._engine,
                 dependencies=[Depends(_verify_orchestrator_key)],
             )
         )

@@ -34,6 +34,7 @@ class Worker:
         policy: DataPolicy | None = None,
         blocked_retry_initial: float | None = None,
         blocked_max_age: float | None = None,
+        task_max_runtime: float | None = None,
     ):
         """Initialize worker with dependencies.
 
@@ -53,6 +54,10 @@ class Worker:
             blocked_max_age: Fail a task that has been blocked for longer than
                 this many seconds, instead of retrying it forever. None or 0
                 means no limit.
+            task_max_runtime: Fail a task whose service keeps reporting
+                "running" for longer than this many seconds. None or 0 means
+                no limit. The service answered, so this does not count against
+                the circuit breaker.
             policy: Limits on the data references a service may return.
         """
         if engine is None:
@@ -69,6 +74,8 @@ class Worker:
             raise ValueError("blocked_retry_initial must be positive")
         if blocked_max_age is not None and blocked_max_age < 0:
             raise ValueError("blocked_max_age must be non-negative")
+        if task_max_runtime is not None and task_max_runtime < 0:
+            raise ValueError("task_max_runtime must be non-negative")
 
         self._engine = engine
         self._client = client
@@ -78,6 +85,7 @@ class Worker:
         self._blocked_retry_delay = blocked_retry_delay
         self._blocked_retry_initial = blocked_retry_initial
         self._blocked_max_age = blocked_max_age
+        self._task_max_runtime = task_max_runtime
         self._policy = policy or DataPolicy.from_env()
 
     def process_task(self, workflow_id: str, timeout: float = 0) -> bool:
@@ -260,8 +268,9 @@ class Worker:
                 workflow_id,
                 task_id,
                 f"{cause}. Giving up after {int(age)}s blocked (limit "
-                f"{int(self._blocked_max_age)}s) and {attempt} attempts; "
-                f"resubmit the workflow once the service is back",
+                f"{int(self._blocked_max_age)}s) and {attempt} attempts; once "
+                f"the service is back, continue with POST /workflows/"
+                f"{workflow_id}/resume",
             )
             logger.error(
                 "Task %s of workflow %s failed after %ds blocked: %s",
@@ -328,7 +337,13 @@ class Worker:
         workflow_id: str,
         task_id: str,
     ) -> list[DataReference]:
-        """Poll service status until complete."""
+        """Poll service status until complete, or until the task times out.
+
+        Each poll also renews the task's lease, so a task that legitimately
+        runs for a long time is not reclaimed by another worker, while a task
+        whose service never finishes is failed after ``task_max_runtime``.
+        """
+        started = time.time()
         while True:
             status = self._client.get_status(base_url, service_task_id)
 
@@ -340,5 +355,13 @@ class Worker:
                 error = status.error or "Service task failed"
                 raise WorkerError(error)
 
-            # Still running - wait and poll again
+            elapsed = time.time() - started
+            if self._task_max_runtime and elapsed >= self._task_max_runtime:
+                raise WorkerError(
+                    f"Service did not finish within {int(self._task_max_runtime)}s "
+                    f"(still reporting '{status.status}' after {int(elapsed)}s)"
+                )
+
+            # Still running - keep the lease, then wait and poll again
+            self._engine.renew_lease(workflow_id, task_id)
             time.sleep(self._poll_interval)

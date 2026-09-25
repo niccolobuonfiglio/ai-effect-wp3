@@ -1,6 +1,8 @@
 """Workflow engine for orchestrating task execution."""
 
 import hashlib
+import json
+import logging
 import time
 
 from redis import Redis
@@ -10,7 +12,15 @@ from models.graph import ExecutionGraph, GraphNode
 from models.state import TaskState, TaskStatus, WorkflowState, WorkflowStatus
 from services.privacy import sanitize_error
 from services.state_store import RedisStateStore
-from services.task_queue import RedisTaskQueue
+from services.task_queue import DEFAULT_LEASE_SECONDS, RedisTaskQueue
+
+logger = logging.getLogger(__name__)
+
+INITIAL_INPUTS = "initial"
+
+
+class NotFailedError(Exception):
+    """Raised when retrying something that has not failed."""
 
 
 class WorkflowEngine:
@@ -21,6 +31,7 @@ class WorkflowEngine:
         state_store: RedisStateStore,
         task_queue: RedisTaskQueue,
         redis_client: Redis,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
     ):
         if state_store is None:
             raise ValueError("state_store is required")
@@ -32,6 +43,7 @@ class WorkflowEngine:
         self._state_store = state_store
         self._task_queue = task_queue
         self._redis = redis_client
+        self._lease_seconds = lease_seconds
 
     def _deps_key(self, workflow_id: str, task_id: str) -> str:
         return f"deps:{workflow_id}:{task_id}"
@@ -113,11 +125,19 @@ class WorkflowEngine:
             if deps_count == 0:
                 # Set initial inputs for start nodes
                 if initial_inputs:
-                    self._append_input_refs(workflow_id, task_id, initial_inputs)
-                self._task_queue.enqueue_task(workflow_id, task_id)
+                    self._store_inputs(
+                        workflow_id, task_id, INITIAL_INPUTS, initial_inputs
+                    )
+                self._task_queue.claim_enqueue(workflow_id, task_id)
 
     def claim_task(self, workflow_id: str, timeout: int = 0) -> TaskState | None:
-        """Claim next available task for execution."""
+        """Claim next available task for execution.
+
+        The claiming worker is the only writer of the task at this point, so
+        this is where the inputs its predecessors stored separately are
+        gathered into ``input_refs``. It also takes a lease, so the task is
+        picked up again if this worker dies before finishing it.
+        """
         if not workflow_id:
             raise ValueError("workflow_id is required")
 
@@ -125,9 +145,21 @@ class WorkflowEngine:
         if task_id is None:
             return None
 
+        self._task_queue.lease(workflow_id, task_id, self._lease_seconds)
         return self._state_store.update_task_status(
-            workflow_id, task_id, TaskStatus.RUNNING
+            workflow_id,
+            task_id,
+            TaskStatus.RUNNING,
+            input_refs=self._collect_inputs(workflow_id, task_id),
         )
+
+    def renew_lease(self, workflow_id: str, task_id: str) -> None:
+        """Extend the lease of a task that is still being worked on."""
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+        self._task_queue.lease(workflow_id, task_id, self._lease_seconds)
 
     def complete_task(
         self,
@@ -145,6 +177,8 @@ class WorkflowEngine:
             workflow_id, task_id, TaskStatus.COMPLETED, output_refs=output_refs
         )
         self._task_queue.reset_attempts(workflow_id, task_id)
+        self._task_queue.release_lease(workflow_id, task_id)
+        self._task_queue.unschedule(workflow_id, task_id)
 
         # Remove this task from dependents' dependency sets
         dependent_ids = self._redis.smembers(
@@ -154,16 +188,19 @@ class WorkflowEngine:
             if isinstance(dep_id, bytes):
                 dep_id = dep_id.decode("utf-8")
 
-            # Pass output refs to dependent task as input
+            # Pass output refs to dependent task as input, under this task's
+            # own field so that two predecessors finishing at the same moment
+            # cannot overwrite each other.
             if output_refs:
-                self._append_input_refs(workflow_id, dep_id, output_refs)
+                self._store_inputs(workflow_id, dep_id, task_id, output_refs)
 
             self._redis.srem(self._deps_key(workflow_id, dep_id), task_id)
 
-            # If dependent has no more dependencies, enqueue it
+            # If dependent has no more dependencies, enqueue it - but only
+            # once, even if the last two predecessors finish simultaneously.
             remaining = self._redis.scard(self._deps_key(workflow_id, dep_id))
             if remaining == 0:
-                self._task_queue.enqueue_task(workflow_id, dep_id)
+                self._task_queue.claim_enqueue(workflow_id, dep_id)
 
         # Check if workflow is complete
         if self._all_tasks_completed(workflow_id):
@@ -173,19 +210,23 @@ class WorkflowEngine:
 
         return task
 
-    def _append_input_refs(
+    def _store_inputs(
         self,
         workflow_id: str,
         task_id: str,
+        source: str,
         refs: list[DataReference],
     ) -> None:
-        """Append input refs to a pending task."""
-        task = self._state_store.get_task(workflow_id, task_id)
-        updated_refs = list(task.input_refs) + list(refs)
-        # Update task with new input refs
-        updated = task.model_copy(update={"input_refs": updated_refs})
-        key = f"task:{workflow_id}:{task_id}"
-        self._redis.set(key, updated.model_dump_json())
+        """Record the inputs ``source`` produced for a task not yet running."""
+        payload = json.dumps([ref.model_dump(mode="json") for ref in refs])
+        self._task_queue.add_inputs(workflow_id, task_id, source, payload)
+
+    def _collect_inputs(self, workflow_id: str, task_id: str) -> list[DataReference]:
+        """The inputs stored for a task, in producer order."""
+        refs: list[DataReference] = []
+        for payload in self._task_queue.inputs(workflow_id, task_id):
+            refs.extend(DataReference(**item) for item in json.loads(payload))
+        return refs
 
     def fail_task(self, workflow_id: str, task_id: str, error: str) -> TaskState:
         """Mark task as failed and fail the workflow."""
@@ -201,6 +242,8 @@ class WorkflowEngine:
             workflow_id, task_id, TaskStatus.FAILED, error=error
         )
         self._task_queue.reset_attempts(workflow_id, task_id)
+        self._task_queue.release_lease(workflow_id, task_id)
+        self._task_queue.unschedule(workflow_id, task_id)
 
         self._state_store.update_workflow_status(
             workflow_id, WorkflowStatus.FAILED, error=f"Task {task_id} failed: {error}"
@@ -226,6 +269,7 @@ class WorkflowEngine:
         task = self._state_store.update_task_status(
             workflow_id, task_id, TaskStatus.BLOCKED, error=sanitize_error(reason)
         )
+        self._task_queue.release_lease(workflow_id, task_id)
         self._task_queue.schedule_task(workflow_id, task_id, delay)
         return task
 
@@ -250,14 +294,35 @@ class WorkflowEngine:
         return max(0.0, time.time() - self._task_queue.mark_blocked(workflow_id, task_id))
 
     def release_due_tasks(self, workflow_id: str) -> int:
-        """Re-queue blocked tasks whose retry delay has elapsed."""
+        """Re-queue tasks that are due to run again.
+
+        Two kinds: blocked tasks whose retry delay has elapsed, and tasks whose
+        lease expired because the worker holding them died.
+        """
         if not workflow_id:
             raise ValueError("workflow_id is required")
 
         released = self._task_queue.release_due_tasks(
             workflow_id, on_release=lambda t: self._mark_released(workflow_id, t)
         )
-        return len(released)
+        reclaimed = self._task_queue.reclaim_expired(
+            workflow_id, on_reclaim=lambda t: self._reclaim(workflow_id, t)
+        )
+        return len(released) + len(reclaimed)
+
+    def _reclaim(self, workflow_id: str, task_id: str) -> None:
+        """Put a task whose worker is gone back to PENDING, ready to re-run."""
+        logger.warning(
+            "Task %s of workflow %s lost its worker; re-queueing it",
+            task_id,
+            workflow_id,
+            extra={
+                "event": "task_reclaimed",
+                "workflow_id": workflow_id,
+                "task_id": task_id,
+            },
+        )
+        self._mark_released(workflow_id, task_id)
 
     def resume_blocked_tasks(self, workflow_id: str, service_name: str) -> int:
         """Immediately re-queue tasks of a running workflow blocked on a service.
@@ -284,8 +349,67 @@ class WorkflowEngine:
         )
         return len(released)
 
-    def _mark_released(self, workflow_id: str, task_id: str) -> None:
-        self._state_store.update_task_status(
+    def retry_task(self, workflow_id: str, task_id: str) -> TaskState:
+        """Put a failed task back on the queue, keeping everything else.
+
+        Raises ``NotFailedError`` if the task did not fail; completed tasks are
+        never re-run this way.
+        """
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+
+        task = self._state_store.get_task(workflow_id, task_id)
+        if task.status != TaskStatus.FAILED:
+            raise NotFailedError(
+                f"Task {task_id} is {task.status.value}, only failed tasks can be retried"
+            )
+
+        task = self._requeue_failed_task(workflow_id, task_id)
+        # update_workflow_status clears the error when none is passed
+        self._state_store.update_workflow_status(workflow_id, WorkflowStatus.RUNNING)
+        return task
+
+    def resume_workflow(self, workflow_id: str) -> list[str]:
+        """Re-queue every failed task of a failed workflow.
+
+        Completed tasks keep their results, so the workflow continues where it
+        stopped. Returns the task ids that were re-queued.
+        """
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+
+        workflow = self._state_store.get_workflow(workflow_id)
+        if workflow.status != WorkflowStatus.FAILED:
+            raise NotFailedError(
+                f"Workflow {workflow_id} is {workflow.status.value}, "
+                "only failed workflows can be resumed"
+            )
+
+        retried = [
+            task.task_id
+            for task in self._state_store.get_workflow_tasks(workflow_id)
+            if task.status == TaskStatus.FAILED
+        ]
+        for task_id in retried:
+            self._requeue_failed_task(workflow_id, task_id)
+
+        # update_workflow_status clears the error when none is passed
+        self._state_store.update_workflow_status(workflow_id, WorkflowStatus.RUNNING)
+        return retried
+
+    def _requeue_failed_task(self, workflow_id: str, task_id: str) -> TaskState:
+        """Reset one failed task and queue it if its dependencies are met."""
+        task = self._mark_released(workflow_id, task_id)
+        self._task_queue.reset_attempts(workflow_id, task_id)
+        self._task_queue.clear_enqueue_guard(workflow_id, task_id)
+        if self._redis.scard(self._deps_key(workflow_id, task_id)) == 0:
+            self._task_queue.claim_enqueue(workflow_id, task_id)
+        return task
+
+    def _mark_released(self, workflow_id: str, task_id: str) -> TaskState:
+        return self._state_store.update_task_status(
             workflow_id, task_id, TaskStatus.PENDING, clear_error=True
         )
 

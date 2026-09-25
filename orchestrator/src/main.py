@@ -48,6 +48,8 @@ def create_app() -> "uvicorn.ASGIApplication":
     redis_client = get_redis_client()
     state_store = RedisStateStore(redis_client)
     task_queue = RedisTaskQueue(redis_client)
+    # The API never claims tasks, so it needs no lease setting: leases are a
+    # worker concern (see docs/SCHEDULING.md).
     engine = WorkflowEngine(state_store, task_queue, redis_client)
     blueprint_parser = BlueprintParser()
     dockerinfo_parser = DockerInfoParser()

@@ -34,6 +34,8 @@ def clean_env(monkeypatch):
         "BLOCKED_TASK_RETRY_INITIAL",
         "CIRCUIT_RESET_INITIAL",
         "BLOCKED_TASK_MAX_AGE",
+        "TASK_MAX_RUNTIME",
+        "LEASE_SECONDS",
         "ALERT_REPEAT_SECONDS",
         "ALLOW_INLINE",
         "MAX_INLINE_BYTES",
@@ -99,6 +101,8 @@ class TestConfiguration:
         assert daemon.blocked_retry_delay == 30.0
         assert daemon.blocked_retry_initial == 2.0
         assert daemon.blocked_max_age == 0.0          # no limit unless configured
+        assert daemon.task_max_runtime == 3600.0      # a task may not hang forever
+        assert daemon.lease_seconds == 300.0
         assert daemon.breaker._alert_repeat == 900.0
         assert daemon.breaker._initial_reset_timeout == 5.0
         assert daemon.breaker._reset_timeout == 60.0
@@ -111,6 +115,8 @@ class TestConfiguration:
         monkeypatch.setenv("MAX_INLINE_BYTES", "128")
         monkeypatch.setenv("BLOCKED_TASK_MAX_AGE", "3600")
         monkeypatch.setenv("ALERT_REPEAT_SECONDS", "60")
+        monkeypatch.setenv("TASK_MAX_RUNTIME", "120")
+        monkeypatch.setenv("LEASE_SECONDS", "45")
 
         daemon = WorkerDaemon(redis_client)
 
@@ -119,6 +125,8 @@ class TestConfiguration:
         assert daemon.policy.max_inline_bytes == 128
         assert daemon.blocked_max_age == 3600.0
         assert daemon.breaker._alert_repeat == 60.0
+        assert daemon.task_max_runtime == 120.0
+        assert daemon.lease_seconds == 45.0
 
     @pytest.mark.parametrize(
         "raw, expected",
