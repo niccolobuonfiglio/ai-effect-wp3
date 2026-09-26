@@ -7,6 +7,19 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 from models.data_reference import DataReference
 
+# Status codes with which a service refuses the caller's credentials.
+AUTH_REFUSED = (401, 403)
+
+
+def parse_tls_verify(value: str | None) -> bool | str:
+    """Read SERVICE_TLS_VERIFY as a flag, or as a path to a CA bundle."""
+    setting = (value or "").strip()
+    if setting.lower() in ("0", "false", "no", "off"):
+        return False
+    if setting.lower() in ("", "1", "true", "yes", "on"):
+        return True
+    return setting
+
 
 class ControlClientError(Exception):
     """Raised when control call fails.
@@ -152,6 +165,25 @@ class ControlClient:
             return ExecuteResponse.model_validate(data)
         except Exception as e:
             raise ControlClientError(f"Invalid response: {e}") from e
+
+    def check_access(self, base_url: str) -> int | None:
+        """Ask a service whether it accepts this client's token, running nothing.
+
+        Sends ``POST /control/execute`` with an empty body. A service that
+        checks tokens refuses a missing or wrong one (401/403) before it reads
+        the body; one that accepts it rejects the empty body (422), so no
+        operation is started either way. Returns the status code, or None when
+        the service could not be reached.
+        """
+        if not base_url or not base_url.strip():
+            raise ValueError("base_url is required")
+
+        url = f"{base_url.rstrip('/')}/control/execute"
+        try:
+            with httpx.Client(timeout=self._timeout, verify=self._verify) as client:
+                return client.post(url, json={}, headers=self._headers).status_code
+        except httpx.HTTPError:
+            return None
 
     def get_status(self, base_url: str, task_id: str) -> StatusResponse:
         """Call GET /control/status/{task_id}."""

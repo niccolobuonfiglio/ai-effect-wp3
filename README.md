@@ -379,6 +379,12 @@ curl -s -X POST http://localhost:18000/workflows \
   }' | jq .
 ```
 
+Before accepting the workflow, the orchestrator asks every service whether it accepts that key: it sends `POST /control/execute` with an empty body, which a service refuses with 401/403 when the key is missing or wrong and otherwise rejects as invalid (422) without running anything. If any service refuses, the submission fails with `400` naming those services, instead of the workflow failing later at its first task. Services that cannot be reached at that moment do not block the submission; an outage is handled by the circuit breaker when their task runs. Set `SERVICE_AUTH_CHECK=false` to skip the check. The API container joins the `ai-effect-services` network for it.
+
+The stored key is removed when the workflow completes or is deleted. A failed workflow keeps it, since `resume` and `retry` call the services again.
+
+Both the orchestrator and the services compare keys in constant time (`hmac.compare_digest`), so response timing does not reveal them.
+
 ### Key generation
 
 ```bash

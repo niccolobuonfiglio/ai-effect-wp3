@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 PREFIX = "enc:v1:"
 
 
+def services_key_name(workflow_id: str) -> str:
+    """Redis key holding a workflow's (encrypted) services API key.
+
+    It lives only as long as the workflow can still call services: it is
+    removed when the workflow completes or is deleted. A failed workflow keeps
+    it, because resume and retry run its tasks again.
+    """
+    return f"services_key:{workflow_id}"
+
+
 class SecretDecryptionError(Exception):
     """Raised when a stored value cannot be decrypted."""
 

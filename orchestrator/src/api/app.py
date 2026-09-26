@@ -1,7 +1,9 @@
 """FastAPI REST API for orchestration platform."""
 
+import hmac
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +21,10 @@ def _verify_orchestrator_key(
     api_key = os.environ.get("ORCHESTRATOR_API_KEY")
     if not api_key:
         return
-    if not credentials or credentials.credentials != api_key:
+    # Constant-time comparison, so response timing does not reveal the key
+    if not credentials or not hmac.compare_digest(
+        credentials.credentials.encode("utf-8"), api_key.encode("utf-8")
+    ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 from api.dashboard_routes import create_dashboard_router
@@ -38,10 +43,11 @@ from api.models import (
 from models.data_reference import DataReference
 from services.blueprint_parser import BlueprintParseError, BlueprintParser
 from services.circuit_breaker import CircuitBreaker
+from services.control_client import AUTH_REFUSED, ControlClient, parse_tls_verify
 from services.dockerinfo_parser import DockerInfoParseError, DockerInfoParser
 from services.log_reader import LogReader
 from services.privacy import DataPolicy, DataPolicyError
-from services.secrets import SecretBox
+from services.secrets import SecretBox, services_key_name
 from services.service_registry import ServiceRegistry
 from services.state_store import WorkflowNotFoundError, TaskNotFoundError
 from services.workflow_catalog import WorkflowCatalog
@@ -49,6 +55,9 @@ from services.workflow_engine import WorkflowEngine
 
 # The dashboard page served at /ui (a single static HTML file).
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+
+# Seconds to wait for each service when checking credentials at submission
+SERVICE_AUTH_CHECK_TIMEOUT = 3.0
 
 
 class OrchestratorAPI:
@@ -66,8 +75,14 @@ class OrchestratorAPI:
         secrets: SecretBox | None = None,
         catalog: WorkflowCatalog | None = None,
         log_reader: LogReader | None = None,
+        service_auth_check: bool | None = None,
     ):
-        """Initialize API with dependencies."""
+        """Initialize API with dependencies.
+
+        ``service_auth_check`` asks every service, when a workflow is
+        submitted, whether it accepts the workflow's services API key. None
+        reads SERVICE_AUTH_CHECK (default on).
+        """
         if engine is None:
             raise ValueError("engine is required")
         if blueprint_parser is None:
@@ -89,6 +104,52 @@ class OrchestratorAPI:
         self._secrets = secrets or SecretBox.from_env()
         self._catalog = catalog or WorkflowCatalog(redis_client)
         self._log_reader = log_reader or LogReader()
+        if service_auth_check is None:
+            service_auth_check = os.environ.get(
+                "SERVICE_AUTH_CHECK", "true"
+            ).strip().lower() not in ("0", "false", "no", "off")
+        self._service_auth_check = service_auth_check
+
+    def _check_service_access(
+        self, endpoints: dict, services_api_key: str | None
+    ) -> None:
+        """Refuse a workflow whose services would reject its credentials.
+
+        Without this the mistake only shows when the first task runs, as a
+        failed workflow. Services that cannot be reached are let through: an
+        outage is the circuit breaker's business and may be over by the time
+        their task runs.
+        """
+        names = list(endpoints or {})
+        if not self._service_auth_check or not names:
+            return
+
+        client = ControlClient(
+            timeout=SERVICE_AUTH_CHECK_TIMEOUT,
+            api_key=services_api_key,
+            verify=parse_tls_verify(os.environ.get("SERVICE_TLS_VERIFY")),
+        )
+        with ThreadPoolExecutor(max_workers=min(8, len(names))) as pool:
+            codes = pool.map(
+                lambda name: client.check_access(endpoints[name].base_url), names
+            )
+            refused = sorted(
+                name for name, code in zip(names, codes) if code in AUTH_REFUSED
+            )
+
+        if refused:
+            reason = (
+                "the services_api_key was not accepted"
+                if services_api_key
+                else "no services_api_key was given"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Services refused the orchestrator's credentials "
+                    f"({reason}): {', '.join(refused)}"
+                ),
+            )
 
     def _reference_response(self, reference: DataReference) -> "DataReferenceResponse":
         """Build an API view of a reference, masking inline payloads."""
@@ -131,13 +192,16 @@ class OrchestratorAPI:
             except DockerInfoParseError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid dockerinfo: {e}")
 
+            # Before anything is stored: would the services accept the key?
+            self._check_service_access(endpoints, request.services_api_key)
+
             # Generate workflow ID
             workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
 
             # Store services API key for worker to use when calling services
             if request.services_api_key:
                 self._redis.set(
-                    f"services_key:{workflow_id}",
+                    services_key_name(workflow_id),
                     self._secrets.encrypt(request.services_api_key),
                 )
 
@@ -283,8 +347,9 @@ class OrchestratorAPI:
             # Delete workflow state
             self._engine._state_store.delete_workflow(workflow_id)
 
-            # Delete endpoints
+            # Delete endpoints and the services API key
             self._redis.delete(f"endpoints:{workflow_id}")
+            self._redis.delete(services_key_name(workflow_id))
 
             # Remove it from the dashboard's catalog
             self._catalog.forget(workflow_id)

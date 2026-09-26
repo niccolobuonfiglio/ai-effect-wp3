@@ -10,11 +10,11 @@ import time
 import redis
 
 from services.circuit_breaker import CircuitBreaker
-from services.control_client import ControlClient
+from services.control_client import ControlClient, parse_tls_verify
 from services.dockerinfo_parser import ServiceEndpoint
 from services.log_service import configure_logging
 from services.privacy import DataPolicy
-from services.secrets import SecretBox, SecretDecryptionError
+from services.secrets import SecretBox, SecretDecryptionError, services_key_name
 from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
 from services.worker import Worker
@@ -76,12 +76,7 @@ class WorkerDaemon:
     @staticmethod
     def _tls_verify(value: str) -> bool | str:
         """Read SERVICE_TLS_VERIFY as a flag, or as a path to a CA bundle."""
-        setting = (value or "").strip()
-        if setting.lower() in ("0", "false", "no", "off"):
-            return False
-        if setting.lower() in ("", "1", "true", "yes", "on"):
-            return True
-        return setting
+        return parse_tls_verify(value)
 
     def load_endpoints(self, workflow_id: str) -> dict[str, ServiceEndpoint]:
         """Load service endpoints for a workflow from Redis."""
@@ -123,7 +118,7 @@ class WorkerDaemon:
 
     def load_services_key(self, workflow_id: str) -> str | None:
         """Load and decrypt the services API key for a workflow."""
-        stored = self.redis_client.get(f"services_key:{workflow_id}")
+        stored = self.redis_client.get(services_key_name(workflow_id))
         try:
             return self.secrets.decrypt(stored)
         except SecretDecryptionError as e:

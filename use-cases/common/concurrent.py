@@ -8,6 +8,7 @@ for single-process containers. For multi-process deployments (e.g., multiple
 uvicorn workers), use external state storage like Redis instead.
 """
 
+import hmac
 import logging
 import os
 import threading
@@ -27,7 +28,10 @@ def _check_api_key(
     api_key = os.environ.get("SERVICE_API_KEY")
     if not api_key:
         return
-    if not credentials or credentials.credentials != api_key:
+    # Constant-time comparison, so response timing does not reveal the key
+    if not credentials or not hmac.compare_digest(
+        credentials.credentials.encode("utf-8"), api_key.encode("utf-8")
+    ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 logger = logging.getLogger(__name__)

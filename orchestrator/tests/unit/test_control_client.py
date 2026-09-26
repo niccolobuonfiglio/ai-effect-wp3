@@ -475,3 +475,39 @@ class TestModels:
         """Create valid OutputResponse."""
         resp = OutputResponse(output=sample_output)
         assert resp.output == sample_output
+
+
+class TestCheckAccess:
+    """check_access asks a service whether it takes the token, running nothing."""
+
+    URL = "http://svc:8080/control/execute"
+
+    def test_returns_refusal_status(self, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(url=self.URL, method="POST", status_code=401)
+
+        assert ControlClient(api_key="wrong").check_access("http://svc:8080") == 401
+
+    def test_accepted_token_meets_body_validation(self, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(url=self.URL, method="POST", status_code=422)
+
+        assert ControlClient(api_key="right").check_access("http://svc:8080") == 422
+
+    def test_sends_token_and_empty_body(self, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(url=self.URL, method="POST", status_code=422)
+
+        ControlClient(api_key="k").check_access("http://svc:8080/")
+
+        request = httpx_mock.get_request()
+        assert request.headers["Authorization"] == "Bearer k"
+        assert request.content == b"{}"
+
+    def test_unreachable_service_returns_none(self, httpx_mock: HTTPXMock):
+        import httpx
+
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+
+        assert ControlClient().check_access("http://svc:8080") is None
+
+    def test_empty_base_url_raises(self):
+        with pytest.raises(ValueError, match="base_url is required"):
+            ControlClient().check_access("")

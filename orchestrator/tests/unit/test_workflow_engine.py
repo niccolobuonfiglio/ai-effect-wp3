@@ -431,6 +431,41 @@ class TestCompleteTask:
         assert "s3://bucket/a.json" in uris
         assert "s3://bucket/b.json" in uris
 
+    def test_fan_in_inputs_name_their_source_node(self, engine):
+        """Each fan-in input says which node produced it, keeping its metadata."""
+        graph = create_fan_in_graph()
+        engine.initialize_workflow("wf-1", graph)
+        engine.start_workflow("wf-1")
+
+        for _ in range(2):
+            task = engine.claim_task("wf-1", timeout=1)
+            name = task.node_key.split(":")[0]
+            output = DataReference(
+                protocol=Protocol.S3,
+                uri=f"s3://bucket/{name}.json",
+                format=Format.JSON,
+                metadata={"rows": 10},
+            )
+            engine.complete_task("wf-1", task.task_id, output_refs=[output])
+
+        task_c = engine.claim_task("wf-1", timeout=1)
+        by_source = {ref.metadata["source_node"]: ref for ref in task_c.input_refs}
+        assert by_source["service-a:Process"].uri == "s3://bucket/service-a.json"
+        assert by_source["service-b:Process"].uri == "s3://bucket/service-b.json"
+        assert by_source["service-a:Process"].metadata["rows"] == 10
+
+    def test_initial_inputs_are_tagged_initial(self, engine):
+        """Workflow inputs are tagged with the ``initial`` source."""
+        graph = create_single_node_graph()
+        engine.initialize_workflow("wf-1", graph)
+        initial = DataReference(
+            protocol=Protocol.S3, uri="s3://bucket/in.json", format=Format.JSON
+        )
+        engine.start_workflow("wf-1", initial_inputs=[initial])
+
+        task = engine.claim_task("wf-1", timeout=1)
+        assert task.input_refs[0].metadata == {"source_node": "initial"}
+
     def test_enqueues_ready_dependent(self, engine, task_queue):
         """Complete enqueues dependent task when ready."""
         graph = create_chain_graph()
@@ -1223,3 +1258,32 @@ class TestTerminalStatesCancelRetries:
 
         assert task_queue.delayed_tasks("wf-1") == []
         assert engine.release_due_tasks("wf-1") == 0
+
+
+class TestServicesKeyLifetime:
+    """The workflow's services API key lives only while tasks may still run."""
+
+    def test_removed_when_workflow_completes(self, engine, redis_client):
+        engine.initialize_workflow("wf-1", create_chain_graph())
+        redis_client.set("services_key:wf-1", "enc:v1:token")
+        engine.start_workflow("wf-1")
+
+        for _ in range(2):
+            task = engine.claim_task("wf-1", timeout=1)
+            engine.complete_task("wf-1", task.task_id)
+            assert redis_client.exists("services_key:wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.complete_task("wf-1", task.task_id)
+
+        assert not redis_client.exists("services_key:wf-1")
+
+    def test_kept_when_workflow_fails_so_resume_can_use_it(self, engine, redis_client):
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        redis_client.set("services_key:wf-1", "enc:v1:token")
+        engine.start_workflow("wf-1")
+
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.fail_task("wf-1", task.task_id, "boom")
+
+        assert redis_client.exists("services_key:wf-1")

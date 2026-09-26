@@ -8,6 +8,8 @@ being repeated in every module.
 Settings (environment):
     ORCHESTRATOR_URL      default http://localhost:18000
     ORCHESTRATOR_API_KEY  sent as bearer token when set
+    SERVICE_API_KEY       submitted with each workflow when set, so the
+                          orchestrator can call services that require it
     REDIS_URL             default redis://localhost:16379/0
 """
 
@@ -27,6 +29,9 @@ USE_CASE_COMPOSE = USE_CASE / "docker-compose.yml"
 
 API = os.environ.get("ORCHESTRATOR_URL", "http://localhost:18000").rstrip("/")
 API_KEY = os.environ.get("ORCHESTRATOR_API_KEY") or None
+# docker compose passes the same variable to the pipeline services, which then
+# refuse calls without it.
+SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY") or None
 # The orchestrator's Redis, published by docker-compose.yml.
 REDIS_URL = os.environ.get("SYSTEM_TEST_REDIS_URL", "redis://localhost:16379/0")
 
@@ -82,7 +87,10 @@ def wait_for(condition, timeout: float, interval: float = 1.0, what: str = "cond
 def payload() -> dict:
     blueprint = json.loads((USE_CASE / "export" / "blueprint.json").read_text())
     dockerinfo = json.loads((USE_CASE / "export" / "dockerinfo.json").read_text())
-    return {"blueprint": blueprint, "dockerinfo": dockerinfo}
+    body = {"blueprint": blueprint, "dockerinfo": dockerinfo}
+    if SERVICE_API_KEY:
+        body["services_api_key"] = SERVICE_API_KEY
+    return body
 
 
 def submit() -> str:

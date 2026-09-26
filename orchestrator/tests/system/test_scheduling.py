@@ -119,32 +119,53 @@ def test_reclaim_is_logged(workers_stopped, engine):
 
 
 def test_failed_workflow_resumes_where_it_stopped(workers_stopped, engine):
-    """Resume re-runs only the failed task, keeping completed results."""
-    # Let the pipeline run normally first, so real outputs exist.
-    compose(ORCHESTRATOR_COMPOSE, "start", "worker")
-    wf = submit()
-    assert wait_for(lambda: finished(wf), timeout=90, what=f"{wf} to finish") == "completed"
+    """Resume re-runs only the failed task, keeping completed results.
 
-    # Now fail its last task, as a service that reports an error would.
-    compose(ORCHESTRATOR_COMPOSE, "stop", "worker")
-    last = "report_generator1:GenerateReport"
-    engine.fail_task(wf, task_id_of(wf, last), "simulated failure for the resume test")
+    The failure is the one resume exists for: a service stays down until its
+    task gives up (``BLOCKED_TASK_MAX_AGE``), the service comes back, and the
+    operator resumes. The workflow never completes before that, so it still
+    holds its services API key, which is dropped only on completion.
+    """
+    blocked = f"{SERVICE}:AnalyzeData"
+    compose(USE_CASE_COMPOSE, "stop", COMPOSE_SERVICE)
+    try:
+        compose(ORCHESTRATOR_COMPOSE, "start", "worker")
+        # Submitting while a service is down is allowed: the credential check
+        # at submission only refuses services that answer 401/403.
+        wf = submit()
+        wait_for(
+            lambda: tasks(wf)[blocked]["status"] == "blocked",
+            timeout=60,
+            what=f"{blocked} to be blocked",
+        )
+
+        # Give up on the task as a worker does once it has been blocked for
+        # longer than BLOCKED_TASK_MAX_AGE.
+        compose(ORCHESTRATOR_COMPOSE, "stop", "worker")
+        engine.fail_task(wf, task_id_of(wf, blocked), "simulated: blocked too long")
+    finally:
+        start_service()
 
     before = tasks(wf)
     assert workflow(wf)["status"] == "failed"
-    assert before[last]["status"] == "failed"
+    assert before[blocked]["status"] == "failed"
     completed_before = {
         key: task["updated_at"]
         for key, task in before.items()
         if task["status"] == "completed"
     }
-    assert len(completed_before) == 3
+    assert set(completed_before) == {
+        "input_provider1:GetConfiguration",
+        "data_generator1:GenerateData",
+    }
 
+    # Forget the outage, so the re-run is not held back by an open circuit.
+    api("POST", f"/orchestrator/health/services/{SERVICE}/recover")
     response = api("POST", f"/workflows/{wf}/resume")
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["status"] == "running"
-    assert body["retried_tasks"] == [before[last]["task_id"]]
+    assert body["retried_tasks"] == [before[blocked]["task_id"]]
 
     compose(ORCHESTRATOR_COMPOSE, "start", "worker")
     assert wait_for(lambda: finished(wf), timeout=90, what=f"{wf} to finish") == "completed"

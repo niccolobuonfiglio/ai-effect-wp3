@@ -11,12 +11,15 @@ from models.data_reference import DataReference
 from models.graph import ExecutionGraph, GraphNode
 from models.state import TaskState, TaskStatus, WorkflowState, WorkflowStatus
 from services.privacy import sanitize_error
+from services.secrets import services_key_name
 from services.state_store import RedisStateStore
 from services.task_queue import DEFAULT_LEASE_SECONDS, RedisTaskQueue
 
 logger = logging.getLogger(__name__)
 
 INITIAL_INPUTS = "initial"
+# Metadata key naming the node that produced an input ref
+SOURCE_NODE_KEY = "source_node"
 
 
 class NotFailedError(Exception):
@@ -125,8 +128,11 @@ class WorkflowEngine:
             if deps_count == 0:
                 # Set initial inputs for start nodes
                 if initial_inputs:
-                    self._store_inputs(
-                        workflow_id, task_id, INITIAL_INPUTS, initial_inputs
+                    self._task_queue.add_inputs(
+                        workflow_id,
+                        task_id,
+                        INITIAL_INPUTS,
+                        self._inputs_payload(INITIAL_INPUTS, initial_inputs),
                     )
                 self._task_queue.claim_enqueue(workflow_id, task_id)
 
@@ -184,6 +190,9 @@ class WorkflowEngine:
         dependent_ids = self._redis.smembers(
             self._dependents_key(workflow_id, task_id)
         )
+        payload = (
+            self._inputs_payload(task.node_key, output_refs) if output_refs else None
+        )
         for dep_id in dependent_ids:
             if isinstance(dep_id, bytes):
                 dep_id = dep_id.decode("utf-8")
@@ -191,8 +200,8 @@ class WorkflowEngine:
             # Pass output refs to dependent task as input, under this task's
             # own field so that two predecessors finishing at the same moment
             # cannot overwrite each other.
-            if output_refs:
-                self._store_inputs(workflow_id, dep_id, task_id, output_refs)
+            if payload is not None:
+                self._task_queue.add_inputs(workflow_id, dep_id, task_id, payload)
 
             self._redis.srem(self._deps_key(workflow_id, dep_id), task_id)
 
@@ -207,19 +216,24 @@ class WorkflowEngine:
             self._state_store.update_workflow_status(
                 workflow_id, WorkflowStatus.COMPLETED
             )
+            # No task will call a service again: the credentials go too.
+            self._redis.delete(services_key_name(workflow_id))
 
         return task
 
-    def _store_inputs(
-        self,
-        workflow_id: str,
-        task_id: str,
-        source: str,
-        refs: list[DataReference],
-    ) -> None:
-        """Record the inputs ``source`` produced for a task not yet running."""
-        payload = json.dumps([ref.model_dump(mode="json") for ref in refs])
-        self._task_queue.add_inputs(workflow_id, task_id, source, payload)
+    def _inputs_payload(self, source_node: str, refs: list[DataReference]) -> str:
+        """Serialize refs handed to a dependent, each tagged with its producer.
+
+        ``source_node`` (``container:operation``, or ``initial`` for the
+        workflow's own inputs) is written to ``metadata["source_node"]``, so a
+        service with several predecessors can tell its inputs apart instead
+        of relying on their order.
+        """
+        return json.dumps([
+            ref.model_dump(mode="json")
+            | {"metadata": {**ref.metadata, SOURCE_NODE_KEY: source_node}}
+            for ref in refs
+        ])
 
     def _collect_inputs(self, workflow_id: str, task_id: str) -> list[DataReference]:
         """The inputs stored for a task, in producer order."""

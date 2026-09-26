@@ -624,3 +624,125 @@ class TestServicesKeyStorage:
         self.submit_with_key(client, valid_blueprint, valid_dockerinfo)
 
         assert self.stored_value(mock_redis) == "super-secret-key"
+
+
+class TestOrchestratorKeyComparison:
+    """The orchestrator key check (now constant-time) still decides correctly."""
+
+    @pytest.fixture(autouse=True)
+    def key(self, monkeypatch, mock_engine):
+        monkeypatch.setenv("ORCHESTRATOR_API_KEY", "s3cret-key")
+        mock_engine.get_workflow_status.return_value = create_mock_workflow()
+
+    def test_correct_key_accepted(self, client):
+        response = client.get(
+            "/workflows/wf-123", headers={"Authorization": "Bearer s3cret-key"}
+        )
+        assert response.status_code == 200
+
+    @pytest.mark.parametrize("token", ["s3cret-kez", "s3cret", "s3cret-key-and-more", ""])
+    def test_other_keys_refused(self, client, token):
+        response = client.get(
+            "/workflows/wf-123", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 401
+
+    def test_missing_key_refused(self, client):
+        assert client.get("/workflows/wf-123").status_code == 401
+
+
+class TestServiceAccessCheck:
+    """At submission the services are asked whether they accept the key."""
+
+    URL = "http://service-a:50051/control/execute"
+
+    def build(self, mock_engine, redis, **kwargs):
+        from services.dockerinfo_parser import DockerInfoParser
+
+        bp = MagicMock()
+        bp.parse_json.return_value = MagicMock()
+        api = OrchestratorAPI(mock_engine, bp, DockerInfoParser(), redis, **kwargs)
+        return TestClient(api.create_app())
+
+    def submit(self, client, blueprint, dockerinfo, key=None):
+        body = {"blueprint": blueprint, "dockerinfo": dockerinfo}
+        if key:
+            body["services_api_key"] = key
+        return client.post("/workflows", json=body)
+
+    def test_refused_key_rejects_submission_before_storing(
+        self, httpx_mock, mock_engine, mock_redis, valid_blueprint, valid_dockerinfo
+    ):
+        httpx_mock.add_response(url=self.URL, method="POST", status_code=401)
+        client = self.build(mock_engine, mock_redis)
+
+        response = self.submit(client, valid_blueprint, valid_dockerinfo, key="wrong")
+
+        assert response.status_code == 400
+        assert "service-a" in response.json()["detail"]
+        assert "not accepted" in response.json()["detail"]
+        assert httpx_mock.get_request().headers["Authorization"] == "Bearer wrong"
+        mock_engine.initialize_workflow.assert_not_called()
+        mock_redis.set.assert_not_called()
+
+    def test_missing_key_is_named_as_the_cause(
+        self, httpx_mock, mock_engine, mock_redis, valid_blueprint, valid_dockerinfo
+    ):
+        httpx_mock.add_response(url=self.URL, method="POST", status_code=403)
+        client = self.build(mock_engine, mock_redis)
+
+        response = self.submit(client, valid_blueprint, valid_dockerinfo)
+
+        assert response.status_code == 400
+        assert "no services_api_key was given" in response.json()["detail"]
+        assert "Authorization" not in httpx_mock.get_request().headers
+
+    def test_accepted_key_submits(
+        self, httpx_mock, mock_engine, mock_redis, valid_blueprint, valid_dockerinfo
+    ):
+        httpx_mock.add_response(url=self.URL, method="POST", status_code=422)
+        client = self.build(mock_engine, mock_redis)
+
+        response = self.submit(client, valid_blueprint, valid_dockerinfo, key="right")
+
+        assert response.status_code == 200
+        mock_engine.start_workflow.assert_called_once()
+
+    def test_unreachable_service_does_not_block_submission(
+        self, httpx_mock, mock_engine, mock_redis, valid_blueprint, valid_dockerinfo
+    ):
+        import httpx
+
+        httpx_mock.add_exception(httpx.ConnectError("refused"), url=self.URL)
+        client = self.build(mock_engine, mock_redis)
+
+        response = self.submit(client, valid_blueprint, valid_dockerinfo)
+
+        assert response.status_code == 200
+
+    def test_check_can_be_turned_off(
+        self, httpx_mock, mock_engine, mock_redis, valid_blueprint, valid_dockerinfo
+    ):
+        client = self.build(mock_engine, mock_redis, service_auth_check=False)
+
+        response = self.submit(client, valid_blueprint, valid_dockerinfo)
+
+        assert response.status_code == 200
+        assert httpx_mock.get_requests() == []
+
+    def test_check_off_via_environment(
+        self, monkeypatch, mock_engine, mock_redis
+    ):
+        monkeypatch.setenv("SERVICE_AUTH_CHECK", "false")
+        api = OrchestratorAPI(mock_engine, MagicMock(), MagicMock(), mock_redis)
+        assert api._service_auth_check is False
+
+
+class TestDeleteRemovesServicesKey:
+    def test_delete_removes_services_key(self, client, mock_engine, mock_redis):
+        mock_engine.get_workflow_status.return_value = create_mock_workflow()
+
+        client.delete("/workflows/wf-123")
+
+        deleted = [c[0][0] for c in mock_redis.delete.call_args_list]
+        assert "services_key:wf-123" in deleted

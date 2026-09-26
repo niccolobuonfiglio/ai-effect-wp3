@@ -3,6 +3,7 @@
 Import this module and implement your methods in service.py.
 """
 
+import hmac
 import logging
 import os
 from typing import Optional
@@ -21,7 +22,10 @@ def _check_api_key(
     api_key = os.environ.get("SERVICE_API_KEY")
     if not api_key:
         return
-    if not credentials or credentials.credentials != api_key:
+    # Constant-time comparison, so response timing does not reveal the key
+    if not credentials or not hmac.compare_digest(
+        credentials.credentials.encode("utf-8"), api_key.encode("utf-8")
+    ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 logger = logging.getLogger(__name__)
