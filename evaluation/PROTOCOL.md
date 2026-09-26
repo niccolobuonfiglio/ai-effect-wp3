@@ -84,6 +84,13 @@ author choosing tests that favour their own code.
   orchestrator changes, lost in `dutch-new`, are listed in
   `dutch-orchestrator-swap.stat` and must be discussed as a confound.
 
+  The fork's **deployment** settings are kept in `dutch-new`, so that only the
+  orchestrator code differs: the fixed container name `orchestrator-api`, which
+  the Dutch suite waits for by name, and ports bound to `127.0.0.1`. Without
+  the name, script 01 waits for a container that never appears (observed
+  2026-09-26). The change is saved as `dutch-deployment.diff` and must be
+  listed with the harness patches.
+
 - **Project name.** The suites find the orchestrator by container name
   (`orchestrator-api`, `orchestrator-redis`), so both versions run as compose
   project `orchestrator`, as in the official closure runs. `run_t33.sh`

@@ -89,6 +89,19 @@ prepare_dutch() {
     git -C "$work/dutch-new" submodule update --init --recursive --quiet
     git -C "$work/dutch-new" rm -r --quiet orchestrator
     git -C "$NEW_ROOT" archive HEAD orchestrator | tar -x -C "$work/dutch-new"
+
+    # Keep the fork's deployment settings, so that only the orchestrator code
+    # differs between the two trees: the Dutch suite waits for a container
+    # named exactly "orchestrator-api", and the fork binds its ports to
+    # localhost. The change is saved for the thesis to report.
+    local compose="$work/dutch-new/orchestrator/docker-compose.yml"
+    cp "$compose" "$work/compose.orig"
+    sed -i -e 's/^  api:$/  api:\n    container_name: orchestrator-api/' \
+           -e 's/"16379:6379"/"127.0.0.1:16379:6379"/' \
+           -e 's/"18000:8000"/"127.0.0.1:18000:8000"/' "$compose"
+    diff -u "$work/compose.orig" "$compose" >"$work/dutch-deployment.diff" || true
+    rm -f "$work/compose.orig"
+
     git -C "$work/dutch-new" add orchestrator
     git -C "$work/dutch-new" -c user.name=evaluation -c user.email=evaluation@localhost \
         commit --quiet -m "evaluation: orchestrator replaced by NEW $(git -C "$NEW_ROOT" rev-parse --short HEAD)"
