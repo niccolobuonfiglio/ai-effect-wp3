@@ -99,6 +99,16 @@ author choosing tests that favour their own code.
   the Dutch suite uses an em dash. Result lines without an upper-case label
   (e.g. `RESULT: recorded.`) are stored as `UNLABELLED`, with the full text.
 
+  The Dutch HAI scripts (30–36) need two more things. First,
+  `HAI_SESSION_TOKEN_SECRET`, which the Dutch runbook creates together with
+  the two API keys; `run_t33.sh` now refuses to start without the keys the
+  runbook requires. Second, a Linux stand-in for the Windows-only
+  `Get-NetTCPConnection`, which script 30 uses to ask whether port 8443 has a
+  listener. The stand-in is defined in `dutch-node/_Support.ps1` only when the
+  real command is missing, answers with `ss`, and appears in
+  `t33-harness.diff` like the German portability patches. It applies to both
+  versions alike.
+
 - **Project name.** The suites find the orchestrator by container name
   (`orchestrator-api`, `orchestrator-redis`), so both versions run as compose
   project `orchestrator`, as in the official closure runs. `run_t33.sh`

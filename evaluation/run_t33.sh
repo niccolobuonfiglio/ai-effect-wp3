@@ -125,6 +125,15 @@ shift 3
 ONLY=("$@")
 [ -n "${SCRIPTS[$NODE]:-}" ] || { echo "unknown node $NODE" >&2; exit 1; }
 
+# The runbooks create these keys before any script; without the HAI secret the
+# Dutch HAI stack refuses to start and scripts 30-36 give no result.
+for key in ORCHESTRATOR_API_KEY SERVICE_API_KEY; do
+    [ -n "${!key:-}" ] || { echo "export $key first (see the node's START-HERE.md)" >&2; exit 1; }
+done
+if [ "$NODE" = dutch ] && [ -z "${HAI_SESSION_TOKEN_SECRET:-}" ]; then
+    echo "export HAI_SESSION_TOKEN_SECRET first (dutch-node/START-HERE.md)" >&2; exit 1
+fi
+
 NODE_DIR="$T33_ROOT/$NODE-node"
 TEMPLATE="$HERE/t33/$NODE-$VERSION.psd1"
 mkdir -p "$OUT/t33-logs/$NODE-$VERSION"
