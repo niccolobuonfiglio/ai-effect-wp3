@@ -298,3 +298,27 @@ class BlueprintParser:
             if start_node.key not in visited:
                 if has_cycle(start_node):
                     raise BlueprintParseError("Circular dependency detected")
+
+
+def message_type_mismatches(graph: ExecutionGraph) -> list[str]:
+    """Connections whose source produces a message the target does not take.
+
+    In an AI4EU blueprint an operation's ``output_message_name`` is what flows
+    along its connections, so it must equal the ``input_message_name`` of every
+    operation it is connected to (the exported blueprints chain their protos
+    this way: ``rpc B(AResponse)``). A connection where either name is missing
+    is not checked - the type is unknown, not wrong.
+
+    Returns one description per mismatching connection, in a stable order.
+    """
+    mismatches = []
+    for key in sorted(graph.all_nodes):
+        source = graph.all_nodes[key]
+        produced = source.operation.operation_signature.output_message_name
+        for target in sorted(source.next_nodes, key=lambda n: n.key):
+            expected = target.operation.operation_signature.input_message_name
+            if produced and expected and produced != expected:
+                mismatches.append(
+                    f"{source.key} outputs {produced} but {target.key} expects {expected}"
+                )
+    return mismatches

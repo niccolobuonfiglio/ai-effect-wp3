@@ -192,6 +192,17 @@ Templates for building AI-Effect compatible services:
 
 See `use-cases/templates/README.md` for detailed documentation.
 
+Services can state the checksum and size of the data they produce and check what they receive, with `use-cases/common/integrity.py`:
+
+```python
+from common.integrity import IntegrityError, describe_file, verify_file
+
+output = DataReference(protocol="file", uri=str(path), format="csv", **describe_file(path))
+verify_file(input_ref, input_path)   # raises IntegrityError if the file changed
+```
+
+The orchestrator verifies inline data itself and hands `checksum`/`size_bytes` of every other reference on unchanged. See `orchestrator/docs/DATA_CONTRACTS.md`.
+
 ## Use Cases
 
 ### file_based_energy_pipeline
@@ -272,6 +283,8 @@ Defines workflow topology:
   ]
 }
 ```
+
+An operation's `output_message_name` is what flows along its connections, so it should equal the `input_message_name` of every operation it is connected to (the generated `export/blueprint.json` files chain their types this way). The orchestrator checks this at submission: with `BLUEPRINT_TYPE_CHECK=warn` (default) mismatches are returned as `warnings` in the submit response, with `strict` the workflow is refused with `400`, with `off` the check is skipped.
 
 ### dockerinfo.json
 

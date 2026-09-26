@@ -1,6 +1,7 @@
 """FastAPI REST API for orchestration platform."""
 
 import hmac
+import logging
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -41,10 +42,15 @@ from api.models import (
     WorkflowSubmitResponse,
 )
 from models.data_reference import DataReference
-from services.blueprint_parser import BlueprintParseError, BlueprintParser
+from services.blueprint_parser import (
+    BlueprintParseError,
+    BlueprintParser,
+    message_type_mismatches,
+)
 from services.circuit_breaker import CircuitBreaker
 from services.control_client import AUTH_REFUSED, ControlClient, parse_tls_verify
 from services.dockerinfo_parser import DockerInfoParseError, DockerInfoParser
+from services.integrity import IntegrityError, verify_all
 from services.log_reader import LogReader
 from services.privacy import DataPolicy, DataPolicyError
 from services.secrets import SecretBox, services_key_name
@@ -58,6 +64,11 @@ UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
 # Seconds to wait for each service when checking credentials at submission
 SERVICE_AUTH_CHECK_TIMEOUT = 3.0
+
+# What to do with a blueprint connection whose message types do not match
+TYPE_CHECK_MODES = ("strict", "warn", "off")
+
+logger = logging.getLogger(__name__)
 
 
 class OrchestratorAPI:
@@ -76,12 +87,19 @@ class OrchestratorAPI:
         catalog: WorkflowCatalog | None = None,
         log_reader: LogReader | None = None,
         service_auth_check: bool | None = None,
+        type_check: str | None = None,
     ):
         """Initialize API with dependencies.
 
         ``service_auth_check`` asks every service, when a workflow is
         submitted, whether it accepts the workflow's services API key. None
         reads SERVICE_AUTH_CHECK (default on).
+
+        ``type_check`` decides what happens to a blueprint connection whose
+        source outputs a different message than its target takes: ``strict``
+        refuses the workflow, ``warn`` accepts it and reports the mismatch,
+        ``off`` skips the check. None reads BLUEPRINT_TYPE_CHECK (default
+        ``warn``).
         """
         if engine is None:
             raise ValueError("engine is required")
@@ -109,6 +127,14 @@ class OrchestratorAPI:
                 "SERVICE_AUTH_CHECK", "true"
             ).strip().lower() not in ("0", "false", "no", "off")
         self._service_auth_check = service_auth_check
+        if type_check is None:
+            type_check = os.environ.get("BLUEPRINT_TYPE_CHECK", "warn")
+        type_check = type_check.strip().lower()
+        if type_check not in TYPE_CHECK_MODES:
+            raise ValueError(
+                f"type_check must be one of: {', '.join(TYPE_CHECK_MODES)}"
+            )
+        self._type_check = type_check
 
     def _check_service_access(
         self, endpoints: dict, services_api_key: str | None
@@ -161,8 +187,46 @@ class OrchestratorAPI:
                 if isinstance(reference.format, str)
                 else reference.format.value
             ),
+            checksum=reference.checksum,
+            size_bytes=reference.size_bytes,
             metadata=reference.metadata,
         )
+
+    def _check_message_types(self, graph) -> list[str]:
+        """Apply the type check mode; return the warnings to report.
+
+        Raises HTTPException(400) in strict mode when a connection mismatches.
+        """
+        if self._type_check == "off":
+            return []
+        mismatches = message_type_mismatches(graph)
+        if mismatches and self._type_check == "strict":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Incompatible connections: {'; '.join(mismatches)}",
+            )
+        for mismatch in mismatches:
+            logger.warning(
+                "Blueprint connection with mismatching message types: %s",
+                mismatch,
+                extra={"event": "blueprint_type_mismatch"},
+            )
+        return [f"Incompatible connection: {m}" for m in mismatches]
+
+    def _parse_inputs(self, raw: list[dict]) -> list[DataReference] | None:
+        """Validate the workflow's initial inputs, or raise HTTPException(400)."""
+        if not raw:
+            return None
+        try:
+            inputs = [DataReference(**inp) for inp in raw]
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid inputs: {e}")
+        try:
+            self._policy.check_all(inputs)
+            verify_all(inputs)
+        except (DataPolicyError, IntegrityError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid inputs: {e}")
+        return inputs
 
     def create_app(self) -> FastAPI:
         """Create FastAPI application."""
@@ -186,11 +250,17 @@ class OrchestratorAPI:
             except BlueprintParseError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid blueprint: {e}")
 
+            # Do connected operations exchange the same message type?
+            warnings = self._check_message_types(graph)
+
             # Parse dockerinfo
             try:
                 endpoints = self._dockerinfo_parser.parse_json(request.dockerinfo)
             except DockerInfoParseError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid dockerinfo: {e}")
+
+            # Initial inputs for start nodes: policy and integrity
+            initial_inputs = self._parse_inputs(request.inputs)
 
             # Before anything is stored: would the services accept the key?
             self._check_service_access(endpoints, request.services_api_key)
@@ -218,22 +288,6 @@ class OrchestratorAPI:
             # before any task has run against them.
             self._registry.register_all(endpoints, workflow_id=workflow_id)
 
-            # Parse initial inputs for start nodes
-            initial_inputs: list[DataReference] | None = None
-            if request.inputs:
-                try:
-                    initial_inputs = [DataReference(**inp) for inp in request.inputs]
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=400, detail=f"Invalid inputs: {e}"
-                    )
-                try:
-                    self._policy.check_all(initial_inputs)
-                except DataPolicyError as e:
-                    raise HTTPException(
-                        status_code=400, detail=f"Invalid inputs: {e}"
-                    )
-
             # Initialize and start workflow
             self._engine.initialize_workflow(workflow_id, graph)
             # Record it for the dashboard: the list view and, since the engine
@@ -241,7 +295,9 @@ class OrchestratorAPI:
             self._catalog.register(workflow_id, request.blueprint)
             self._engine.start_workflow(workflow_id, initial_inputs)
 
-            return WorkflowSubmitResponse(workflow_id=workflow_id, status="running")
+            return WorkflowSubmitResponse(
+                workflow_id=workflow_id, status="running", warnings=warnings
+            )
 
         @app.get(
             "/workflows/{workflow_id}",

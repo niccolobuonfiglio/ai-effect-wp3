@@ -775,3 +775,85 @@ class TestGraphStructure:
         leaf_nodes = graph.get_leaf_nodes()
         assert len(leaf_nodes) == 1
         assert leaf_nodes[0].key == "service-c:ProcessC"
+
+
+def typed_blueprint(operations: dict, edges: list[tuple[str, str]]) -> dict:
+    """Blueprint of one-operation containers.
+
+    ``operations`` maps container name to (input_message, output_message);
+    ``edges`` lists (source, target) container names.
+    """
+    nodes = []
+    for name, (inp, out) in operations.items():
+        nodes.append({
+            "container_name": name,
+            "proto_uri": f"{name}.proto",
+            "image": f"{name}:latest",
+            "node_type": "MLModel",
+            "operation_signature_list": [{
+                "operation_signature": {
+                    "operation_name": "Run",
+                    "input_message_name": inp,
+                    "output_message_name": out,
+                },
+                "connected_to": [
+                    {"container_name": t, "operation_signature": {"operation_name": "Run"}}
+                    for s, t in edges if s == name
+                ],
+            }],
+        })
+    return {
+        "name": "typed", "pipeline_id": "p", "creation_date": "2025-01-01",
+        "type": "pipeline-topology/v2", "version": "2.0", "nodes": nodes,
+    }
+
+
+class TestMessageTypeMismatches:
+    """message_type_mismatches compares each connection's message types."""
+
+    def mismatches(self, parser, operations, edges):
+        from services.blueprint_parser import message_type_mismatches
+
+        return message_type_mismatches(parser.parse_json(typed_blueprint(operations, edges)))
+
+    def test_chained_types_match(self, parser):
+        ops = {"a": ("Req", "AOut"), "b": ("AOut", "BOut"), "c": ("BOut", "COut")}
+        assert self.mismatches(parser, ops, [("a", "b"), ("b", "c")]) == []
+
+    def test_mismatch_is_described(self, parser):
+        ops = {"a": ("Req", "AOut"), "b": ("BRequest", "BOut")}
+        assert self.mismatches(parser, ops, [("a", "b")]) == [
+            "a:Run outputs AOut but b:Run expects BRequest"
+        ]
+
+    def test_unknown_types_are_not_mismatches(self, parser):
+        ops = {"a": ("Req", None), "b": (None, "BOut"), "c": ("X", "Y")}
+        assert self.mismatches(parser, ops, [("a", "c"), ("b", "c")]) == [
+            "b:Run outputs BOut but c:Run expects X"
+        ]
+
+    def test_fan_in_checks_every_incoming_connection(self, parser):
+        ops = {"a": ("R", "Data"), "b": ("R", "Other"), "join": ("Data", "Out")}
+        assert self.mismatches(parser, ops, [("a", "join"), ("b", "join")]) == [
+            "b:Run outputs Other but join:Run expects Data"
+        ]
+
+    def test_fan_out_checks_every_outgoing_connection(self, parser):
+        ops = {"a": ("R", "Data"), "b": ("Data", "X"), "c": ("Else", "Y")}
+        assert self.mismatches(parser, ops, [("a", "b"), ("a", "c")]) == [
+            "a:Run outputs Data but c:Run expects Else"
+        ]
+
+    def test_repository_export_blueprints_are_consistent(self, parser):
+        """The generated blueprints of the use cases chain their types."""
+        import json
+        from pathlib import Path
+
+        from services.blueprint_parser import message_type_mismatches
+
+        root = Path(__file__).resolve().parents[3] / "use-cases"
+        exports = sorted(root.glob("*/export/blueprint.json"))
+        assert exports, "no exported blueprints found"
+        for path in exports:
+            graph = parser.parse_json(json.loads(path.read_text()))
+            assert message_type_mismatches(graph) == [], path

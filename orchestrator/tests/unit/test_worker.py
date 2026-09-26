@@ -915,3 +915,66 @@ class TestLeaseRenewal:
         worker.process_task("wf-123")
 
         mock_engine.renew_lease.assert_not_called()
+
+
+class TestOutputIntegrity:
+    """A service's inline output must match the checksum and size it states."""
+
+    def run(self, worker, mock_engine, mock_client, sample_task, output):
+        mock_engine.claim_task.return_value = sample_task
+        mock_client.execute.return_value = ExecuteResponse(status="complete", output=output)
+        return worker.process_task("wf-123")
+
+    def test_mismatching_checksum_fails_task(
+        self, worker, mock_engine, mock_client, sample_task
+    ):
+        output = DataReference.from_inline_data(
+            b"a,b\n1,2\n", Format.CSV, checksum="sha256:" + "0" * 64
+        )
+
+        assert self.run(worker, mock_engine, mock_client, sample_task, output) is True
+
+        mock_engine.complete_task.assert_not_called()
+        error = mock_engine.fail_task.call_args[0][2]
+        assert "integrity check" in error and "checksum mismatch" in error
+
+    def test_matching_checksum_completes_task(
+        self, worker, mock_engine, mock_client, sample_task
+    ):
+        from services.integrity import compute_checksum
+
+        data = b"a,b\n1,2\n"
+        output = DataReference.from_inline_data(
+            data, Format.CSV, checksum=compute_checksum(data)
+        )
+
+        self.run(worker, mock_engine, mock_client, sample_task, output)
+
+        mock_engine.complete_task.assert_called_once()
+        mock_engine.fail_task.assert_not_called()
+
+    def test_file_reference_with_checksum_passes_through(
+        self, worker, mock_engine, mock_client, sample_task
+    ):
+        output = DataReference(
+            protocol=Protocol.FILE, uri="/app/data/raw.csv", format=Format.CSV,
+            checksum="sha256:" + "0" * 64, size_bytes=10,
+        )
+
+        self.run(worker, mock_engine, mock_client, sample_task, output)
+
+        # Not readable by the orchestrator: handed on unchanged, for the consumer
+        completed_refs = mock_engine.complete_task.call_args[0][2]
+        assert completed_refs == [output]
+
+    def test_integrity_failure_does_not_count_against_the_breaker(
+        self, mock_engine, mock_client, endpoints, sample_task
+    ):
+        breaker = MagicMock()
+        breaker.allow.return_value = True
+        worker = Worker(mock_engine, mock_client, endpoints, poll_interval=0.01, breaker=breaker)
+        output = DataReference.from_inline_data(b"x", Format.CSV, checksum="sha256:" + "0" * 64)
+
+        self.run(worker, mock_engine, mock_client, sample_task, output)
+
+        breaker.record_failure.assert_not_called()

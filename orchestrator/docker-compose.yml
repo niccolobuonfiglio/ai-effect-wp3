@@ -34,6 +34,8 @@ services:
       - SERVICE_TLS_VERIFY=${SERVICE_TLS_VERIFY:-true}
       # Check at submission that the services accept the workflow's key
       - SERVICE_AUTH_CHECK=${SERVICE_AUTH_CHECK:-true}
+      # strict | warn | off: blueprint connections whose message types differ
+      - BLUEPRINT_TYPE_CHECK=${BLUEPRINT_TYPE_CHECK:-warn}
       - ALLOW_INLINE=${ALLOW_INLINE:-true}
       - MAX_INLINE_BYTES=${MAX_INLINE_BYTES:-65536}
       - MAX_ERROR_CHARS=${MAX_ERROR_CHARS:-500}

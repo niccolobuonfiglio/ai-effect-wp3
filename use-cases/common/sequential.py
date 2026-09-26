@@ -32,11 +32,20 @@ logger = logging.getLogger(__name__)
 
 
 class DataReference(BaseModel):
-    """Reference to data location."""
+    """Reference to data location.
+
+    ``checksum`` ("sha256:<hex>") and ``size_bytes`` describe the data, so the
+    service reading it can check it arrived intact (see common/integrity.py).
+    ``metadata`` is free-form; the orchestrator adds ``source_node`` to the
+    copies it hands to the next task.
+    """
 
     protocol: str
     uri: str
     format: str
+    checksum: str | None = None
+    size_bytes: int | None = None
+    metadata: dict = {}
 
 
 class ExecuteRequest(BaseModel):

@@ -38,6 +38,9 @@ class WorkflowSubmitResponse(BaseModel):
 
     workflow_id: str
     status: str
+    # Problems that did not stop the submission, e.g. blueprint connections
+    # whose message types do not match (BLUEPRINT_TYPE_CHECK=warn)
+    warnings: list[str] = []
 
 
 class WorkflowStatusResponse(BaseModel):
@@ -60,6 +63,8 @@ class DataReferenceResponse(BaseModel):
     protocol: str
     uri: str
     format: str
+    checksum: str | None = None
+    size_bytes: int | None = None
     metadata: dict[str, Any] = {}
 
 

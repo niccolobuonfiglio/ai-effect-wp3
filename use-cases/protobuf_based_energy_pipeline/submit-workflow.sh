@@ -107,9 +107,7 @@ END
 )
 
 # Submit workflow
-RESPONSE=$(curl -s -X POST "$API_URL/workflows" \
-  -H "Content-Type: application/json" \
-  -d "{
+PAYLOAD="{
     \"blueprint\": $BLUEPRINT,
     \"dockerinfo\": $DOCKERINFO,
     \"inputs\": [
@@ -119,7 +117,22 @@ RESPONSE=$(curl -s -X POST "$API_URL/workflows" \
         \"format\": \"json\"
       }
     ]
-  }")
+  }"
+
+# Authentication, when enabled: the services' key travels with the workflow
+# (the orchestrator sends it to every service), the orchestrator's own key as a
+# bearer token.
+if [ -n "${SERVICE_API_KEY:-}" ]; then
+    PAYLOAD=$(echo "$PAYLOAD" | jq --arg k "$SERVICE_API_KEY" '. + {services_api_key: $k}')
+fi
+AUTH=()
+if [ -n "${ORCHESTRATOR_API_KEY:-}" ]; then
+    AUTH=(-H "Authorization: Bearer $ORCHESTRATOR_API_KEY")
+fi
+
+RESPONSE=$(curl -s -X POST "$API_URL/workflows" \
+  -H "Content-Type: application/json" "${AUTH[@]}" \
+  -d "$PAYLOAD")
 
 WORKFLOW_ID=$(echo "$RESPONSE" | jq -r .workflow_id)
 
@@ -132,6 +145,14 @@ fi
 echo "Workflow submitted!"
 echo "Workflow ID: $WORKFLOW_ID"
 echo ""
+
+# Problems that did not stop the submission (e.g. BLUEPRINT_TYPE_CHECK=warn)
+WARNINGS=$(echo "$RESPONSE" | jq -r '.warnings[]?')
+if [ -n "$WARNINGS" ]; then
+    echo "Warnings:"
+    echo "$WARNINGS" | sed 's/^/  - /'
+    echo ""
+fi
 echo "Data flow (via gRPC):"
 echo "  pb-input-provider --[grpc]--> pb-data-generator --[grpc]--> pb-data-analyzer --[grpc]--> pb-report-generator"
 echo ""

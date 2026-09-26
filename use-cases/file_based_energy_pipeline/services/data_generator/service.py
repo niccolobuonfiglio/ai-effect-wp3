@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from common.integrity import describe_file
 from common.sequential import DataReference, ExecuteRequest, ExecuteResponse, run
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,8 @@ def execute_GenerateData(request: ExecuteRequest) -> ExecuteResponse:
             protocol="file",
             uri=str(output_path.absolute()),
             format="csv",
+            # Lets the next service check the file arrived intact
+            **describe_file(output_path),
         ),
     )
 

@@ -8,6 +8,7 @@ from services.backoff import backoff_delay
 from services.circuit_breaker import CircuitBreaker
 from services.control_client import ControlClient, ControlClientError
 from services.dockerinfo_parser import ServiceEndpoint
+from services.integrity import IntegrityError, verify_all
 from services.privacy import DataPolicy, DataPolicyError
 from services.workflow_engine import WorkflowEngine
 
@@ -187,6 +188,20 @@ class Worker:
                     task.task_id,
                     f"Service '{container_name}' returned data that breaks the "
                     f"orchestrator data policy: {e}",
+                )
+                return True
+
+            # An inline payload that does not match the checksum or size its
+            # own reference states was corrupted or mislabelled on the way;
+            # passing it on would hand bad data to the next task.
+            try:
+                verify_all(output_refs)
+            except IntegrityError as e:
+                self._engine.fail_task(
+                    workflow_id,
+                    task.task_id,
+                    f"Service '{container_name}' returned data that fails its "
+                    f"integrity check: {e}",
                 )
                 return True
 

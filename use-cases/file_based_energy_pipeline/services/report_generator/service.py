@@ -6,17 +6,18 @@ from pathlib import Path
 
 import pandas as pd
 
+from common.integrity import IntegrityError, describe_file, verify_file
 from common.sequential import DataReference, ExecuteRequest, ExecuteResponse, run
 
 logger = logging.getLogger(__name__)
 
 
-def _get_input_file_path(inputs: list[dict]) -> str:
-    """Get file path from input DataReference."""
+def _get_input_reference(inputs: list[dict]) -> dict:
+    """The CSV file reference among the inputs, or an empty dict."""
     for inp in inputs:
         if inp.get("protocol") == "file" and inp.get("format") == "csv":
-            return inp.get("uri", "")
-    return ""
+            return inp
+    return {}
 
 
 def execute_GenerateReport(request: ExecuteRequest) -> ExecuteResponse:
@@ -27,7 +28,8 @@ def execute_GenerateReport(request: ExecuteRequest) -> ExecuteResponse:
     Output: File path to report CSV.
     """
     # Get input file path
-    input_path = _get_input_file_path(request.inputs)
+    input_ref = _get_input_reference(request.inputs)
+    input_path = input_ref.get("uri", "")
     if not input_path:
         return ExecuteResponse(status="failed", error="No input file provided")
 
@@ -40,6 +42,12 @@ def execute_GenerateReport(request: ExecuteRequest) -> ExecuteResponse:
     input_file = Path(input_path)
     if not input_file.exists():
         return ExecuteResponse(status="failed", error=f"Input file not found: {input_path}")
+
+    # Refuse a file that differs from what the previous service wrote
+    try:
+        verify_file(input_ref, input_file)
+    except IntegrityError as e:
+        return ExecuteResponse(status="failed", error=f"Input rejected: {e}")
 
     df = pd.read_csv(input_file)
 
@@ -87,6 +95,8 @@ def execute_GenerateReport(request: ExecuteRequest) -> ExecuteResponse:
             protocol="file",
             uri=str(output_path.absolute()),
             format="csv",
+            # Lets the next service check the file arrived intact
+            **describe_file(output_path),
         ),
     )
 

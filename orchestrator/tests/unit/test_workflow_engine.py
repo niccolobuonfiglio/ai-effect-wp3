@@ -1287,3 +1287,26 @@ class TestServicesKeyLifetime:
         engine.fail_task("wf-1", task.task_id, "boom")
 
         assert redis_client.exists("services_key:wf-1")
+
+
+class TestChecksumPassThrough:
+    """Checksum and size reach the dependent task unchanged."""
+
+    def test_dependent_receives_checksum_and_size(self, engine):
+        engine.initialize_workflow("wf-1", create_chain_graph())
+        engine.start_workflow("wf-1")
+
+        task_a = engine.claim_task("wf-1", timeout=1)
+        output = DataReference(
+            protocol=Protocol.FILE,
+            uri="/app/data/raw_energy.csv",
+            format=Format.CSV,
+            checksum="sha256:" + "ab" * 32,
+            size_bytes=1234,
+        )
+        engine.complete_task("wf-1", task_a.task_id, output_refs=[output])
+
+        received = engine.claim_task("wf-1", timeout=1).input_refs[0]
+        assert received.checksum == output.checksum
+        assert received.size_bytes == 1234
+        assert received.uri == output.uri

@@ -746,3 +746,171 @@ class TestDeleteRemovesServicesKey:
 
         deleted = [c[0][0] for c in mock_redis.delete.call_args_list]
         assert "services_key:wf-123" in deleted
+
+
+def typed_blueprint(out_a: str, in_b: str) -> dict:
+    """Two connected services whose message types can be made to (mis)match."""
+    def node(name, inp, out, targets):
+        return {
+            "container_name": name,
+            "proto_uri": f"{name}.proto",
+            "image": f"{name}:latest",
+            "node_type": "MLModel",
+            "operation_signature_list": [{
+                "operation_signature": {
+                    "operation_name": "Run",
+                    "input_message_name": inp,
+                    "output_message_name": out,
+                },
+                "connected_to": [
+                    {"container_name": t, "operation_signature": {"operation_name": "Run"}}
+                    for t in targets
+                ],
+            }],
+        }
+    return {
+        "name": "typed", "pipeline_id": "p", "creation_date": "2025-01-01",
+        "type": "pipeline-topology/v2", "version": "2.0",
+        "nodes": [node("svc-a", "Req", out_a, ["svc-b"]), node("svc-b", in_b, "Out", [])],
+    }
+
+
+class TestMessageTypeCheck:
+    """Blueprint connections are checked for matching message types."""
+
+    def build(self, mock_engine, redis, **kwargs):
+        from services.blueprint_parser import BlueprintParser
+
+        di = MagicMock()
+        di.parse_json.return_value = {}
+        api = OrchestratorAPI(mock_engine, BlueprintParser(), di, redis, **kwargs)
+        return TestClient(api.create_app())
+
+    def submit(self, client, blueprint):
+        return client.post("/workflows", json={"blueprint": blueprint, "dockerinfo": {"x": 1}})
+
+    def test_strict_refuses_mismatch_before_storing(self, mock_engine, mock_redis):
+        client = self.build(mock_engine, mock_redis, type_check="strict")
+
+        response = self.submit(client, typed_blueprint("AOut", "BRequest"))
+
+        assert response.status_code == 400
+        assert "svc-a:Run outputs AOut but svc-b:Run expects BRequest" in response.json()["detail"]
+        mock_engine.initialize_workflow.assert_not_called()
+        mock_redis.hset.assert_not_called()
+
+    def test_strict_accepts_matching_types(self, mock_engine, mock_redis):
+        client = self.build(mock_engine, mock_redis, type_check="strict")
+
+        response = self.submit(client, typed_blueprint("AOut", "AOut"))
+
+        assert response.status_code == 200
+        assert response.json()["warnings"] == []
+
+    def test_warn_accepts_and_reports(self, mock_engine, mock_redis):
+        client = self.build(mock_engine, mock_redis, type_check="warn")
+
+        response = self.submit(client, typed_blueprint("AOut", "BRequest"))
+
+        assert response.status_code == 200
+        assert response.json()["warnings"] == [
+            "Incompatible connection: svc-a:Run outputs AOut but svc-b:Run expects BRequest"
+        ]
+        mock_engine.start_workflow.assert_called_once()
+
+    def test_off_skips_the_check(self, mock_engine, mock_redis):
+        client = self.build(mock_engine, mock_redis, type_check="off")
+
+        response = self.submit(client, typed_blueprint("AOut", "BRequest"))
+
+        assert response.status_code == 200
+        assert response.json()["warnings"] == []
+
+    def test_default_is_warn(self, monkeypatch, mock_engine, mock_redis):
+        monkeypatch.delenv("BLUEPRINT_TYPE_CHECK", raising=False)
+        api = OrchestratorAPI(mock_engine, MagicMock(), MagicMock(), mock_redis)
+        assert api._type_check == "warn"
+
+    def test_mode_from_environment(self, monkeypatch, mock_engine, mock_redis):
+        monkeypatch.setenv("BLUEPRINT_TYPE_CHECK", "STRICT")
+        api = OrchestratorAPI(mock_engine, MagicMock(), MagicMock(), mock_redis)
+        assert api._type_check == "strict"
+
+    def test_unknown_mode_rejected(self, mock_engine, mock_redis):
+        with pytest.raises(ValueError, match="type_check"):
+            OrchestratorAPI(mock_engine, MagicMock(), MagicMock(), mock_redis, type_check="loud")
+
+
+class TestInputIntegrityOnSubmission:
+    """Initial inline inputs are checked against their checksum and size."""
+
+    def build(self, mock_engine, redis):
+        bp = MagicMock()
+        bp.parse_json.return_value = MagicMock()
+        di = MagicMock()
+        di.parse_json.return_value = {}
+        return TestClient(OrchestratorAPI(mock_engine, bp, di, redis).create_app())
+
+    def submit(self, client, inputs, key=None):
+        body = {"blueprint": {"b": 1}, "dockerinfo": {"d": 1}, "inputs": inputs}
+        if key:
+            body["services_api_key"] = key
+        return client.post("/workflows", json=body)
+
+    def test_matching_checksum_accepted(self, mock_engine, mock_redis):
+        import base64, hashlib
+
+        data = b'{"num_records": 10}'
+        ref = {
+            "protocol": "inline", "format": "json",
+            "uri": base64.b64encode(data).decode(),
+            "checksum": f"sha256:{hashlib.sha256(data).hexdigest()}",
+        }
+        response = self.submit(self.build(mock_engine, mock_redis), [ref])
+
+        assert response.status_code == 200
+
+    def test_wrong_checksum_refused_before_anything_is_stored(self, mock_engine, mock_redis):
+        import base64
+
+        ref = {
+            "protocol": "inline", "format": "json",
+            "uri": base64.b64encode(b'{"num_records": 10}').decode(),
+            "checksum": "sha256:" + "0" * 64,
+        }
+        response = self.submit(self.build(mock_engine, mock_redis), [ref], key="k")
+
+        assert response.status_code == 400
+        assert "checksum mismatch" in response.json()["detail"]
+        # Inputs are validated before the key and endpoints are written
+        mock_redis.set.assert_not_called()
+        mock_redis.hset.assert_not_called()
+        mock_engine.initialize_workflow.assert_not_called()
+
+    def test_invalid_input_leaves_nothing_behind(self, mock_engine, mock_redis):
+        response = self.submit(
+            self.build(mock_engine, mock_redis), [{"protocol": "nope"}], key="k"
+        )
+
+        assert response.status_code == 400
+        mock_redis.set.assert_not_called()
+        mock_redis.hset.assert_not_called()
+
+
+class TestChecksumInResponses:
+    def test_task_refs_show_checksum_and_size(self, client, mock_engine):
+        from models.data_reference import DataReference, Format, Protocol
+
+        task = create_mock_task()
+        ref = DataReference(
+            protocol=Protocol.FILE, uri="/app/data/raw.csv", format=Format.CSV,
+            checksum="sha256:" + "a" * 64, size_bytes=42,
+        )
+        mock_engine._state_store.get_task.return_value = task.model_copy(
+            update={"output_refs": [ref]}
+        )
+
+        body = client.get("/workflows/wf-123/tasks/task-1").json()
+
+        assert body["output_refs"][0]["checksum"] == "sha256:" + "a" * 64
+        assert body["output_refs"][0]["size_bytes"] == 42

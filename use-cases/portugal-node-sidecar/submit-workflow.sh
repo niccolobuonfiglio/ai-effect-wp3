@@ -18,8 +18,19 @@ PAYLOAD=$(jq -n --argjson blueprint "$BLUEPRINT" --argjson dockerinfo "$DOCKERIN
   '{"blueprint": $blueprint, "dockerinfo": $dockerinfo, "inputs": [{"protocol": "inline", "uri": $inputs_b64, "format": "json"}]}')
 
 echo "Submitting Portugal node workflow (sidecar) to orchestrator at $API_URL..."
+# Authentication, when enabled: the services' key travels with the workflow
+# (the orchestrator sends it to every service), the orchestrator's own key as a
+# bearer token.
+if [ -n "${SERVICE_API_KEY:-}" ]; then
+    PAYLOAD=$(echo "$PAYLOAD" | jq --arg k "$SERVICE_API_KEY" '. + {services_api_key: $k}')
+fi
+AUTH=()
+if [ -n "${ORCHESTRATOR_API_KEY:-}" ]; then
+    AUTH=(-H "Authorization: Bearer $ORCHESTRATOR_API_KEY")
+fi
+
 RESPONSE=$(curl -s -X POST "$API_URL/workflows" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" "${AUTH[@]}" \
   -d "$PAYLOAD")
 
 WORKFLOW_ID=$(echo "$RESPONSE" | jq -r .workflow_id)
@@ -33,6 +44,14 @@ fi
 echo "Workflow submitted!"
 echo "Workflow ID: $WORKFLOW_ID"
 echo ""
+
+# Problems that did not stop the submission (e.g. BLUEPRINT_TYPE_CHECK=warn)
+WARNINGS=$(echo "$RESPONSE" | jq -r '.warnings[]?')
+if [ -n "$WARNINGS" ]; then
+    echo "Warnings:"
+    echo "$WARNINGS" | sed 's/^/  - /'
+    echo ""
+fi
 echo "Pipeline: LoadData -> ApplyFeatures -> TrainModel -> GenerateData"
 echo ""
 echo "To check status:"
