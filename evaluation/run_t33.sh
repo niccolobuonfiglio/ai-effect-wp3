@@ -130,8 +130,16 @@ ONLY=("$@")
 for key in ORCHESTRATOR_API_KEY SERVICE_API_KEY; do
     [ -n "${!key:-}" ] || { echo "export $key first (see the node's START-HERE.md)" >&2; exit 1; }
 done
-if [ "$NODE" = dutch ] && [ -z "${HAI_SESSION_TOKEN_SECRET:-}" ]; then
-    echo "export HAI_SESSION_TOKEN_SECRET first (dutch-node/START-HERE.md)" >&2; exit 1
+if [ "$NODE" = dutch ]; then
+    [ -n "${HAI_SESSION_TOKEN_SECRET:-}" ] || {
+        echo "export HAI_SESSION_TOKEN_SECRET first (dutch-node/START-HERE.md)" >&2; exit 1; }
+    # The runbook's fixed HAI settings (START-HERE.md), unless already exported
+    export NODE_PUBLIC_BASE_URL="${NODE_PUBLIC_BASE_URL:-http://localhost:8443}"
+    export HAI_PUBLIC_BASE_URL="${HAI_PUBLIC_BASE_URL:-http://localhost:8443}"
+    export HAI_PROXY_HOST_PORT="${HAI_PROXY_HOST_PORT:-8443}"
+    export HAI_SESSION_SLOT_COUNT="${HAI_SESSION_SLOT_COUNT:-2}"
+    export HAI_CAB_URL="${HAI_CAB_URL:-http://frontend:80}"
+    export HAI_SIM_ENV_NAME="${HAI_SIM_ENV_NAME:-Ressources/env_ICAPS_input_data_test}"
 fi
 
 NODE_DIR="$T33_ROOT/$NODE-node"

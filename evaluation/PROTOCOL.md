@@ -100,9 +100,12 @@ author choosing tests that favour their own code.
   (e.g. `RESULT: recorded.`) are stored as `UNLABELLED`, with the full text.
 
   The Dutch HAI scripts (30–36) need two more things. First,
-  `HAI_SESSION_TOKEN_SECRET`, which the Dutch runbook creates together with
-  the two API keys; `run_t33.sh` now refuses to start without the keys the
-  runbook requires. Second, a Linux stand-in for the Windows-only
+  the runbook's HAI environment (`START-HERE.md`): `HAI_SESSION_TOKEN_SECRET`,
+  which must be exported and without which `run_t33.sh` refuses to start, and
+  six fixed values (`HAI_PUBLIC_BASE_URL`, `NODE_PUBLIC_BASE_URL`,
+  `HAI_PROXY_HOST_PORT`, `HAI_SESSION_SLOT_COUNT`, `HAI_CAB_URL`,
+  `HAI_SIM_ENV_NAME`), which `run_t33.sh` sets to the runbook's values unless
+  already exported. Second, a Linux stand-in for the Windows-only
   `Get-NetTCPConnection`, which script 30 uses to ask whether port 8443 has a
   listener. The stand-in is defined in `dutch-node/_Support.ps1` only when the
   real command is missing, answers with `ss`, and appears in
