@@ -227,17 +227,28 @@ while IFS= read -r line; do
     started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     t0=$(date +%s)
     echo "=== $NODE $VERSION $script ${args[*]}"
-    (cd "$NODE_DIR" && NO_COLOR=1 pwsh -NoLogo -NoProfile -File "./$script" "${args[@]}") 2>&1 \
+    # </dev/null: the script list is this loop's stdin, and a script (or a
+    # command it runs) that reads stdin would swallow the remaining lines.
+    (cd "$NODE_DIR" && NO_COLOR=1 pwsh -NoLogo -NoProfile -File "./$script" "${args[@]}" </dev/null) 2>&1 \
         | sed 's/\x1b\[[0-9;]*m//g' >"$log"
     code=${PIPESTATUS[0]}
     secs=$(( $(date +%s) - t0 ))
     result=$(grep -a 'RESULT:' "$log" | tail -n 1 | sed 's/.*RESULT:[[:space:]]*//')
+    # Verdicts are an upper-case label, then " - " (German, Portugal) or an em
+    # dash (Dutch) and a message. Some Dutch lines have no label at all
+    # ("RESULT: recorded."); they are kept whole, labelled UNLABELLED.
     if [ -z "$result" ]; then
         verdict="NO RESULT"
         message="$(grep -av '^\s*$' "$log" | tail -n 1)"
+    elif [[ "$result" =~ ^([A-Z][A-Z\ ]*[A-Z])[[:space:]]+(-|—)[[:space:]]+(.*)$ ]]; then
+        verdict="${BASH_REMATCH[1]}"
+        message="${BASH_REMATCH[3]}"
+    elif [[ "$result" =~ ^[A-Z][A-Z\ ]*[A-Z]\.?$ ]]; then
+        verdict="${result%.}"
+        message=""
     else
-        verdict="${result%% - *}"
-        message="${result#* - }"
+        verdict="UNLABELLED"
+        message="$result"
     fi
     printf '%s,%s,%s,"%s",%s,%s,%s,"%s"\n' "$NODE" "$VERSION" "$script" "${verdict//\"/\'}" \
         "$code" "$started" "$secs" "${message//\"/\'}" >>"$CSV"

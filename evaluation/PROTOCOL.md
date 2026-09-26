@@ -91,6 +91,14 @@ author choosing tests that favour their own code.
   2026-09-26). The change is saved as `dutch-deployment.diff` and must be
   listed with the harness patches.
 
+  Two harness bugs were found on the first Dutch runs (2026-09-26) and fixed
+  before the reported ones. First, the loop fed the script list to each script
+  as standard input, so a script that read it swallowed the rest of the list:
+  Dutch runs stopped after script 20. Scripts now run with `</dev/null`.
+  Second, only ` - ` was recognised as the separator in `RESULT:` lines, while
+  the Dutch suite uses an em dash. Result lines without an upper-case label
+  (e.g. `RESULT: recorded.`) are stored as `UNLABELLED`, with the full text.
+
 - **Project name.** The suites find the orchestrator by container name
   (`orchestrator-api`, `orchestrator-redis`), so both versions run as compose
   project `orchestrator`, as in the official closure runs. `run_t33.sh`
