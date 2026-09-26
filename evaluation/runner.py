@@ -19,9 +19,13 @@ Usage:
 """
 
 import argparse
+import base64
 import copy
+import hashlib
 import json
+import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -51,16 +55,20 @@ def api(method: str, path: str, **kwargs) -> httpx.Response:
     return httpx.request(method, f"{API}{path}", headers=headers, timeout=15, **kwargs)
 
 
-def run(*args: str, check: bool = True) -> str:
-    result = subprocess.run(list(args), capture_output=True, text=True, check=check)
+def run(*args: str, check: bool = True, env: dict | None = None) -> str:
+    result = subprocess.run(
+        list(args), capture_output=True, text=True, check=check,
+        env={**os.environ, **env} if env else None,
+    )
     return result.stdout
 
 
-def compose(compose_file: Path, *args: str, project: str | None = None, check=True) -> str:
+def compose(compose_file: Path, *args: str, project: str | None = None, check=True,
+            env: dict | None = None) -> str:
     cmd = ["docker", "compose"]
     if project:
         cmd += ["-p", project]
-    return run(*cmd, "-f", str(compose_file), *args, check=check)
+    return run(*cmd, "-f", str(compose_file), *args, check=check, env=env)
 
 
 def wait_for(condition, timeout: float, interval: float = 0.25):
@@ -146,6 +154,27 @@ class Stack:
             if not ok:
                 raise RuntimeError(f"{name} does not answer at {url}")
 
+    def recreate_services(self, **env: str) -> None:
+        """Recreate every use-case service with this environment (e.g. a key).
+
+        Compose fixes a container's environment when it is created, so
+        switching service authentication on or off needs a recreate, not a
+        restart.
+        """
+        names = [c for c, _ in self.uc.services.values()]
+        self.uc_compose_env(env, "up", "-d", "--force-recreate", *names)
+        for name, (_, url) in self.uc.services.items():
+            ok, _ = wait_for(lambda url=url: answers(url), timeout=60, interval=0.5)
+            if not ok:
+                raise RuntimeError(f"{name} does not answer at {url} after recreate")
+
+    def uc_compose_env(self, env: dict, *args: str) -> str:
+        return compose(self.uc.compose_file, *args, env=env)
+
+    def redis_keys(self, pattern: str) -> int:
+        out = self.orch("exec", "-T", "redis", "redis-cli", "--scan", "--pattern", pattern)
+        return len([line for line in out.splitlines() if line.strip()])
+
     def stop_service(self, name: str) -> None:
         self.uc_compose("stop", self.uc.compose_name(name))
 
@@ -172,6 +201,12 @@ class Stack:
         r = api("POST", "/workflows", json=self.payload)
         r.raise_for_status()
         return r.json()["workflow_id"]
+
+    def try_submit(self) -> tuple[httpx.Response, float]:
+        """Submit and return the response as is, with how long it took."""
+        t0 = time.monotonic()
+        r = api("POST", "/workflows", json=self.payload)
+        return r, time.monotonic() - t0
 
     def status(self, wf: str) -> str:
         return api("GET", f"/workflows/{wf}").json()["status"]
@@ -542,6 +577,68 @@ def _alerts(stack: Stack, rec: dict, target: str, t_fault: float):
     rec["first_alert_seconds"] = down[0] - t_fault if down else None
 
 
+# ----------------------------------------------------------------------
+# RQ8: data-exchange contracts (PROTOCOL.md, Amendment 1)
+# ----------------------------------------------------------------------
+def _submit_and_observe(stack: Stack, rec: dict, args) -> None:
+    """Submit; if accepted, follow the workflow until the client can see it fail.
+
+    ``error_visible_seconds`` is the time from submission to the first error a
+    client can observe: the refusal itself, or the workflow turning ``failed``.
+    """
+    t0 = time.monotonic()
+    r, took = stack.try_submit()
+    rec["submit_status"] = r.status_code
+    rec["accepted"] = r.status_code == 200
+    rec["refused"] = r.status_code == 400
+    rec["refusal"] = None if rec["accepted"] else r.text[:300]
+    if rec["accepted"]:
+        wf = r.json()["workflow_id"]
+        final, _ = wait_for(lambda: stack.finished(wf), args.timeout, interval=0.05)
+        rec["final_status"] = final or "timeout"
+        rec["job_completed"] = final == "completed"
+        rec["error_visible_seconds"] = time.monotonic() - t0 if final == "failed" else None
+        tasks = stack.tasks(wf).values()
+        rec["tasks_started"] = sum(t["status"] != "pending" for t in tasks)
+        rec["task_errors"] = [t["error"][:200] for t in tasks if t.get("error")]
+    else:
+        rec["final_status"] = "refused" if rec["refused"] else f"http {r.status_code}"
+        rec["job_completed"] = False
+        rec["error_visible_seconds"] = took
+        rec["tasks_started"] = 0
+    rec["residue_services_keys"] = stack.redis_keys("services_key:*")
+    rec["residue_endpoints"] = stack.redis_keys("endpoints:*")
+
+
+def sc_credential_misconfig(stack: Stack, rec: dict, args) -> None:
+    """V-C1: the services require a key and the workflow is submitted without one."""
+    key = secrets.token_hex(24)
+    stack.recreate_services(SERVICE_API_KEY=key)
+    try:
+        _submit_and_observe(stack, rec, args)
+    finally:
+        # Back to the unauthenticated services every other scenario uses
+        stack.recreate_services(SERVICE_API_KEY="")
+
+
+def sc_corrupt_inline(stack: Stack, rec: dict, args) -> None:
+    """V-C2: an inline input whose checksum does not match its payload."""
+    _submit_and_observe(stack, rec, args)
+
+
+def corrupt_inline_input(payload: dict, uc: UseCase) -> dict:
+    """Add an inline initial input whose stated checksum is not its own."""
+    p = copy.deepcopy(payload)
+    data = json.dumps({"num_records": 10, "output_format": "csv"}).encode()
+    p["inputs"] = [{
+        "protocol": "inline",
+        "uri": base64.b64encode(data).decode(),
+        "format": "json",
+        "checksum": "sha256:" + hashlib.sha256(data + b" altered").hexdigest(),
+    }]
+    return p
+
+
 def break_operation(payload: dict, uc: UseCase) -> dict:
     """Ask the outage target for an operation it does not implement.
 
@@ -569,6 +666,8 @@ SCENARIOS = {
     "request-error": (sc_request_error, break_operation),
     "worker-death": (sc_worker_death, None),
     "concurrent-outage": (sc_concurrent_outage, None),
+    "credential-misconfig": (sc_credential_misconfig, None),
+    "corrupt-inline": (sc_corrupt_inline, corrupt_inline_input),
 }
 
 
@@ -588,6 +687,8 @@ def main() -> int:
     p.add_argument("--down-extra", type=float, default=10, help="short-outage extra downtime (s)")
     p.add_argument("--max-resubmits", type=int, default=2, help="OLD operator budget")
     p.add_argument("--stats", action="store_true", help="sample docker stats")
+    p.add_argument("--variant", default="default",
+                   help="label of the orchestrator configuration, e.g. checks-off (RQ6 attribution)")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
 
@@ -606,6 +707,7 @@ def main() -> int:
         rec = {
             "version": args.version,
             "scenario": args.scenario,
+            "variant": args.variant,
             "use_case": args.use_case,
             "rep": i - args.warmup,
             "warmup": warm,

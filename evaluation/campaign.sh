@@ -28,8 +28,9 @@ UC="$HERE/../use-cases/file_based_energy_pipeline/docker-compose.yml"
 docker compose -f "$UC" up -d
 
 # NEW's lease is shortened for the worker-death scenario only; everything else
-# runs with the shipped defaults of each version.
-scenarios=(nominal burst outage short-outage request-error concurrent-outage worker-death)
+# runs with the shipped defaults of each version. CAMPAIGN_SCENARIOS selects a
+# subset (space-separated), e.g. for a smoke run.
+scenarios=(${CAMPAIGN_SCENARIOS:-nominal burst outage short-outage request-error concurrent-outage worker-death credential-misconfig corrupt-inline})
 
 run_block() {  # version
     local v=$1
@@ -44,6 +45,14 @@ run_block() {  # version
             --use-case file_based --out "$OUT" "${extra[@]}") | tee -a "$OUT/campaign.log"
         if [ "$s" = worker-death ] && [ "$v" = new ]; then
             "$HERE/stack.sh" new >/dev/null   # back to the default lease
+        fi
+        # RQ6 attribution (PROTOCOL.md 8.4): the same nominal workload on NEW
+        # with the submission-time checks switched off.
+        if [ "$s" = nominal ] && [ "$v" = new ]; then
+            SERVICE_AUTH_CHECK=false BLUEPRINT_TYPE_CHECK=off "$HERE/stack.sh" new >/dev/null
+            (cd "$HERE" && "$PY" runner.py --version new --scenario nominal --variant checks-off \
+                --reps "$reps" --use-case file_based --out "$OUT" "${extra[@]}") | tee -a "$OUT/campaign.log"
+            "$HERE/stack.sh" new >/dev/null   # back to the default checks
         fi
     done
     # CPU/RAM are sampled in a separate burst run: "docker stats" itself costs

@@ -1,7 +1,8 @@
 """Differential tests: the same behavioural checks, run on OLD and on NEW.
 
 Each test states a property that the orchestrator *should* have, using only
-the API that both versions share (WorkflowEngine, RedisTaskQueue, Worker).
+the API that both versions share (WorkflowEngine, RedisTaskQueue, Worker, and
+the REST API built by OrchestratorAPI).
 Run on NEW they should pass. Run on OLD they should fail, which shows the test
 detects a real defect of the original code and does not merely exercise
 new code. Which source tree is tested is decided by PYTHONPATH (see
@@ -22,6 +23,8 @@ Environment:
     DIFF_OUT        directory for measured rates (differential.json)
 """
 
+import base64
+import hashlib
 import inspect
 import json
 import os
@@ -34,12 +37,16 @@ import fakeredis
 import pytest
 import redis
 
+from fastapi.testclient import TestClient
+
+from api.app import OrchestratorAPI
 from models.data_reference import DataReference, Format, Protocol
 from models.graph import ExecutionGraph, GraphNode
 from models.node import Node, OperationSignature, OperationSignatureList
 from models.state import TaskStatus
+from services.blueprint_parser import BlueprintParser
 from services.control_client import ExecuteResponse, StatusResponse
-from services.dockerinfo_parser import ServiceEndpoint
+from services.dockerinfo_parser import DockerInfoParser, ServiceEndpoint
 from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
 from services.worker import Worker
@@ -302,3 +309,149 @@ def test_service_that_never_finishes_does_not_hold_a_worker_forever():
     assert finished, f"worker still polling a stuck service after {HANG}s"
     tasks = engine.get_all_tasks("wf-1")
     assert tasks[0].status == TaskStatus.FAILED
+
+
+# ----------------------------------------------------------------------
+# RQ8: data-exchange contracts (PROTOCOL.md, Amendment 1)
+# ----------------------------------------------------------------------
+def chain_graph() -> ExecutionGraph:
+    """A -> B."""
+    graph = ExecutionGraph()
+    a, b = graph_node("service-a"), graph_node("service-b")
+    a.next_nodes.append(b)
+    b.dependencies.append(a)
+    graph.add_node(a)
+    graph.add_node(b)
+    graph.start_nodes.append(a)
+    return graph
+
+
+def blueprint(out_a: str = "Msg", in_b: str = "Msg") -> dict:
+    """Two connected services; the message types match unless told otherwise."""
+    def node(name, inp, out, targets):
+        return {
+            "container_name": name,
+            "proto_uri": f"{name}.proto",
+            "image": f"{name}:latest",
+            "node_type": "MLModel",
+            "operation_signature_list": [{
+                "operation_signature": {
+                    "operation_name": "Run",
+                    "input_message_name": inp,
+                    "output_message_name": out,
+                },
+                "connected_to": [
+                    {"container_name": t, "operation_signature": {"operation_name": "Run"}}
+                    for t in targets
+                ],
+            }],
+        }
+    return {
+        "name": "differential", "pipeline_id": "diff", "creation_date": "2026-09-26",
+        "type": "pipeline-topology/v2", "version": "2.0",
+        "nodes": [node("svc-a", "Start", out_a, ["svc-b"]), node("svc-b", in_b, "End", [])],
+    }
+
+
+DOCKERINFO = {"docker_info_list": [
+    {"container_name": "svc-a", "ip_address": "svc-a", "port": "8080"},
+    {"container_name": "svc-b", "ip_address": "svc-b", "port": "8080"},
+]}
+
+
+def api_client(monkeypatch, client, **kwargs) -> TestClient:
+    """This version's REST API on ``client``, with the API key switched off."""
+    monkeypatch.delenv("ORCHESTRATOR_API_KEY", raising=False)
+    api = OrchestratorAPI(
+        make_engine(client), BlueprintParser(), DockerInfoParser(), client,
+        **optional(OrchestratorAPI, **kwargs),
+    )
+    return TestClient(api.create_app())
+
+
+def keys(client, pattern: str) -> list:
+    return list(client.scan_iter(match=pattern))
+
+
+def test_fan_in_inputs_name_their_producer():
+    """A task with two predecessors can tell its inputs apart."""
+    engine = make_engine(make_redis())
+    engine.initialize_workflow("wf-1", fan_in_graph())
+    engine.start_workflow("wf-1")
+    for _ in range(2):
+        task = engine.claim_task("wf-1", timeout=1)
+        producer = task.node_key.split(":")[0]
+        engine.complete_task("wf-1", task.task_id, output_refs=[ref(producer)])
+
+    join = engine.claim_task("wf-1", timeout=1)
+    labels = {r.uri: (r.metadata or {}).get("source_node") for r in join.input_refs}
+
+    record("fan_in_inputs_labelled", all(labels.values()))
+    assert labels == {
+        "s3://bucket/service-a.json": "service-a:Process",
+        "s3://bucket/service-b.json": "service-b:Process",
+    }
+
+
+def test_services_key_is_gone_once_the_workflow_completes():
+    """A workflow's service credentials do not outlive it (T3.3 German 50)."""
+    client = make_redis()
+    engine = make_engine(client)
+    engine.initialize_workflow("wf-1", chain_graph())
+    client.set("services_key:wf-1", "secret")
+    engine.start_workflow("wf-1")
+    for _ in range(2):
+        task = engine.claim_task("wf-1", timeout=1)
+        engine.complete_task("wf-1", task.task_id)
+
+    left = bool(client.exists("services_key:wf-1"))
+    record("services_key_left_after_completion", left)
+    assert not left, "the services key is still in Redis after the workflow completed"
+
+
+@pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+def test_submission_with_refused_credentials_is_rejected(monkeypatch, httpx_mock):
+    """Services that refuse the key: rejected at once, nothing stored."""
+    httpx_mock.add_response(status_code=401, is_reusable=True)
+    client = make_redis()
+    api = api_client(monkeypatch, client, service_auth_check=True)
+
+    response = api.post("/workflows", json={
+        "blueprint": blueprint(), "dockerinfo": DOCKERINFO, "services_api_key": "wrong",
+    })
+
+    stored = keys(client, "services_key:*") + keys(client, "endpoints:*")
+    record("refused_credentials_rejected", response.status_code == 400)
+    assert response.status_code == 400, "accepted a workflow its services will refuse"
+    assert stored == []
+
+
+def test_mismatching_message_types_are_reported(monkeypatch):
+    """A connection whose message types differ is reported at submission."""
+    client = make_redis()
+    api = api_client(monkeypatch, client, service_auth_check=False)
+
+    response = api.post("/workflows", json={
+        "blueprint": blueprint(out_a="Forecast", in_b="GridModel"), "dockerinfo": DOCKERINFO,
+    })
+
+    reported = response.status_code == 400 or bool(response.json().get("warnings"))
+    record("type_mismatch_reported", reported)
+    assert reported, "a Forecast -> GridModel connection went unnoticed"
+
+
+def test_inline_input_with_wrong_checksum_is_rejected(monkeypatch):
+    """Inline data that does not match its own checksum never enters a workflow."""
+    client = make_redis()
+    api = api_client(monkeypatch, client, service_auth_check=False)
+    data = b'{"num_records": 10}'
+    wrong = "sha256:" + hashlib.sha256(b"something else").hexdigest()
+
+    response = api.post("/workflows", json={
+        "blueprint": blueprint(), "dockerinfo": DOCKERINFO,
+        "inputs": [{"protocol": "inline", "uri": base64.b64encode(data).decode(),
+                    "format": "json", "checksum": wrong}],
+    })
+
+    record("corrupt_inline_rejected", response.status_code == 400)
+    assert response.status_code == 400, "a corrupted inline input was accepted"

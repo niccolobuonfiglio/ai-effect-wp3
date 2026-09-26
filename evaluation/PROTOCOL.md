@@ -121,6 +121,17 @@ author choosing tests that favour their own code.
   builds it from the pinned source, as its "prepare" path does; the source is
   the same in `dutch-old` and `dutch-new`.
 
+  The rebuild then failed on both versions: the simulator's `Dockerfile.app`
+  starts from `python:3.9-slim-bullseye` (Debian 11), whose packages Debian's
+  mirrors no longer serve (`apt-get install ffmpeg …` → 404), so the supplied
+  source can no longer be built. Changing the Dockerfile would modify supplied
+  source, which the suite forbids, so HAI scripts 29–36 are reported as
+  **blocked by the environment** on both versions. This does not weaken the
+  comparison: the HAI scripts call the HAI service's own `/control/execute`
+  directly inside its container and never use the orchestrator, so they cannot
+  distinguish OLD from NEW. The Dutch comparison rests on scripts 00–22, 40 and
+  50.
+
 - **Project name.** The suites find the orchestrator by container name
   (`orchestrator-api`, `orchestrator-redis`), so both versions run as compose
   project `orchestrator`, as in the official closure runs. `run_t33.sh`
@@ -281,3 +292,73 @@ Single scenarios can be run on their own, for example
 - **Configuration.** NEW's lease is shortened in one scenario (reported).
   Jitter injection in the fan-in test is an artificial stressor: it shows the
   race is *possible*, not how often it happens in production.
+
+## 8. Amendment 1 (2026-09-26): data contracts, overhead attribution, pipeline fix
+
+Sections 1–7 are unchanged and remain the pre-registered protocol. This
+amendment was written **before** any of the measurements it describes, after
+the features below were added to NEW (commits after `1c42faa`, documented in
+`orchestrator/docs/PROVENANCE_AND_CREDENTIALS.md` and `DATA_CONTRACTS.md`). The
+run in `results/final-2026-09-25` measured NEW at `1c42faa` and therefore
+does not cover them; the whole protocol is rerun on the final commit.
+
+### 8.1 New research question
+
+| RQ | Question | H1 | Evidence layer |
+|---|---|---|---|
+| RQ8 Data-exchange contracts | Are mis-wired pipelines, misconfigured service credentials and corrupted inline data detected before they affect execution? | NEW detects them at submission; OLD accepts them | 2, 3 |
+
+**Attribution rule.** RQ8 credits NEW only with what the orchestrator itself
+does: the message-type check, the credential check at submission, the
+services-key lifetime, input provenance labels and the verification of
+inline data. Checksum verification of *files* happens in the use-case
+services, which are identical for both versions (§1), and OLD's
+`DataReference` already carries `checksum`. A tampered file is therefore
+caught on OLD too, and is not claimed as an improvement of NEW.
+
+### 8.2 Layer 2: five more differential tests
+
+Each uses only the API both versions share and must **fail on OLD and pass on
+NEW**:
+
+1. Fan-in inputs name their producer (`metadata["source_node"]`).
+2. A workflow's `services_key:*` is gone once its last task completes.
+3. A submission whose services refuse the key (401) is rejected with 400 and
+   leaves nothing in Redis.
+4. A blueprint connection whose message types differ is reported at
+   submission (`warnings` or 400).
+5. An inline input whose checksum does not match its payload is rejected
+   with 400.
+
+### 8.3 Layer 3: two more scenarios
+
+| ID | Scenario (`--scenario`) | Fault injection | Oracle | Main metrics | n per version |
+|---|---|---|---|---|---|
+| V-C1 | `credential-misconfig` | services require a key; the workflow is submitted without one | refused at submission, no task started | accepted (binary), seconds from submission to the first error visible to the client, tasks started, keys left in Redis | 10 |
+| V-C2 | `corrupt-inline` | an inline input whose `checksum` does not match its payload | refused at submission | accepted (binary), tasks executed on the corrupted input | 10 |
+
+Both outcomes are expected to be deterministic; Fisher's exact test as in §5.
+
+### 8.4 Overhead attribution (RQ6)
+
+The credential check and the type check run inside `POST /workflows`, which
+the nominal end-to-end latency includes. One more nominal arm runs NEW with
+both switched off (`SERVICE_AUTH_CHECK=false BLUEPRINT_TYPE_CHECK=off`,
+recorded as `variant = checks-off`), n = 30 after 2 warm-up trials. Reported:
+
+- (a) OLD vs NEW (default) TOST, the pre-registered RQ6 test;
+- (b) OLD vs NEW (checks-off) TOST;
+- (c) NEW (default) vs NEW (checks-off): difference in medians with a 95 %
+  bootstrap CI, i.e. the measured cost of the checks.
+
+The ±5 % margin is **not** changed. If (a) fails and (b) passes, the chapter
+reports that the checks cost what (c) shows; it does not re-tune the margin.
+
+### 8.5 Use-case fix: per-workflow files
+
+The file-based pipeline wrote fixed file names shared by all workflows, so
+overlapping workflows could read each other's half-written files (SUMMARY
+§3). Its three services now write under `data/<workflow_id>/`. The fix is in
+the use case, which both versions run identically, so it removes a confound
+without favouring either version. Burst and concurrent-outage are rerun, and
+their 2026-09-25 completion rates are not used.

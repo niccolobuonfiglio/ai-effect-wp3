@@ -165,30 +165,46 @@ Burst throughput (OLD 561, NEW 707 workflows/min, p = 0.003) is affected by
 the same failures. OLD's idle worker stuck in BRPOP is a genuine factor in
 that gap too, but the two cannot be separated in this data.
 
-### Finding: the service-key defect is not fixed in NEW
+### Finding (superseded 2026-09-26): the service-key defect
 
-T3.3 reports that workflow service keys persist in Redis without expiry. In
-NEW, a key submitted with a workflow is still in Redis after the workflow
-completes (`TTL -1`):
+On 2026-09-25, T3.3 German script 50 reported DEFECT CONFIRMED on both
+versions: a key submitted with a workflow stayed in Redis after it completed.
+NEW now deletes the key when the workflow completes or is deleted (see
+`orchestrator/docs/PROVENANCE_AND_CREDENTIALS.md`). Rerun on 2026-09-26
+(`results/t33-2026-09-26`), script 50 gives **DEFECT CONFIRMED on OLD and
+PASS on NEW**, the only T3.3 verdict that improves. Caveats for the chapter:
+a failed workflow keeps its key (needed for resume), and without
+`ORCHESTRATOR_SECRET` it is stored in plain text, as in OLD.
 
-- With the shipped defaults (`ORCHESTRATOR_SECRET` unset) it is stored in
-  plain text, exactly as in OLD.
-- With `ORCHESTRATOR_SECRET` set it is encrypted at rest, but it still never
-  expires, so T3.3 script 50 still reports DEFECT CONFIRMED.
+The same day the Dutch suite was run on both versions for the first time,
+after four harness fixes (PROTOCOL.md, Layer 1). All verdicts are identical
+(non-regression). HAI scripts 29–36 are blocked by the environment on both,
+because the supplied simulator can no longer be built on Debian 11, and they
+never use the orchestrator.
 
-NEW improves confidentiality only when it is configured to. It does not change
-the key's lifecycle.
+## 4. Amendment 1 (2026-09-26) and what is left
 
-## 4. Still to do
+The protocol was amended before new measurements (PROTOCOL.md §8):
 
-1. Decide how to handle the pipeline race:
-   - **(a)** make the pipeline services write per-workflow file names (the
-     same fixed pipeline for both versions), then rerun only burst and
-     concurrent-outage; or
-   - **(b)** keep the data and report the race as a use-case defect, drawing
-     no conclusions from those two completion rates.
-2. Decide whether to fix the service-key lifecycle in NEW (then rerun T3.3
-   script 50) or report it as an open limitation.
-3. Commit the modified `campaign.sh`, `runner.py` and the docs.
-4. Optional: Portugal (needs the external TEF checkout) and Dutch
-   (`run_t33.sh prepare-dutch`).
+- **RQ8, data-exchange contracts**, with 5 more differential tests (checked:
+  all 9 fail on OLD and pass on NEW, each for the behaviour it names) and two
+  scenarios, `credential-misconfig` and `corrupt-inline`. In a smoke run OLD
+  accepted both, completing the workflow on the corrupted input and failing
+  the misconfigured one 0.7 s later with a key left in Redis; NEW refused both
+  at submission in under 40 ms, leaving nothing behind.
+- **Overhead attribution**: a nominal arm with NEW's submission checks off
+  (`--variant checks-off`), so their cost is measured rather than hidden in
+  RQ6.
+- **The pipeline race is fixed** (decision (a) above): the file-based services
+  write under `data/<workflow_id>/`. Check on OLD: 10/10 bursts completed with
+  no file-race errors (previously 5 of 20 failed).
+
+Left to do:
+
+1. Commit, then rerun the whole protocol on the final commit: `env_snapshot.sh`,
+   `run_own_suites.sh`, `campaign.sh $RUN 2 5` (about 4–5 h), `analyze.py`.
+   T3.3 can be cited from `results/t33-2026-09-26` if the orchestrator code
+   does not change again.
+2. Replace the results in section 3 with the rerun's, including the new tables
+   `table_overhead.tex` and `table_differential.tex`.
+3. Optional: Portugal (needs the partner's TEF source).

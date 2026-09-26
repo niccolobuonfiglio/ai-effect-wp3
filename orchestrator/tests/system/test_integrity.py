@@ -27,8 +27,6 @@ from tests.system.live import (
     wait_for,
 )
 
-GENERATED_FILE = "/app/data/raw_energy.csv"
-
 
 @pytest.fixture(scope="module", autouse=True)
 def live_stack():
@@ -66,11 +64,13 @@ def test_file_changed_between_tasks_is_refused():
             timeout=60,
             what=f"{blocked} to be blocked",
         )
-        # Alter one value without changing the file's size, so only the
+        # The file the generator wrote for this workflow (one folder per
+        # workflow). Alter one value without changing its size, so only the
         # checksum can notice: 120.5 -> 999.9 on the first data row
+        generated = tasks(wf)["data_generator1:GenerateData"]["output_refs"][0]["uri"]
         compose(
             USE_CASE_COMPOSE, "exec", "-T", "data-generator",
-            "sed", "-i", "2s/120.5/999.9/", GENERATED_FILE,
+            "sed", "-i", "2s/120.5/999.9/", generated,
         )
     finally:
         start_service()
@@ -82,5 +82,6 @@ def test_file_changed_between_tasks_is_refused():
     assert analyzer["status"] == "failed"
     assert "Input rejected" in analyzer["error"]
     assert "checksum mismatch" in analyzer["error"]
+    assert wf in analyzer["error"]  # the workflow's own file, not a shared one
     # Nothing downstream ran on the altered data
     assert tasks(wf)["report_generator1:GenerateReport"]["status"] == "pending"

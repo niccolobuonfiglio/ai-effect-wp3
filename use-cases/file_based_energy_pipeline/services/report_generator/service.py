@@ -1,6 +1,7 @@
 """Report Generator service - generates summary reports from analyzed data."""
 
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -10,6 +11,12 @@ from common.integrity import IntegrityError, describe_file, verify_file
 from common.sequential import DataReference, ExecuteRequest, ExecuteResponse, run
 
 logger = logging.getLogger(__name__)
+
+
+def _output_dir(workflow_id: str) -> Path:
+    """A folder per workflow, so workflows running at once never share a file."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", workflow_id or "") or "unknown"
+    return Path("data") / safe
 
 
 def _get_input_reference(inputs: list[dict]) -> dict:
@@ -79,7 +86,7 @@ def execute_GenerateReport(request: ExecuteRequest) -> ExecuteResponse:
     }
 
     # Save report
-    output_path = Path("data/energy_report.csv")
+    output_path = _output_dir(request.workflow_id) / "energy_report.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     report_df = pd.DataFrame(report_data)

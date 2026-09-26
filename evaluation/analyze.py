@@ -15,7 +15,9 @@ Statistics (see PROTOCOL.md, "Analysis"):
   binary outcomes     Fisher's exact test, two-sided
   continuous          Mann-Whitney U (two-sided), Cliff's delta,
                       95% bootstrap CI of the difference in medians
-  overhead (nominal)  TOST equivalence on log latency, margin +/-5 %
+  overhead (nominal)  TOST equivalence on log latency, margin +/-5 %; plus the
+                      attribution arm (NEW with its submission checks off,
+                      PROTOCOL.md 8.4)
 Metrics that OLD cannot produce at all are reported as "n/s" (not supported),
 never as 0.
 """
@@ -138,7 +140,9 @@ def values(trials, key) -> list[float]:
 def analyse_trials(trials: list[dict]) -> dict:
     groups: dict[tuple, dict[str, list]] = defaultdict(lambda: {"old": [], "new": []})
     for t in trials:
-        if not t.get("warmup"):
+        # Only the shipped configuration of each version is compared here; the
+        # checks-off arm is analysed separately (analyse_overhead).
+        if not t.get("warmup") and t.get("variant", "default") == "default":
             groups[(t["scenario"], t["use_case"])][t["version"]].append(t)
 
     result = {}
@@ -152,8 +156,15 @@ def analyse_trials(trials: list[dict]) -> dict:
                 sum(bool(t.get("job_completed")) for t in valid["new"]), len(valid["new"]),
             ),
         }
+        if any("refused" in t for t in valid["old"] + valid["new"]):  # RQ8
+            r["refused"] = compare_binary(
+                sum(bool(t.get("refused")) for t in valid["old"]), len(valid["old"]),
+                sum(bool(t.get("refused")) for t in valid["new"]), len(valid["new"]),
+            )
         for key in ("recovery_seconds", "reexecutions", "operator_actions", "e2e_seconds",
-                    "makespan_seconds", "throughput_wf_per_min", "brpop_clients_after"):
+                    "makespan_seconds", "throughput_wf_per_min", "brpop_clients_after",
+                    "error_visible_seconds", "tasks_started", "residue_services_keys",
+                    "residue_endpoints"):
             o, n = values(valid["old"], key), values(valid["new"], key)
             if o or n:
                 r[key] = compare_continuous(o, n)
@@ -168,6 +179,31 @@ def analyse_trials(trials: list[dict]) -> dict:
             r["tost_e2e"] = tost_log(values(valid["old"], "e2e_seconds"), values(valid["new"], "e2e_seconds"))
         result[f"{scenario}/{uc}"] = r
     return result
+
+
+def analyse_overhead(trials: list[dict]) -> dict:
+    """RQ6 with attribution (PROTOCOL.md 8.4): what do NEW's submission checks cost?"""
+    def e2e(version, variant):
+        return [t["e2e_seconds"] for t in trials
+                if t["scenario"] == "nominal" and not t.get("warmup") and "error" not in t
+                and t["version"] == version and t.get("variant", "default") == variant
+                and t.get("e2e_seconds") is not None]
+
+    old, new, off = e2e("old", "default"), e2e("new", "default"), e2e("new", "checks-off")
+    if not off:
+        return {}
+    cost = compare_continuous(off, new)  # "old" slot = checks off, "new" slot = default
+    return {
+        "a_old_vs_new_default": tost_log(old, new),
+        "b_old_vs_new_checks_off": tost_log(old, off),
+        "c_checks_cost": {
+            "n_checks_off": len(off), "n_default": len(new),
+            "median_checks_off": _med(off), "median_default": _med(new),
+            "median_diff_seconds": (_med(new) - _med(off)) if new and off else None,
+            "ci_median_diff": cost.get("ci_median_diff"),
+            "mwu_p": cost.get("mwu_p"), "cliffs_delta": cost.get("cliffs_delta"),
+        },
+    }
 
 
 # ----------------------------------------------------------------------
@@ -227,6 +263,12 @@ def analyse_suites(run: Path) -> dict:
                 for s in suites for c in s.iter("testcase")
                 if c.find("failure") is not None or c.find("error") is not None
             ]
+            if cell.name.startswith("diff-"):  # per-test outcome, for the RQ4/RQ8 table
+                r["cases"] = {
+                    c.get("name"): "fail" if (c.find("failure") is not None or c.find("error") is not None)
+                    else "pass"
+                    for s in suites for c in s.iter("testcase")
+                }
         cov = cell / "coverage.json"
         if cov.exists():
             t = json.loads(cov.read_text())["totals"]
@@ -271,14 +313,19 @@ def write_tables(out: Path, summary: dict) -> None:
             r"\midrule",
         ]
         for name, r in trials.items():
-            c = r["completion"]
-            lines.append(
-                f"{tex_escape(name)} & completed & {c['k_old']}/{c['n_old']} & {c['k_new']}/{c['n_new']} "
-                f"& {fmt_p(c['fisher_p'])} & & \\\\"
-            )
+            for key, label in (("completion", "completed"), ("refused", "refused at submission")):
+                if key in r:
+                    c = r[key]
+                    lines.append(
+                        f"{tex_escape(name)} & {label} & {c['k_old']}/{c['n_old']} & {c['k_new']}/{c['n_new']} "
+                        f"& {fmt_p(c['fisher_p'])} & & \\\\"
+                    )
             for key, label in (("recovery_seconds", "recovery [s]"), ("reexecutions", "re-executed tasks"),
                                ("operator_actions", "operator actions"), ("e2e_seconds", "latency [s]"),
-                               ("throughput_wf_per_min", "throughput [wf/min]")):
+                               ("throughput_wf_per_min", "throughput [wf/min]"),
+                               ("error_visible_seconds", "error visible after [s]"),
+                               ("tasks_started", "tasks started"),
+                               ("residue_endpoints", "workflow keys left in Redis")):
                 if key in r:
                     m = r[key]
                     lines.append(
@@ -292,6 +339,34 @@ def write_tables(out: Path, summary: dict) -> None:
         lines[-1] = r"\bottomrule"
         lines.append(r"\end{tabular}")
         (out / "table_trials.tex").write_text("\n".join(lines) + "\n")
+
+    overhead = summary.get("overhead", {})
+    if overhead:
+        a, b, c = overhead["a_old_vs_new_default"], overhead["b_old_vs_new_checks_off"], overhead["c_checks_cost"]
+        ci = c.get("ci_median_diff") or (None, None)
+        lines = [
+            r"\begin{tabular}{lrrl}", r"\toprule",
+            r"Comparison (nominal latency) & NEW/OLD ratio & $p_{\mathrm{TOST}}$ & equivalent ($\pm$5\,\%) \\",
+            r"\midrule",
+            f"OLD vs NEW (shipped) & {fmt(a.get('ratio_new_over_old'), 3)} & {fmt_p(a.get('p_tost'))} & {'yes' if a.get('equivalent') else 'no'} \\\\",
+            f"OLD vs NEW (checks off) & {fmt(b.get('ratio_new_over_old'), 3)} & {fmt_p(b.get('p_tost'))} & {'yes' if b.get('equivalent') else 'no'} \\\\",
+            r"\midrule",
+            f"\\multicolumn{{4}}{{l}}{{Cost of the checks: median {fmt(c.get('median_diff_seconds'), 3)}\\,s "
+            f"(95\\,\\% CI {fmt(ci[0], 3)} to {fmt(ci[1], 3)}\\,s), MWU $p$ = {fmt_p(c.get('mwu_p'))}}} \\\\",
+            r"\bottomrule", r"\end{tabular}",
+        ]
+        (out / "table_overhead.tex").write_text("\n".join(lines) + "\n")
+
+    suites_d = summary.get("suites", {})
+    old_cases = suites_d.get("diff-on-old", {}).get("cases", {})
+    new_cases = suites_d.get("diff-on-new", {}).get("cases", {})
+    if old_cases or new_cases:
+        lines = [r"\begin{tabular}{lll}", r"\toprule", r"Differential test & OLD & NEW \\", r"\midrule"]
+        for name in sorted(set(old_cases) | set(new_cases)):
+            lines.append(f"{tex_escape(name.removeprefix('test_'))} & {old_cases.get(name, '--')} & "
+                         f"{new_cases.get(name, '--')} \\\\")
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        (out / "table_differential.tex").write_text("\n".join(lines) + "\n")
 
     t33 = summary.get("t33", {})
     if t33:
@@ -408,6 +483,7 @@ def main() -> int:
     raw = load_trials(run)
     summary = {
         "trials": analyse_trials(raw),
+        "overhead": analyse_overhead(raw),
         "t33": analyse_t33(run),
         "suites": analyse_suites(run),
     }

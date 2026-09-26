@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +13,12 @@ from common.integrity import describe_file
 from common.sequential import DataReference, ExecuteRequest, ExecuteResponse, run
 
 logger = logging.getLogger(__name__)
+
+
+def _output_dir(workflow_id: str) -> Path:
+    """A folder per workflow, so workflows running at once never share a file."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", workflow_id or "") or "unknown"
+    return Path("data") / safe
 
 
 def _decode_inline_input(inputs: list[dict]) -> dict:
@@ -51,7 +58,7 @@ def execute_GenerateData(request: ExecuteRequest) -> ExecuteResponse:
     }
 
     # Save to CSV
-    output_path = Path("data/raw_energy.csv")
+    output_path = _output_dir(request.workflow_id) / "raw_energy.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame(data)
