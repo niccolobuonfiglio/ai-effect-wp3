@@ -26,6 +26,11 @@ unset ORCHESTRATOR_API_KEY SERVICE_API_KEY ORCHESTRATOR_SECRET
 # The file-based pipeline carries the fault scenarios; its services must be up.
 UC="$HERE/../use-cases/file_based_energy_pipeline/docker-compose.yml"
 docker compose -f "$UC" up -d
+# V-A2 (outage during a long task) runs on the Germany node, the only use case
+# with a task long enough to be interrupted (PROTOCOL.md, layer 3). Its ports
+# (18091-18093) do not clash with the file-based pipeline's.
+GERMANY="$HERE/../use-cases/germany-node/docker-compose.yml"
+docker compose -f "$GERMANY" up -d
 
 # NEW's lease is shortened for the worker-death scenario only; everything else
 # runs with the shipped defaults of each version. CAMPAIGN_SCENARIOS selects a
@@ -35,6 +40,7 @@ scenarios=(${CAMPAIGN_SCENARIOS:-nominal burst outage short-outage request-error
 run_block() {  # version
     local v=$1
     for s in "${scenarios[@]}"; do
+        [ "$s" = outage-during-task ] && continue   # Germany only, run below
         local reps=$REPS extra=()
         [ "$s" = nominal ] && { reps=$((REPS * 3)); extra=(--warmup 2); }
         [ "$s" = worker-death ] && extra=(--timeout 120)   # lease 20 s + slack; OLD never finishes
@@ -55,6 +61,12 @@ run_block() {  # version
             "$HERE/stack.sh" new >/dev/null   # back to the default checks
         fi
     done
+    # V-A2 on the Germany node. CAMPAIGN_SCENARIOS can leave it out by not
+    # listing outage-during-task.
+    if [ -z "${CAMPAIGN_SCENARIOS:-}" ] || [[ " $CAMPAIGN_SCENARIOS " == *" outage-during-task "* ]]; then
+        (cd "$HERE" && "$PY" runner.py --version "$v" --scenario outage-during-task --reps "$REPS" \
+            --use-case germany --out "$OUT") | tee -a "$OUT/campaign.log"
+    fi
     # CPU/RAM are sampled in a separate burst run: "docker stats" itself costs
     # CPU and would bias the latency and throughput measured above.
     (cd "$HERE" && "$PY" runner.py --version "$v" --scenario burst --reps 2 --stats \
