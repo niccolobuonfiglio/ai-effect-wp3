@@ -112,6 +112,15 @@ author choosing tests that favour their own code.
   `t33-harness.diff` like the German portability patches. It applies to both
   versions alike.
 
+  A stale simulator image made every HAI session fail on both versions
+  (2026-09-26). Script 29 accepts any local image named
+  `powergrid-simulator-app:latest` without rebuilding it, and the one on this
+  machine (`sha256:551aa866…`, created 2026-07-06) predates the fork and lacks
+  the simulator's `POST /hai/session` endpoint, which the fork's source defines
+  (`PowerGrid_poc_simulator_app.py`). The image was removed so that script 29
+  builds it from the pinned source, as its "prepare" path does; the source is
+  the same in `dutch-old` and `dutch-new`.
+
 - **Project name.** The suites find the orchestrator by container name
   (`orchestrator-api`, `orchestrator-redis`), so both versions run as compose
   project `orchestrator`, as in the official closure runs. `run_t33.sh`
