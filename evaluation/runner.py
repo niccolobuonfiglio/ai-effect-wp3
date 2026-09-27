@@ -154,6 +154,22 @@ class Stack:
             if not ok:
                 raise RuntimeError(f"{name} does not answer at {url}")
 
+    def recreate(self, names: tuple[str, ...], settle: float = 2.0) -> None:
+        """Recreate these compose services and wait until they run.
+
+        Used for use-case services without a health URL (e.g. villas-node);
+        ``settle`` gives the service's own API time to come up after start.
+        """
+        for svc in names:
+            self.uc_compose("up", "-d", "--force-recreate", svc)
+        ok, _ = wait_for(
+            lambda: set(names) <= set(self.uc_compose("ps", "--status", "running", "--services").split()),
+            timeout=60, interval=0.5,
+        )
+        if not ok:
+            raise RuntimeError(f"{', '.join(names)} not running after recreate")
+        time.sleep(settle)
+
     def recreate_services(self, **env: str) -> None:
         """Recreate every use-case service with this environment (e.g. a key).
 
@@ -300,9 +316,17 @@ def operator_recover(stack: Stack, wf: str, service: str, rec: dict, limit: floa
     Returns the id of the workflow that finally carries the job (a new id on
     OLD, where recovery means resubmitting), and records actions and outcome.
     """
+    def before_recovery():
+        # The F2 rule (PROTOCOL.md 9.3): identical for both versions, not an
+        # operator action. Empty for every use case but Germany.
+        if stack.uc.recreate_before_recovery:
+            stack.recreate(stack.uc.recreate_before_recovery)
+            rec["f2_recreates"] = rec.get("f2_recreates", 0) + 1
+
     if stack.version.name == "new":
         status = stack.finished(wf)
         if status is None or status == "failed":
+            before_recovery()
             body = stack.recover(service)
             rec["operator_actions"] += 1
             rec["resumed_tasks"] = body.get("resumed_tasks")
@@ -320,6 +344,7 @@ def operator_recover(stack: Stack, wf: str, service: str, rec: dict, limit: floa
     for _ in range(rec["max_resubmits"]):
         if final == "completed":
             break
+        before_recovery()
         current = stack.submit()
         rec["operator_actions"] += 1
         final, _ = wait_for(lambda: stack.finished(current), limit)
@@ -343,6 +368,8 @@ def sc_nominal(stack: Stack, rec: dict, args) -> None:
 
 def sc_burst(stack: Stack, rec: dict, args) -> None:
     """No fault: K workflows at once (throughput) and the idle-worker check (V-A4)."""
+    if not stack.uc.concurrent:
+        raise SystemExit(f"use case {stack.uc.name} cannot run workflows concurrently")
     k = args.workflows
     t0 = time.monotonic()
     wfs = [stack.submit() for _ in range(k)]

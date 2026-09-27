@@ -53,6 +53,9 @@ class UseCase:
     long_task: str | None = None
     # compose services recreated before every trial (use-case defects, e.g. F2)
     recreate_before_trial: tuple[str, ...] = field(default_factory=tuple)
+    # compose services recreated before every recovery action of the operator
+    # (OLD resubmission, NEW /recover); the F2 rule of PROTOCOL.md 9.3
+    recreate_before_recovery: tuple[str, ...] = field(default_factory=tuple)
     # can several workflows run at the same time?
     concurrent: bool = True
 
@@ -88,6 +91,23 @@ USE_CASES = {
         long_task="villas_chronics1",
         # villas-node segfaults on its second restart (RUN_ANALYSIS F2)
         recreate_before_trial=("villas-node",),
+        recreate_before_recovery=("villas-node",),
+        concurrent=False,
+    ),
+    # Services pass data over gRPC from in-memory caches: a restart erases a
+    # service's output, and concurrent workflows would overwrite each other's
+    # data (PROTOCOL.md 9.1). The target has not produced its output yet when
+    # it goes down, so the resume does not depend on a lost cache.
+    "protobuf": UseCase(
+        name="protobuf",
+        folder=NEW_ROOT / "use-cases" / "protobuf_based_energy_pipeline",
+        services={
+            "input_provider1": ("pb-input-provider", "http://localhost:18181/health"),
+            "data_generator1": ("pb-data-generator", "http://localhost:18182/health"),
+            "data_analyzer1": ("pb-data-analyzer", "http://localhost:18183/health"),
+            "report_generator1": ("pb-report-generator", "http://localhost:18184/health"),
+        },
+        outage_target="data_analyzer1",
         concurrent=False,
     ),
 }

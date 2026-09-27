@@ -23,54 +23,74 @@ OUT="$(cd "$OUT" && pwd)"   # absolute: the runner is started from evaluation/
 # on both versions. Starting the pipeline here also recreates it without one.
 unset ORCHESTRATOR_API_KEY SERVICE_API_KEY ORCHESTRATOR_SECRET
 
-# The file-based pipeline carries the fault scenarios; its services must be up.
-UC="$HERE/../use-cases/file_based_energy_pipeline/docker-compose.yml"
-docker compose -f "$UC" up -d
-# V-A2 (outage during a long task) runs on the Germany node, the only use case
-# with a task long enough to be interrupted (PROTOCOL.md, layer 3). Its ports
-# (18091-18093) do not clash with the file-based pipeline's.
-GERMANY="$HERE/../use-cases/germany-node/docker-compose.yml"
-docker compose -f "$GERMANY" up -d
+# Use cases and the scenarios each one supports (PROTOCOL.md 3 and 9.2).
+# CAMPAIGN_USE_CASES selects use cases, CAMPAIGN_SCENARIOS filters scenarios
+# (both space-separated), e.g. for a smoke run or the Amendment 2 cells only.
+# Germany and protobuf are sequential-only: no burst, no concurrent-outage.
+use_cases=(${CAMPAIGN_USE_CASES:-file_based germany protobuf})
+declare -A SCENARIOS=(
+  [file_based]="nominal burst outage short-outage request-error concurrent-outage worker-death credential-misconfig corrupt-inline"
+  [germany]="nominal outage short-outage request-error worker-death credential-misconfig corrupt-inline outage-during-task"
+  [protobuf]="nominal outage short-outage request-error worker-death credential-misconfig corrupt-inline"
+)
+declare -A COMPOSE=(
+  [file_based]=file_based_energy_pipeline
+  [germany]=germany-node
+  [protobuf]=protobuf_based_energy_pipeline
+)
+for uc in "${use_cases[@]}"; do
+    [ -n "${SCENARIOS[$uc]:-}" ] || { echo "unknown use case: $uc" >&2; exit 1; }
+    # Their ports do not clash: 18081-4, 18091-3, 18181-4 (+ gRPC 50152-4)
+    docker compose -f "$HERE/../use-cases/${COMPOSE[$uc]}/docker-compose.yml" up -d
+done
 
-# NEW's lease is shortened for the worker-death scenario only; everything else
-# runs with the shipped defaults of each version. CAMPAIGN_SCENARIOS selects a
-# subset (space-separated), e.g. for a smoke run.
-scenarios=(${CAMPAIGN_SCENARIOS:-nominal burst outage short-outage request-error concurrent-outage worker-death credential-misconfig corrupt-inline})
-
-run_block() {  # version
-    local v=$1
-    for s in "${scenarios[@]}"; do
-        [ "$s" = outage-during-task ] && continue   # Germany only, run below
-        local reps=$REPS extra=()
-        [ "$s" = nominal ] && { reps=$((REPS * 3)); extra=(--warmup 2); }
-        [ "$s" = worker-death ] && extra=(--timeout 120)   # lease 20 s + slack; OLD never finishes
-        if [ "$s" = worker-death ] && [ "$v" = new ]; then
-            LEASE_SECONDS=20 "$HERE/stack.sh" new >/dev/null
-        fi
-        (cd "$HERE" && "$PY" runner.py --version "$v" --scenario "$s" --reps "$reps" \
-            --use-case file_based --out "$OUT" "${extra[@]}") | tee -a "$OUT/campaign.log"
-        if [ "$s" = worker-death ] && [ "$v" = new ]; then
-            "$HERE/stack.sh" new >/dev/null   # back to the default lease
-        fi
-        # RQ6 attribution (PROTOCOL.md 8.4): the same nominal workload on NEW
-        # with the submission-time checks switched off.
-        if [ "$s" = nominal ] && [ "$v" = new ]; then
-            SERVICE_AUTH_CHECK=false BLUEPRINT_TYPE_CHECK=off "$HERE/stack.sh" new >/dev/null
-            (cd "$HERE" && "$PY" runner.py --version new --scenario nominal --variant checks-off \
-                --reps "$reps" --use-case file_based --out "$OUT" "${extra[@]}") | tee -a "$OUT/campaign.log"
-            "$HERE/stack.sh" new >/dev/null   # back to the default checks
+selected() {  # use-case -> the scenarios to run for it
+    local s out=()
+    for s in ${SCENARIOS[$1]}; do
+        if [ -z "${CAMPAIGN_SCENARIOS:-}" ] || [[ " $CAMPAIGN_SCENARIOS " == *" $s "* ]]; then
+            out+=("$s")
         fi
     done
-    # V-A2 on the Germany node. CAMPAIGN_SCENARIOS can leave it out by not
-    # listing outage-during-task.
-    if [ -z "${CAMPAIGN_SCENARIOS:-}" ] || [[ " $CAMPAIGN_SCENARIOS " == *" outage-during-task "* ]]; then
-        (cd "$HERE" && "$PY" runner.py --version "$v" --scenario outage-during-task --reps "$REPS" \
-            --use-case germany --out "$OUT") | tee -a "$OUT/campaign.log"
+    echo "${out[@]}"
+}
+
+# NEW's lease is shortened for the worker-death scenario only; everything else
+# runs with the shipped defaults of each version.
+run_cell() {  # version use-case scenario
+    local v=$1 uc=$2 s=$3 reps=$REPS extra=()
+    [ "$s" = nominal ] && { reps=$((REPS * 3)); extra=(--warmup 2); }
+    [ "$s" = worker-death ] && extra=(--timeout 120)   # lease 20 s + slack; OLD never finishes
+    if [ "$s" = worker-death ] && [ "$v" = new ]; then
+        LEASE_SECONDS=20 "$HERE/stack.sh" new >/dev/null
     fi
+    (cd "$HERE" && "$PY" runner.py --version "$v" --scenario "$s" --reps "$reps" \
+        --use-case "$uc" --out "$OUT" "${extra[@]}") | tee -a "$OUT/campaign.log"
+    if [ "$s" = worker-death ] && [ "$v" = new ]; then
+        "$HERE/stack.sh" new >/dev/null   # back to the default lease
+    fi
+    # RQ6 attribution (PROTOCOL.md 8.4), file-based only: the same nominal
+    # workload on NEW with the submission-time checks switched off.
+    if [ "$s" = nominal ] && [ "$v" = new ] && [ "$uc" = file_based ]; then
+        SERVICE_AUTH_CHECK=false BLUEPRINT_TYPE_CHECK=off "$HERE/stack.sh" new >/dev/null
+        (cd "$HERE" && "$PY" runner.py --version new --scenario nominal --variant checks-off \
+            --reps "$reps" --use-case file_based --out "$OUT" "${extra[@]}") | tee -a "$OUT/campaign.log"
+        "$HERE/stack.sh" new >/dev/null   # back to the default checks
+    fi
+}
+
+run_block() {  # version
+    local v=$1 uc s
+    for uc in "${use_cases[@]}"; do
+        for s in $(selected "$uc"); do
+            run_cell "$v" "$uc" "$s"
+        done
+    done
     # CPU/RAM are sampled in a separate burst run: "docker stats" itself costs
     # CPU and would bias the latency and throughput measured above.
-    (cd "$HERE" && "$PY" runner.py --version "$v" --scenario burst --reps 2 --stats \
-        --use-case file_based --out "$OUT/resources") | tee -a "$OUT/campaign.log"
+    if [[ " ${use_cases[*]} " == *" file_based "* ]] && [ -z "${CAMPAIGN_SCENARIOS:-}" ]; then
+        (cd "$HERE" && "$PY" runner.py --version "$v" --scenario burst --reps 2 --stats \
+            --use-case file_based --out "$OUT/resources") | tee -a "$OUT/campaign.log"
+    fi
 }
 
 for b in $(seq 1 "$BLOCKS"); do
