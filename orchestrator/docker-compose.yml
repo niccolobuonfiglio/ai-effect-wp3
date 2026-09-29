@@ -2,6 +2,11 @@ services:
   redis:
     restart: unless-stopped
     image: redis:7-alpine
+    # All workflow state lives here: append-only file (fsync every second)
+    # on a named volume, so a restart or `docker compose down` keeps it.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
     ports:
       - "16379:6379"
     healthcheck:
@@ -99,6 +104,7 @@ services:
 
 volumes:
   orchestrator_logs:
+  redis_data:
 
 networks:
   services:

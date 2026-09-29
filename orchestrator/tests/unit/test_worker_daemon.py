@@ -186,34 +186,87 @@ class TestLoadEndpoints:
 # workflow discovery
 # ----------------------------------------------------------------------
 class TestGetRunningWorkflows:
-    def test_only_running_workflows(self, daemon, redis_client):
+    def test_only_running_workflows(self, daemon):
+        store = daemon.state_store
+        for wf, status in (
+            ("wf-run", WorkflowStatus.RUNNING),
+            ("wf-done", WorkflowStatus.COMPLETED),
+            ("wf-fail", WorkflowStatus.FAILED),
+            ("wf-new", WorkflowStatus.PENDING),
+        ):
+            store.create_workflow(wf)
+            if status != WorkflowStatus.PENDING:
+                store.update_workflow_status(wf, status)
+
+        assert daemon.get_running_workflows() == ["wf-run"]
+
+    def test_leaves_index_when_no_longer_running(self, daemon):
+        store = daemon.state_store
+        store.create_workflow("wf-1")
+        store.update_workflow_status("wf-1", WorkflowStatus.RUNNING)
+        store.update_workflow_status("wf-1", WorkflowStatus.FAILED)
+
+        assert daemon.get_running_workflows() == []
+
+    def test_deleted_workflow_leaves_index(self, daemon):
+        store = daemon.state_store
+        store.create_workflow("wf-1")
+        store.update_workflow_status("wf-1", WorkflowStatus.RUNNING)
+        store.delete_workflow("wf-1")
+
+        assert daemon.get_running_workflows() == []
+
+
+class TestRebuildRunningIndex:
+    """Workflows stored before the index existed are found by a scan."""
+
+    def test_adds_only_running_workflows(self, daemon, redis_client):
         for wf, status in (
             ("wf-run", "running"),
             ("wf-done", "completed"),
-            ("wf-fail", "failed"),
             ("wf-new", "pending"),
         ):
             redis_client.set(f"workflow:{wf}", json.dumps({"status": status}))
 
+        assert daemon.state_store.rebuild_running_index() == 1
         assert daemon.get_running_workflows() == ["wf-run"]
 
     def test_ignores_sub_keys(self, daemon, redis_client):
         redis_client.set("workflow:wf-1", json.dumps({"status": "running"}))
         redis_client.sadd("workflow:wf-1:tasks", "task-a")
 
+        daemon.state_store.rebuild_running_index()
         assert daemon.get_running_workflows() == ["wf-1"]
 
     def test_skips_corrupt_entries(self, daemon, redis_client):
         redis_client.set("workflow:wf-bad", "not json")
         redis_client.set("workflow:wf-ok", json.dumps({"status": "running"}))
 
+        daemon.state_store.rebuild_running_index()
         assert daemon.get_running_workflows() == ["wf-ok"]
 
     def test_scans_past_one_page(self, daemon, redis_client):
         for i in range(250):
             redis_client.set(f"workflow:wf-{i}", json.dumps({"status": "running"}))
 
+        assert daemon.state_store.rebuild_running_index() == 250
         assert len(daemon.get_running_workflows()) == 250
+
+    def test_keeps_existing_entries(self, daemon):
+        """Additive: a workflow already indexed stays indexed."""
+        store = daemon.state_store
+        store.create_workflow("wf-1")
+        store.update_workflow_status("wf-1", WorkflowStatus.RUNNING)
+
+        store.rebuild_running_index()
+        assert daemon.get_running_workflows() == ["wf-1"]
+
+    def test_run_rebuilds_on_start(self, daemon, redis_client):
+        redis_client.set("workflow:wf-old", json.dumps({"status": "running"}))
+        daemon.running = False
+
+        daemon.run()
+        assert daemon.get_running_workflows() == ["wf-old"]
 
 
 # ----------------------------------------------------------------------

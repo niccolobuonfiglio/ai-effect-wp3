@@ -12,49 +12,73 @@ safe when several workers run at once:
   dependency completes
 * ``processing:{wf}``    leases of running tasks, so a task whose worker died is
   picked up again
+
+Moving a task from one structure to another (queue to lease, delayed or
+expired lease to queue) is one ``MULTI``/``EXEC`` transaction guarded by
+``WATCH``, so a crash between the two steps cannot lose the task. The write
+methods take an optional ``client``: the engine passes the pipeline of its own
+transaction so these writes are applied together with its state changes.
+
+A transaction's caller can add its own writes through a hook with the signature
+``hook(pipe, task_id) -> writer | None``. The hook runs before ``MULTI``, so it
+may ``WATCH`` and read through ``pipe``; the ``writer(pipe)`` it returns queues
+its writes, which are then applied atomically with the move.
 """
 
 import time
 from collections.abc import Callable
 
 from redis import Redis
+from redis.client import Pipeline
 
 DEFAULT_LEASE_SECONDS = 300.0
 
+Writer = Callable[[Pipeline], None]
+Hook = Callable[[Pipeline, str], Writer | None]
+
+
+def _decode(value):
+    return value.decode("utf-8") if isinstance(value, bytes) else value
+
 
 class RedisTaskQueue:
-    """BRPOP-based task queue for distributing tasks to workers."""
+    """Task queue for distributing tasks to workers."""
 
     def __init__(self, redis_client: Redis):
         if redis_client is None:
             raise ValueError("redis_client is required")
         self._redis = redis_client
 
-    def _queue_key(self, workflow_id: str) -> str:
+    def _client(self, client):
+        return client if client is not None else self._redis
+
+    def queue_key(self, workflow_id: str) -> str:
         return f"queue:{workflow_id}"
 
-    def _delayed_key(self, workflow_id: str) -> str:
+    def delayed_key(self, workflow_id: str) -> str:
         return f"delayed:{workflow_id}"
 
-    def _attempts_key(self, workflow_id: str) -> str:
+    def attempts_key(self, workflow_id: str) -> str:
         return f"attempts:{workflow_id}"
 
-    def _blocked_since_key(self, workflow_id: str) -> str:
+    def blocked_since_key(self, workflow_id: str) -> str:
         return f"blocked_since:{workflow_id}"
 
-    def _inputs_key(self, workflow_id: str, task_id: str) -> str:
+    def inputs_key(self, workflow_id: str, task_id: str) -> str:
         return f"inputs:{workflow_id}:{task_id}"
 
-    def _queued_key(self, workflow_id: str, task_id: str) -> str:
+    def queued_key(self, workflow_id: str, task_id: str) -> str:
         return f"queued:{workflow_id}:{task_id}"
 
-    def _processing_key(self, workflow_id: str) -> str:
+    def processing_key(self, workflow_id: str) -> str:
         return f"processing:{workflow_id}"
 
     # ------------------------------------------------------------------
     # inputs handed from one task to the next
     # ------------------------------------------------------------------
-    def add_inputs(self, workflow_id: str, task_id: str, source: str, payload: str) -> None:
+    def add_inputs(
+        self, workflow_id: str, task_id: str, source: str, payload: str, client=None
+    ) -> None:
         """Store the inputs ``source`` produced for ``task_id``.
 
         One field per producing task, so two predecessors completing at the same
@@ -66,9 +90,9 @@ class RedisTaskQueue:
             raise ValueError("task_id is required")
         if not source:
             raise ValueError("source is required")
-        self._redis.hset(self._inputs_key(workflow_id, task_id), source, payload)
+        self._client(client).hset(self.inputs_key(workflow_id, task_id), source, payload)
 
-    def inputs(self, workflow_id: str, task_id: str) -> list[str]:
+    def inputs(self, workflow_id: str, task_id: str, client=None) -> list[str]:
         """Stored inputs for a task, ordered by producer name.
 
         ``initial`` (the workflow's own inputs) sorts before any ``task_*``.
@@ -78,12 +102,8 @@ class RedisTaskQueue:
         if not task_id:
             raise ValueError("task_id is required")
 
-        stored = self._redis.hgetall(self._inputs_key(workflow_id, task_id)) or {}
-        decoded = {
-            (k.decode("utf-8") if isinstance(k, bytes) else k):
-            (v.decode("utf-8") if isinstance(v, bytes) else v)
-            for k, v in stored.items()
-        }
+        stored = self._client(client).hgetall(self.inputs_key(workflow_id, task_id)) or {}
+        decoded = {_decode(k): _decode(v) for k, v in stored.items()}
         return [decoded[name] for name in sorted(decoded)]
 
     # ------------------------------------------------------------------
@@ -100,18 +120,85 @@ class RedisTaskQueue:
         if not task_id:
             raise ValueError("task_id is required")
 
-        if not self._redis.setnx(self._queued_key(workflow_id, task_id), "1"):
-            return False
-        self.enqueue_task(workflow_id, task_id)
-        return True
+        def claim(pipe):
+            if self.is_enqueued(workflow_id, task_id, client=pipe):
+                return False
+            pipe.multi()
+            self.enqueue_once(workflow_id, task_id, client=pipe)
+            return True
 
-    def clear_enqueue_guard(self, workflow_id: str, task_id: str) -> None:
+        return self._redis.transaction(
+            claim, self.queued_key(workflow_id, task_id), value_from_callable=True
+        )
+
+    def is_enqueued(self, workflow_id: str, task_id: str, client=None) -> bool:
+        """Whether the at-most-once guard of a task has already fired."""
+        return bool(self._client(client).exists(self.queued_key(workflow_id, task_id)))
+
+    def enqueue_once(self, workflow_id: str, task_id: str, client=None) -> None:
+        """Set a task's guard and enqueue it.
+
+        For use inside a transaction that has watched the guard key and seen
+        it unset (``is_enqueued``); ``claim_enqueue`` does both.
+        """
+        r = self._client(client)
+        r.set(self.queued_key(workflow_id, task_id), "1")
+        self.enqueue_task(workflow_id, task_id, client=r)
+
+    def clear_enqueue_guard(self, workflow_id: str, task_id: str, client=None) -> None:
         """Allow the guard to fire again, e.g. when a task is retried."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
         if not task_id:
             raise ValueError("task_id is required")
-        self._redis.delete(self._queued_key(workflow_id, task_id))
+        self._client(client).delete(self.queued_key(workflow_id, task_id))
+
+    # ------------------------------------------------------------------
+    # claiming a task: dequeue and lease in one step
+    # ------------------------------------------------------------------
+    def claim(
+        self,
+        workflow_id: str,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        on_claim: Hook | None = None,
+    ) -> str | None:
+        """Take the next task off the queue and lease it, atomically.
+
+        Returns the task id, or None if the queue is empty. The task leaves the
+        queue only together with its lease, so a worker that dies at any
+        point leaves it either queued or leased - never lost. ``on_claim`` adds
+        the caller's own writes (e.g. the RUNNING status) to the same
+        transaction.
+        """
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+
+        key = self.queue_key(workflow_id)
+
+        def take(pipe):
+            head = pipe.lindex(key, -1)
+            if head is None:
+                return None
+            task_id = _decode(head)
+            write = on_claim(pipe, task_id) if on_claim is not None else None
+            pipe.multi()
+            pipe.rpop(key)
+            self.lease(workflow_id, task_id, lease_seconds, client=pipe)
+            if write is not None:
+                write(pipe)
+            return task_id
+
+        return self._redis.transaction(take, key, value_from_callable=True)
+
+    def discard(self, workflow_id: str, task_id: str) -> None:
+        """Drop every queued entry of a task, e.g. one whose state is gone."""
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+        if not task_id:
+            raise ValueError("task_id is required")
+        self._redis.lrem(self.queue_key(workflow_id), 0, task_id)
 
     # ------------------------------------------------------------------
     # leases of running tasks
@@ -122,6 +209,7 @@ class RedisTaskQueue:
         task_id: str,
         seconds: float = DEFAULT_LEASE_SECONDS,
         now: float | None = None,
+        client=None,
     ) -> float:
         """Hold (or renew) a task's lease; returns the new deadline."""
         if not workflow_id:
@@ -132,55 +220,76 @@ class RedisTaskQueue:
             raise ValueError("seconds must be positive")
 
         deadline = (time.time() if now is None else now) + seconds
-        self._redis.zadd(self._processing_key(workflow_id), {task_id: deadline})
+        self._client(client).zadd(self.processing_key(workflow_id), {task_id: deadline})
         return deadline
 
-    def release_lease(self, workflow_id: str, task_id: str) -> None:
+    def release_lease(self, workflow_id: str, task_id: str, client=None) -> None:
         """Drop a task's lease once it is no longer running."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
         if not task_id:
             raise ValueError("task_id is required")
-        self._redis.zrem(self._processing_key(workflow_id), task_id)
+        self._client(client).zrem(self.processing_key(workflow_id), task_id)
 
     def leased_tasks(self, workflow_id: str) -> list[str]:
         """Tasks currently held by a worker, earliest deadline first."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
         return [
-            t.decode("utf-8") if isinstance(t, bytes) else t
-            for t in self._redis.zrange(self._processing_key(workflow_id), 0, -1)
+            _decode(t) for t in self._redis.zrange(self.processing_key(workflow_id), 0, -1)
         ]
 
     def reclaim_expired(
         self,
         workflow_id: str,
         now: float | None = None,
-        on_reclaim: Callable[[str], None] | None = None,
+        on_reclaim: Hook | None = None,
     ) -> list[str]:
         """Re-queue tasks whose lease has expired (their worker is gone).
 
-        The worker whose ``ZREM`` removes the entry owns the reclaim, so a task
-        is re-queued once even when several workers notice it at the same time.
-        ``on_reclaim`` runs before the task is queued again.
+        Each task moves from the leases to the queue in one transaction, which
+        aborts if the lease changed meanwhile (renewed, released or reclaimed
+        by another worker), so a task is re-queued once and only if its lease
+        really expired. ``on_reclaim`` adds the caller's writes to it.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
 
         now = time.time() if now is None else now
-        key = self._processing_key(workflow_id)
-        expired = self._redis.zrangebyscore(key, "-inf", now)
+        key = self.processing_key(workflow_id)
+        return [
+            task_id
+            for task_id in map(_decode, self._redis.zrangebyscore(key, "-inf", now))
+            if self._move_to_queue(workflow_id, key, task_id, now, on_reclaim)
+        ]
 
-        reclaimed = []
-        for task_id in expired:
-            if isinstance(task_id, bytes):
-                task_id = task_id.decode("utf-8")
-            if self._redis.zrem(key, task_id):
-                if on_reclaim is not None:
-                    on_reclaim(task_id)
-                self.enqueue_task(workflow_id, task_id)
-                reclaimed.append(task_id)
-        return reclaimed
+    def _move_to_queue(
+        self,
+        workflow_id: str,
+        source_key: str,
+        task_id: str,
+        due: float | None,
+        hook: Hook | None,
+    ) -> bool:
+        """Move a task from a sorted set onto the queue; True if moved.
+
+        Only a task still in ``source_key`` (with a score no later than
+        ``due``, if given) is moved.
+        """
+
+        def move(pipe):
+            score = pipe.zscore(source_key, task_id)
+            if score is None or (due is not None and score > due):
+                return False
+            write = hook(pipe, task_id) if hook is not None else None
+            pipe.multi()
+            pipe.zrem(source_key, task_id)
+            if write is not None:
+                write(pipe)
+            self.enqueue_task(workflow_id, task_id, client=pipe)
+            return True
+
+        return self._redis.transaction(move, source_key, value_from_callable=True)
 
     def mark_blocked(self, workflow_id: str, task_id: str, now: float | None = None) -> float:
         """Record when a task was *first* blocked; returns that moment.
@@ -194,7 +303,7 @@ class RedisTaskQueue:
             raise ValueError("task_id is required")
 
         now = time.time() if now is None else now
-        key = self._blocked_since_key(workflow_id)
+        key = self.blocked_since_key(workflow_id)
         self._redis.hsetnx(key, task_id, now)
         return float(self._redis.hget(key, task_id))
 
@@ -204,31 +313,33 @@ class RedisTaskQueue:
             raise ValueError("workflow_id is required")
         if not task_id:
             raise ValueError("task_id is required")
-        return int(self._redis.hincrby(self._attempts_key(workflow_id), task_id, 1))
+        return int(self._redis.hincrby(self.attempts_key(workflow_id), task_id, 1))
 
-    def reset_attempts(self, workflow_id: str, task_id: str) -> None:
+    def reset_attempts(self, workflow_id: str, task_id: str, client=None) -> None:
         """Forget a task's deferral count and start time once it has finished."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
         if not task_id:
             raise ValueError("task_id is required")
-        self._redis.hdel(self._attempts_key(workflow_id), task_id)
-        self._redis.hdel(self._blocked_since_key(workflow_id), task_id)
+        r = self._client(client)
+        r.hdel(self.attempts_key(workflow_id), task_id)
+        r.hdel(self.blocked_since_key(workflow_id), task_id)
 
-    def enqueue_task(self, workflow_id: str, task_id: str) -> None:
+    def enqueue_task(self, workflow_id: str, task_id: str, client=None) -> None:
         """Add task to workflow queue (FIFO)."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
         if not task_id:
             raise ValueError("task_id is required")
 
-        self._redis.lpush(self._queue_key(workflow_id), task_id)
+        self._client(client).lpush(self.queue_key(workflow_id), task_id)
 
     def dequeue_task(self, workflow_id: str, timeout: int = 0) -> str | None:
-        """Remove and return next task from queue.
+        """Remove and return next task from queue, without leasing it.
 
         Blocks up to ``timeout`` seconds; ``timeout=0`` returns immediately
-        (unlike Redis BRPOP, where 0 means block forever).
+        (unlike Redis BRPOP, where 0 means block forever). Workers use
+        ``claim``, which also takes the lease.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -236,18 +347,17 @@ class RedisTaskQueue:
             raise ValueError("timeout must be non-negative")
 
         if timeout == 0:
-            task_id = self._redis.rpop(self._queue_key(workflow_id))
+            task_id = self._redis.rpop(self.queue_key(workflow_id))
         else:
-            result = self._redis.brpop(self._queue_key(workflow_id), timeout=timeout)
+            result = self._redis.brpop(self.queue_key(workflow_id), timeout=timeout)
             task_id = result[1] if result is not None else None
         if task_id is None:
             return None
+        return _decode(task_id)
 
-        if isinstance(task_id, bytes):
-            task_id = task_id.decode("utf-8")
-        return task_id
-
-    def schedule_task(self, workflow_id: str, task_id: str, delay: float) -> None:
+    def schedule_task(
+        self, workflow_id: str, task_id: str, delay: float, client=None
+    ) -> None:
         """Park a task and make it eligible for the queue after ``delay`` seconds.
 
         Rescheduling an already parked task moves its release time.
@@ -259,57 +369,60 @@ class RedisTaskQueue:
         if delay < 0:
             raise ValueError("delay must be non-negative")
 
-        self._redis.zadd(self._delayed_key(workflow_id), {task_id: time.time() + delay})
+        self._client(client).zadd(
+            self.delayed_key(workflow_id), {task_id: time.time() + delay}
+        )
 
     def release_due_tasks(
         self,
         workflow_id: str,
         now: float | None = None,
-        on_release: Callable[[str], None] | None = None,
+        on_release: Hook | None = None,
     ) -> list[str]:
         """Move parked tasks whose delay has elapsed onto the queue."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
 
         now = time.time() if now is None else now
-        due = self._redis.zrangebyscore(self._delayed_key(workflow_id), "-inf", now)
-        return self.release_tasks(workflow_id, due, on_release)
+        key = self.delayed_key(workflow_id)
+        return [
+            task_id
+            for task_id in map(_decode, self._redis.zrangebyscore(key, "-inf", now))
+            if self._move_to_queue(workflow_id, key, task_id, now, on_release)
+        ]
 
     def release_tasks(
         self,
         workflow_id: str,
         task_ids: list[str],
-        on_release: Callable[[str], None] | None = None,
+        on_release: Hook | None = None,
     ) -> list[str]:
         """Move specific parked tasks onto the queue immediately.
 
-        Only tasks this call removed from the delayed set are enqueued, so
-        concurrent callers (API and worker replicas) never enqueue a task twice.
-        ``on_release`` runs after a task is claimed but before it is enqueued,
-        so state updates cannot race with a worker picking the task up.
+        Each task leaves the delayed set and enters the queue in one
+        transaction, so concurrent callers (API and worker replicas) never
+        enqueue a task twice and a crash never drops it. ``on_release`` adds
+        the caller's writes (e.g. the PENDING status) to that transaction, so
+        they cannot race with a worker picking the task up.
         Returns the released task ids.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
 
-        released = []
-        for task_id in task_ids:
-            if isinstance(task_id, bytes):
-                task_id = task_id.decode("utf-8")
-            if self._redis.zrem(self._delayed_key(workflow_id), task_id):
-                if on_release is not None:
-                    on_release(task_id)
-                self.enqueue_task(workflow_id, task_id)
-                released.append(task_id)
-        return released
+        key = self.delayed_key(workflow_id)
+        return [
+            task_id
+            for task_id in map(_decode, task_ids)
+            if self._move_to_queue(workflow_id, key, task_id, None, on_release)
+        ]
 
-    def unschedule(self, workflow_id: str, task_id: str) -> None:
+    def unschedule(self, workflow_id: str, task_id: str, client=None) -> None:
         """Forget a pending retry, e.g. because the task reached a final state."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
         if not task_id:
             raise ValueError("task_id is required")
-        self._redis.zrem(self._delayed_key(workflow_id), task_id)
+        self._client(client).zrem(self.delayed_key(workflow_id), task_id)
 
     def delayed_tasks(self, workflow_id: str) -> list[str]:
         """Parked task ids, earliest release first."""
@@ -317,8 +430,7 @@ class RedisTaskQueue:
             raise ValueError("workflow_id is required")
 
         return [
-            t.decode("utf-8") if isinstance(t, bytes) else t
-            for t in self._redis.zrange(self._delayed_key(workflow_id), 0, -1)
+            _decode(t) for t in self._redis.zrange(self.delayed_key(workflow_id), 0, -1)
         ]
 
     def peek_queue(self, workflow_id: str, count: int = 10) -> list[str]:
@@ -329,20 +441,15 @@ class RedisTaskQueue:
             raise ValueError("count must be non-negative")
 
         # LRANGE returns from head to tail, we want FIFO order (tail first)
-        items = self._redis.lrange(self._queue_key(workflow_id), -count, -1)
-        result = []
-        for item in reversed(items):
-            if isinstance(item, bytes):
-                item = item.decode("utf-8")
-            result.append(item)
-        return result
+        items = self._redis.lrange(self.queue_key(workflow_id), -count, -1)
+        return [_decode(item) for item in reversed(items)]
 
     def queue_length(self, workflow_id: str) -> int:
         """Get number of tasks in queue."""
         if not workflow_id:
             raise ValueError("workflow_id is required")
 
-        return self._redis.llen(self._queue_key(workflow_id))
+        return self._redis.llen(self.queue_key(workflow_id))
 
     def clear_queue(self, workflow_id: str) -> None:
         """Remove all tasks from queue, including parked ones."""
@@ -350,14 +457,14 @@ class RedisTaskQueue:
             raise ValueError("workflow_id is required")
 
         keys = [
-            self._queue_key(workflow_id),
-            self._delayed_key(workflow_id),
-            self._attempts_key(workflow_id),
-            self._blocked_since_key(workflow_id),
-            self._processing_key(workflow_id),
+            self.queue_key(workflow_id),
+            self.delayed_key(workflow_id),
+            self.attempts_key(workflow_id),
+            self.blocked_since_key(workflow_id),
+            self.processing_key(workflow_id),
         ]
         keys += [
-            k.decode("utf-8") if isinstance(k, bytes) else k
+            _decode(k)
             for pattern in (f"inputs:{workflow_id}:*", f"queued:{workflow_id}:*")
             for k in self._redis.scan_iter(match=pattern, count=100)
         ]

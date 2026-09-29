@@ -35,14 +35,14 @@ class WorkerDaemon:
         self.poll_interval = poll_interval
         self.running = True
 
-        state_store = RedisStateStore(redis_client)
+        self.state_store = RedisStateStore(redis_client)
         task_queue = RedisTaskQueue(redis_client)
         # A task whose worker dies keeps its lease until this many seconds have
         # passed; another worker then re-runs it. It must comfortably exceed
         # the poll interval, since polling renews the lease.
         self.lease_seconds = float(os.environ.get("LEASE_SECONDS", "300"))
         self.engine = WorkflowEngine(
-            state_store, task_queue, redis_client, lease_seconds=self.lease_seconds
+            self.state_store, task_queue, redis_client, lease_seconds=self.lease_seconds
         )
 
         # TLS verification for https service endpoints; a CA bundle path is
@@ -93,28 +93,7 @@ class WorkerDaemon:
 
     def get_running_workflows(self) -> list[str]:
         """Get all workflows with running status."""
-        running = []
-        cursor = 0
-        while True:
-            cursor, keys = self.redis_client.scan(
-                cursor, match="workflow:*", count=100
-            )
-            for key in keys:
-                # Skip task keys and other workflow sub-keys
-                if key.count(":") > 1:
-                    continue
-                try:
-                    data = self.redis_client.get(key)
-                    if data:
-                        workflow = json.loads(data)
-                        if workflow.get("status") == "running":
-                            workflow_id = key.split(":")[1]
-                            running.append(workflow_id)
-                except (json.JSONDecodeError, IndexError):
-                    continue
-            if cursor == 0:
-                break
-        return running
+        return self.state_store.running_workflow_ids()
 
     def load_services_key(self, workflow_id: str) -> str | None:
         """Load and decrypt the services API key for a workflow."""
@@ -160,6 +139,13 @@ class WorkerDaemon:
     def run(self) -> None:
         """Main daemon loop."""
         logger.info("Worker daemon started, polling for tasks...")
+        # Workflows written before the running index existed are not in it;
+        # rebuilding is idempotent, so every replica may do it on start.
+        try:
+            found = self.state_store.rebuild_running_index()
+            logger.info(f"Running-workflow index rebuilt: {found} running")
+        except Exception as e:
+            logger.error(f"Could not rebuild running-workflow index: {e}")
 
         while self.running:
             try:

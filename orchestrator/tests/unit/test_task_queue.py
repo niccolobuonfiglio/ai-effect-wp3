@@ -256,10 +256,34 @@ class TestDelayedTasks:
         queue.schedule_task("wf-1", "task-1", delay=0)
 
         queue.release_due_tasks(
-            "wf-1", on_release=lambda t: seen.append((t, queue.queue_length("wf-1")))
+            "wf-1",
+            on_release=lambda pipe, t: seen.append((t, queue.queue_length("wf-1"))),
         )
 
         assert seen == [("task-1", 0)]
+
+    def test_on_release_writes_apply_with_the_move(self, queue, redis_client):
+        queue.schedule_task("wf-1", "task-1", delay=0)
+
+        queue.release_due_tasks(
+            "wf-1", on_release=lambda pipe, t: lambda p: p.set(f"state:{t}", "pending")
+        )
+
+        assert redis_client.get("state:task-1") == b"pending"
+        assert queue.queue_length("wf-1") == 1
+
+    def test_failing_hook_leaves_task_parked(self, queue):
+        """Nothing is moved unless the whole transaction applies."""
+        queue.schedule_task("wf-1", "task-1", delay=0)
+
+        def broken(pipe, task_id):
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            queue.release_due_tasks("wf-1", on_release=broken)
+
+        assert queue.delayed_tasks("wf-1") == ["task-1"]
+        assert queue.queue_length("wf-1") == 0
 
     def test_rescheduling_does_not_duplicate(self, queue):
         queue.schedule_task("wf-1", "task-1", delay=0)
@@ -526,8 +550,21 @@ class TestReclaimExpired:
         """The caller can reset state before the task becomes claimable."""
         seen = []
         queue.lease("wf-1", "task-1", seconds=10, now=1000.0)
-        queue.reclaim_expired("wf-1", now=2000.0, on_reclaim=seen.append)
+        queue.reclaim_expired(
+            "wf-1", now=2000.0, on_reclaim=lambda pipe, t: seen.append(t)
+        )
         assert seen == ["task-1"]
+
+    def test_renewed_lease_is_not_reclaimed(self, queue):
+        """A lease renewed after the scan (worker alive) keeps its task."""
+        queue.lease("wf-1", "task-1", seconds=10, now=1000.0)
+
+        def renew(pipe, task_id):
+            queue.lease("wf-1", task_id, seconds=10_000)
+
+        assert queue.reclaim_expired("wf-1", now=2000.0, on_reclaim=renew) == []
+        assert queue.leased_tasks("wf-1") == ["task-1"]
+        assert queue.queue_length("wf-1") == 0
 
     def test_reclaim_requires_workflow_id(self, queue):
         """Missing workflow id is rejected."""
@@ -580,3 +617,73 @@ class TestUnschedule:
             queue.unschedule("", "task-1")
         with pytest.raises(ValueError, match="task_id is required"):
             queue.unschedule("wf-1", "")
+
+
+class TestClaim:
+    """Dequeue and lease are one step."""
+
+    def test_claim_leases_the_task(self, queue):
+        queue.enqueue_task("wf-1", "task-1")
+
+        assert queue.claim("wf-1", lease_seconds=60) == "task-1"
+        assert queue.queue_length("wf-1") == 0
+        assert queue.leased_tasks("wf-1") == ["task-1"]
+
+    def test_claim_is_fifo(self, queue):
+        queue.enqueue_task("wf-1", "task-1")
+        queue.enqueue_task("wf-1", "task-2")
+
+        assert queue.claim("wf-1") == "task-1"
+        assert queue.claim("wf-1") == "task-2"
+
+    def test_claim_empty_queue_returns_none(self, queue):
+        assert queue.claim("wf-1") is None
+        assert queue.leased_tasks("wf-1") == []
+
+    def test_crash_while_claiming_leaves_task_queued(self, queue):
+        """A worker dying before EXEC neither dequeues nor leases."""
+        queue.enqueue_task("wf-1", "task-1")
+
+        def die(pipe, task_id):
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            queue.claim("wf-1", on_claim=die)
+
+        assert queue.peek_queue("wf-1") == ["task-1"]
+        assert queue.leased_tasks("wf-1") == []
+
+    def test_claim_hook_writes_apply_with_lease(self, queue, redis_client):
+        queue.enqueue_task("wf-1", "task-1")
+
+        queue.claim(
+            "wf-1", on_claim=lambda pipe, t: lambda p: p.set(f"state:{t}", "running")
+        )
+
+        assert redis_client.get("state:task-1") == b"running"
+
+    def test_concurrent_enqueue_retries_claim(self, queue, redis_client):
+        """A push between the read and EXEC restarts the claim, losing nothing."""
+        queue.enqueue_task("wf-1", "task-1")
+        pushed = []
+
+        def push_once(pipe, task_id):
+            if not pushed:
+                pushed.append(True)
+                redis_client.lpush("queue:wf-1", "task-2")
+
+        assert queue.claim("wf-1", on_claim=push_once) == "task-1"
+        assert queue.peek_queue("wf-1") == ["task-2"]
+        assert queue.leased_tasks("wf-1") == ["task-1"]
+
+    def test_discard_drops_task(self, queue):
+        queue.enqueue_task("wf-1", "task-1")
+        queue.enqueue_task("wf-1", "task-2")
+        queue.discard("wf-1", "task-1")
+        assert queue.peek_queue("wf-1") == ["task-2"]
+
+    def test_invalid_arguments(self, queue):
+        with pytest.raises(ValueError, match="workflow_id is required"):
+            queue.claim("")
+        with pytest.raises(ValueError, match="lease_seconds"):
+            queue.claim("wf-1", lease_seconds=0)
