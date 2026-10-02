@@ -95,6 +95,7 @@ class TestRouterConstruction:
 
         assert "/workflows/{workflow_id}/resume" in paths
         assert "/workflows/{workflow_id}/tasks/{task_id}/retry" in paths
+        assert "/workflows/{workflow_id}/verify" in paths
 
 
 class TestResume:
@@ -195,6 +196,9 @@ class TestAuthDependency:
     def test_resume_rejects_missing_credentials(self, secured_client):
         assert secured_client.post(f"/workflows/{WF}/resume").status_code == 401
 
+    def test_verify_rejects_missing_credentials(self, secured_client):
+        assert secured_client.get(f"/workflows/{WF}/verify").status_code == 401
+
     def test_retry_rejects_missing_credentials(self, secured_client):
         assert (
             secured_client.post(f"/workflows/{WF}/tasks/task-1/retry").status_code == 401
@@ -205,3 +209,50 @@ class TestAuthDependency:
             f"/workflows/{WF}/resume", headers={"Authorization": "Bearer s3cret"}
         )
         assert response.status_code == 200
+
+
+class TestVerify:
+    """GET /workflows/{id}/verify (docs/VERIFICATION.md)."""
+
+    def test_a_healthy_workflow_is_verified(self, client, engine):
+        engine.initialize_workflow(WF, chain_graph())
+        engine.start_workflow(WF)
+        while (task := engine.claim_task(WF)) is not None:
+            engine.complete_task(WF, task.task_id)
+
+        body = client.get(f"/workflows/{WF}/verify").json()
+
+        assert body["workflow_id"] == WF
+        assert body["status"] == "completed"
+        assert body["verified"] is True
+        assert [c["name"] for c in body["checks"]] == [
+            "status", "placement", "dependencies", "handover", "inputs",
+            "bookkeeping", "history", "cleanup",
+        ]
+        assert all(c["passed"] and c["problems"] == [] for c in body["checks"])
+        assert body["history"] == {
+            "claims": 2, "reclaims": 0, "deferrals": 0, "retries": 0, "clean": True,
+        }
+
+    def test_a_failed_workflow_can_still_be_consistent(self, client, failed_workflow):
+        body = client.get(f"/workflows/{WF}/verify").json()
+
+        assert body["status"] == "failed"
+        assert body["verified"] is True
+        assert body["history"]["clean"] is True
+
+    def test_damage_is_reported(self, client, engine, redis_client, failed_workflow):
+        engine.task_queue.enqueue_task(WF, failed_workflow[1].task_id)
+
+        body = client.get(f"/workflows/{WF}/verify").json()
+
+        assert body["verified"] is False
+        (placement,) = [c for c in body["checks"] if not c["passed"]]
+        assert placement["name"] == "placement"
+        assert "is failed but is queued 1 time(s)" in placement["problems"][0]
+
+    def test_unknown_workflow(self, client):
+        response = client.get("/workflows/wf-missing/verify")
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Workflow not found"

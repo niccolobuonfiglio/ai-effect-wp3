@@ -18,6 +18,9 @@ Statistics (see PROTOCOL.md, "Analysis"):
   overhead (nominal)  TOST equivalence on log latency, margin +/-5 %; plus the
                       attribution arm (NEW with its submission checks off,
                       PROTOCOL.md 8.4)
+  output equivalence  completed jobs whose output files equal the reference,
+                      with an exact (Clopper-Pearson) 95% CI (PROTOCOL.md,
+                      Amendment 3)
 Metrics that OLD cannot produce at all are reported as "n/s" (not supported),
 never as 0.
 """
@@ -27,7 +30,7 @@ import json
 import math
 import sys
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -175,6 +178,12 @@ def analyse_trials(trials: list[dict]) -> dict:
         down = [t.get("alerts", {}).get("SERVICE_DOWN", 0) for t in valid["new"] if "alerts" in t]
         if down:
             r["service_down_alerts_new"] = {"median": _med(down), "max": max(down)}
+        # PROTOCOL.md 10.8: alerts about workflows (NEW only), expected zero
+        if any("workflow_alerts" in t for t in valid["new"]):
+            raised = Counter()
+            for t in valid["new"]:
+                raised.update(t.get("workflow_alerts", {}))
+            r["workflow_alerts_new"] = dict(raised)
         if scenario == "nominal":
             r["tost_e2e"] = tost_log(values(valid["old"], "e2e_seconds"), values(valid["new"], "e2e_seconds"))
         result[f"{scenario}/{uc}"] = r
@@ -204,6 +213,101 @@ def analyse_overhead(trials: list[dict]) -> dict:
             "mwu_p": cost.get("mwu_p"), "cliffs_delta": cost.get("cliffs_delta"),
         },
     }
+
+
+def exact_ci(k: int, n: int) -> tuple[float, float] | None:
+    """Clopper-Pearson 95 % interval of a proportion k/n."""
+    if not n:
+        return None
+    ci = stats.binomtest(k, n).proportion_ci(confidence_level=0.95, method="exact")
+    return (float(ci.low), float(ci.high))
+
+
+# Pooled for RQ9 (PROTOCOL.md 10.4): the scenarios with a fault that a job is
+# expected to survive.
+FAULT_SCENARIOS = ("outage", "short-outage", "concurrent-outage", "worker-death")
+# Per cell: the verdicts, then (NEW only, PROTOCOL.md 10.6) how many checked
+# jobs carry the orchestrator's history, how many were not clean or had a task
+# reclaimed, and how many of those were still equivalent.
+EQUIVALENCE_COUNTS = ("jobs", "equivalent", "divergent", "missing", "with_history",
+                      "not_clean", "not_clean_equivalent", "reclaimed", "reclaimed_equivalent",
+                      "verified", "not_verified")
+
+
+def history_inconsistent(trials: list[dict]) -> list[dict]:
+    """Trials where the services executed more often than NEW handed tasks out.
+
+    PROTOCOL.md 10.6: every execution needs a claim, so the services' count
+    must not exceed the orchestrator's. Only trials whose every carrier was
+    checked are compared, so both counts cover the same workflows.
+    """
+    bad = []
+    for t in trials:
+        outputs = t.get("outputs") or []
+        if (t.get("version") != "new" or "error" in t or not outputs
+                or len(outputs) != len(t.get("carriers", []))
+                or any(o.get("history") is None for o in outputs)):
+            continue
+        claims = sum(o["history"]["claims"] for o in outputs)
+        executions = sum(t.get("executions", {}).values())
+        if executions > claims:
+            bad.append({"scenario": t["scenario"], "rep": t.get("rep"),
+                        "claims": claims, "executions": executions})
+    return bad
+
+
+def analyse_equivalence(trials: list[dict]) -> dict:
+    """RQ9 (PROTOCOL.md, Amendment 3): are completed jobs output-equivalent?
+
+    Counted per job, not per trial (a burst trial has 11 jobs). Per cell
+    (scenario, use case, version), then pooled per use case over
+    FAULT_SCENARIOS. Nominal also checks the
+    reference: a fault-free job that diverges makes the reference invalid, and
+    the result is then reported but not interpreted.
+    """
+    cells: dict[tuple, dict] = defaultdict(lambda: dict.fromkeys(EQUIVALENCE_COUNTS, 0))
+    for t in trials:
+        if t.get("warmup") or "error" in t or "outputs" not in t:
+            continue
+        if t.get("variant", "default") != "default":
+            continue
+        c = cells[(t["scenario"], t["use_case"], t["version"])]
+        for o in t["outputs"]:
+            c["jobs"] += 1
+            c[o["verdict"]] += 1
+            # PROTOCOL.md 10.7: the orchestrator's own consistency check (NEW only)
+            if o.get("verified") is not None:
+                c["verified" if o["verified"] else "not_verified"] += 1
+            # PROTOCOL.md 10.6: the orchestrator's own record (NEW only)
+            history = o.get("history")
+            if history is None:
+                continue
+            c["with_history"] += 1
+            for kind, flag in (("not_clean", not history["clean"]),
+                               ("reclaimed", history["reclaims"] > 0)):
+                if flag:
+                    c[kind] += 1
+                    c[f"{kind}_equivalent"] += o["verdict"] == "equivalent"
+
+    def summarise(c: dict) -> dict:
+        return c | {"rate": c["equivalent"] / c["jobs"] if c["jobs"] else None,
+                    "ci95": exact_ci(c["equivalent"], c["jobs"]),
+                    "silent_divergences": c["divergent"] + c["missing"]}
+
+    result: dict = {"cells": {}, "pooled_faults": {}, "reference_valid": {},
+                    "history_inconsistent": history_inconsistent(trials)}
+    pooled: dict[tuple, dict] = defaultdict(lambda: dict.fromkeys(EQUIVALENCE_COUNTS, 0))
+    for (scenario, uc, version), c in sorted(cells.items()):
+        result["cells"][f"{scenario}/{uc}/{version}"] = summarise(c)
+        if scenario == "nominal":
+            ok = result["reference_valid"].get(uc, True) and c["equivalent"] == c["jobs"]
+            result["reference_valid"][uc] = ok
+        elif scenario in FAULT_SCENARIOS:
+            for key in c:
+                pooled[(uc, version)][key] += c[key]
+    for (uc, version), c in sorted(pooled.items()):
+        result["pooled_faults"][f"{uc}/{version}"] = summarise(c)
+    return result
 
 
 # ----------------------------------------------------------------------
@@ -339,6 +443,42 @@ def write_tables(out: Path, summary: dict) -> None:
         lines[-1] = r"\bottomrule"
         lines.append(r"\end{tabular}")
         (out / "table_trials.tex").write_text("\n".join(lines) + "\n")
+
+    equivalence = summary.get("equivalence", {})
+
+    def recovered(c: dict) -> str:
+        """Jobs that needed recovery, as 'equivalent/total', from NEW's history (n/s on OLD)."""
+        if not c["with_history"]:
+            return "n/s & n/s"
+        return (f"{c['not_clean_equivalent']}/{c['not_clean']} & "
+                f"{c['reclaimed_equivalent']}/{c['reclaimed']}")
+
+    if equivalence.get("cells"):
+        lines = [
+            r"\begin{tabular}{lllrrrrlll}", r"\toprule",
+            r"Scenario & Use case & Version & Jobs & Equivalent & Divergent & Missing & 95\,\% CI"
+            r" & Not clean & Reclaimed \\",
+            r"\midrule",
+        ]
+        for name, c in equivalence["cells"].items():
+            scenario, uc, version = name.split("/")
+            ci = c["ci95"]
+            ci_text = f"[{ci[0]:.2f}, {ci[1]:.2f}]" if ci else ""
+            lines.append(
+                f"{tex_escape(scenario)} & {tex_escape(uc)} & {version.upper()} & {c['jobs']} & "
+                f"{c['equivalent']} & {c['divergent']} & {c['missing']} & {ci_text} & {recovered(c)} \\\\"
+            )
+        lines.append(r"\midrule")
+        for name, c in equivalence["pooled_faults"].items():
+            uc, version = name.split("/")
+            ci = c["ci95"]
+            ci_text = f"[{ci[0]:.2f}, {ci[1]:.2f}]" if ci else ""
+            lines.append(
+                f"all faults & {tex_escape(uc)} & {version.upper()} & {c['jobs']} & "
+                f"{c['equivalent']} & {c['divergent']} & {c['missing']} & {ci_text} & {recovered(c)} \\\\"
+            )
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        (out / "table_equivalence.tex").write_text("\n".join(lines) + "\n")
 
     overhead = summary.get("overhead", {})
     if overhead:
@@ -484,6 +624,7 @@ def main() -> int:
     summary = {
         "trials": analyse_trials(raw),
         "overhead": analyse_overhead(raw),
+        "equivalence": analyse_equivalence(raw),
         "t33": analyse_t33(run),
         "suites": analyse_suites(run),
     }

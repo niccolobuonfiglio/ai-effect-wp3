@@ -67,6 +67,7 @@ from models.state import TaskState, TaskStatus, WorkflowStatus
 from services.secrets import services_key_name
 from services.state_store import RUNNING_WORKFLOWS_KEY, RedisStateStore
 from services.task_queue import RedisTaskQueue
+from services.verifier import WorkflowVerifier
 from services.workflow_engine import (
     INITIAL_INPUTS,
     SOURCE_NODE_KEY,
@@ -121,6 +122,11 @@ class Task:
     due: bool = False  # blocked, and its retry delay has elapsed
     lease_expired: bool = False  # running, but its worker is gone
     attempts: int = 0  # deferrals since it last ended or was retried
+    # its history, which the engine keeps on the task and never resets
+    claims: int = 0
+    reclaims: int = 0
+    deferrals: int = 0
+    retries: int = 0
 
 
 def ref(name: str) -> DataReference:
@@ -137,6 +143,7 @@ class EngineMachine(RuleBasedStateMachine):
         self.store = RedisStateStore(self.redis)
         self.queue = RedisTaskQueue(self.redis)
         self.engine = WorkflowEngine(self.store, self.queue, self.redis)
+        self.verifier = WorkflowVerifier(self.engine)
         # A second worker, with its own connection, for the races.
         other = self.connect()
         self.other = WorkflowEngine(RedisStateStore(other), RedisTaskQueue(other), other)
@@ -255,9 +262,12 @@ class EngineMachine(RuleBasedStateMachine):
             expected.append(INITIAL_INPUTS)
         assert sorted(r.metadata[SOURCE_NODE_KEY] for r in claimed.input_refs) == sorted(expected)
         task.status, task.lease_expired = RUNNING, False
+        task.claims += 1
 
     def _requeued(self, task_id: str) -> None:
         task = self.tasks[task_id]
+        if task.status == RUNNING:  # only a reclaim takes a running task back
+            task.reclaims += 1
         task.status, task.due, task.lease_expired = PENDING, False, False
 
     def _finish(self, engine: WorkflowEngine, task_id: str, outcome: str, produce: bool) -> None:
@@ -279,6 +289,7 @@ class EngineMachine(RuleBasedStateMachine):
     def _retried(self, task_id: str) -> None:
         self._requeued(task_id)
         self.tasks[task_id].attempts = 0
+        self.tasks[task_id].retries += 1
         self.workflow = WorkflowStatus.RUNNING
 
     # ------------------------------------------------------------------
@@ -368,6 +379,7 @@ class EngineMachine(RuleBasedStateMachine):
             blocked = self.engine.defer_task(WF, task_id, "service down", delay)
             assert blocked.status == BLOCKED
             task.status, task.due, task.lease_expired = BLOCKED, delay == DUE_NOW, False
+            task.deferrals += 1
 
     @precondition(lambda self: self.held())
     @rule(data=st.data())
@@ -434,6 +446,33 @@ class EngineMachine(RuleBasedStateMachine):
     @rule()
     def nothing_more_can_happen(self):
         """A completed workflow offers no step; the properties still hold."""
+
+    def stalled(self) -> bool:
+        """Running, but nothing queued, parked or leased (docs/STALLS.md)."""
+        return (
+            self.workflow == WorkflowStatus.RUNNING
+            and not self.queued()
+            and not self.having(RUNNING, BLOCKED)
+        )
+
+    @precondition(lambda self: self.workflow == WorkflowStatus.RUNNING and not self.queued())
+    @rule(crash=dies_at("write_workflow"))
+    def watchdog(self, crash):
+        """A worker's idle poll: a stalled workflow is failed, nothing else changes.
+
+        Drawn only where the answer is not trivial: running, with nothing on
+        the queue. Then only leased or parked work tells a busy workflow from
+        a stalled one.
+        """
+        stalled, failed = self.stalled(), self.having(FAILED)
+        with self.transition(crash):
+            result = self.engine.fail_if_stalled(WF)
+            if not stalled:
+                assert result is None, f"not stalled, but the watchdog answered {result}"
+            else:
+                assert result == failed
+                self.workflow = WorkflowStatus.FAILED
+                event("a stalled workflow was failed")
 
     # ------------------------------------------------------------------
     # two workers at the same moment
@@ -524,6 +563,10 @@ class EngineMachine(RuleBasedStateMachine):
             assert (task_id in blocked_since) == (task.attempts > 0), where
 
             assert (state.error is not None) == (state.status in (BLOCKED, FAILED)), where
+            # The history counts each transition once, crashes and races included.
+            history = (state.claims, state.reclaims, state.deferrals, state.retries)
+            modelled = (task.claims, task.reclaims, task.deferrals, task.retries)
+            assert history == modelled, f"{where}: history {history}, the model expects {modelled}"
             if state.status == COMPLETED:
                 assert len(state.output_refs) == int(task.produced), where
 
@@ -573,14 +616,29 @@ class EngineMachine(RuleBasedStateMachine):
         assert self.snapshot() == before
 
     @invariant()
+    def the_runtime_verifier_finds_nothing_wrong(self):
+        """docs/VERIFICATION.md: no false alarm in any reachable state.
+
+        The verifier checks the same properties from Redis alone, without the
+        model, so this is also a check that it needs nothing the model knows.
+        """
+        if self.workflow is None:
+            return
+        for workflow_id in (WF, BYSTANDER):
+            problems = [
+                f"{r.name}: {p}" for r in self.verifier.verify(workflow_id) for p in r.problems
+            ]
+            assert not problems, f"{workflow_id}: {problems}"
+
+    @invariant()
     def a_running_workflow_has_something_to_wait_for(self):
         """Running means that a task is queued, parked or leased.
 
-        One exception is accepted here, because it is how the engine behaves
-        today (found by this test, docs/PROPERTY_TESTING.md section 7): after
-        two tasks failed and an operator retried only one, the workflow stays
-        running with the other task failed and nothing scheduled, until that
-        task is retried too.
+        One exception: after two tasks failed and an operator retried only
+        one, the workflow is running with nothing scheduled and the other task
+        failed (found by this test, docs/PROPERTY_TESTING.md section 7). The
+        transitions still allow it; the watchdog step then fails the workflow
+        (docs/STALLS.md), and its rule checks that it does.
         """
         if self.workflow != WorkflowStatus.RUNNING:
             return

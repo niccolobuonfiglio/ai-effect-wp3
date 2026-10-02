@@ -914,3 +914,48 @@ class TestChecksumInResponses:
 
         assert body["output_refs"][0]["checksum"] == "sha256:" + "a" * 64
         assert body["output_refs"][0]["size_bytes"] == 42
+
+
+class TestTaskHistory:
+    """Each task's history, and the workflow's totals, are part of the task list."""
+
+    def task(self, task_id, **history):
+        return create_mock_task(task_id=task_id, status=TaskStatus.COMPLETED).model_copy(
+            update=history
+        )
+
+    def test_each_task_shows_its_history(self, client, mock_engine):
+        mock_engine.get_workflow_status.return_value = create_mock_workflow()
+        mock_engine.get_all_tasks.return_value = [self.task("t1", claims=2, reclaims=1)]
+
+        body = client.get("/workflows/wf-123/tasks").json()
+
+        assert body["tasks"][0]["history"] == {
+            "claims": 2, "reclaims": 1, "deferrals": 0, "retries": 0,
+        }
+
+    def test_the_workflow_adds_them_up(self, client, mock_engine):
+        mock_engine.get_workflow_status.return_value = create_mock_workflow()
+        mock_engine.get_all_tasks.return_value = [
+            self.task("t1", claims=1),
+            self.task("t2", claims=3, deferrals=1, retries=1),
+        ]
+
+        body = client.get("/workflows/wf-123/tasks").json()
+
+        assert body["history"] == {
+            "claims": 4, "reclaims": 0, "deferrals": 1, "retries": 1, "clean": False,
+        }
+
+    def test_one_claim_per_task_is_clean(self, client, mock_engine):
+        mock_engine.get_workflow_status.return_value = create_mock_workflow()
+        mock_engine.get_all_tasks.return_value = [self.task("t1", claims=1), self.task("t2", claims=1)]
+
+        assert client.get("/workflows/wf-123/tasks").json()["history"]["clean"] is True
+
+    def test_a_single_task_shows_its_history(self, client, mock_engine):
+        mock_engine._state_store.get_task.return_value = self.task("t1", claims=1, deferrals=2)
+
+        body = client.get("/workflows/wf-123/tasks/t1").json()
+
+        assert body["history"]["deferrals"] == 2

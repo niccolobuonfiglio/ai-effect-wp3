@@ -978,3 +978,180 @@ class TestOutputIntegrity:
         self.run(worker, mock_engine, mock_client, sample_task, output)
 
         breaker.record_failure.assert_not_called()
+
+
+class TestVerificationOnCompletion:
+    """A workflow the worker completes is verified; damage raises an alert."""
+
+    @pytest.fixture
+    def engine(self):
+        import fakeredis
+
+        from services.state_store import RedisStateStore
+        from services.task_queue import RedisTaskQueue
+        from services.workflow_engine import WorkflowEngine
+
+        client = fakeredis.FakeRedis(decode_responses=True)
+        return WorkflowEngine(RedisStateStore(client), RedisTaskQueue(client), client)
+
+    @pytest.fixture
+    def make_worker(self, engine, mock_client, endpoints):
+        from services.verifier import WorkflowVerifier
+
+        def make(verify: bool = True):
+            verifier = WorkflowVerifier(engine) if verify else None
+            return Worker(engine, mock_client, endpoints, poll_interval=0.01, verifier=verifier)
+
+        return make
+
+    def finish(self, engine, workflow_id="wf-1"):
+        from tests.unit.test_workflow_engine import create_single_node_graph
+
+        engine.initialize_workflow(workflow_id, create_single_node_graph())
+        engine.start_workflow(workflow_id)
+        task = engine.claim_task(workflow_id)
+        engine.complete_task(workflow_id, task.task_id)
+        return task
+
+    def alerts(self, caplog):
+        return [r for r in caplog.records if getattr(r, "alert", None) == "WORKFLOW_VERIFICATION_FAILED"]
+
+    def test_a_consistent_workflow_raises_no_alert(self, engine, make_worker, caplog):
+        self.finish(engine)
+        with caplog.at_level("INFO"):
+            make_worker()._verify_if_completed("wf-1")
+
+        assert self.alerts(caplog) == []
+        assert any(getattr(r, "event", None) == "workflow_verified" for r in caplog.records)
+
+    def test_damage_raises_an_alert(self, engine, make_worker, caplog):
+        task = self.finish(engine)
+        engine.task_queue.lease("wf-1", task.task_id)  # a lease outliving its task
+        with caplog.at_level("INFO"):
+            make_worker()._verify_if_completed("wf-1")
+
+        (alert,) = self.alerts(caplog)
+        assert alert.workflow_id == "wf-1"
+        assert alert.failed_checks == ["placement", "cleanup"]
+        assert alert.severity == "error"
+        assert "placement:" in alert.summary
+
+    def test_a_running_workflow_is_not_verified_yet(self, engine, make_worker, caplog):
+        from tests.unit.test_workflow_engine import create_chain_graph
+
+        engine.initialize_workflow("wf-1", create_chain_graph())
+        engine.start_workflow("wf-1")
+        with caplog.at_level("INFO"):
+            make_worker()._verify_if_completed("wf-1")
+
+        assert not any(getattr(r, "event", None) == "workflow_verified" for r in caplog.records)
+
+    def test_switched_off(self, engine, make_worker, caplog):
+        task = self.finish(engine)
+        engine.task_queue.lease("wf-1", task.task_id)
+        with caplog.at_level("INFO"):
+            make_worker(verify=False)._verify_if_completed("wf-1")
+
+        assert self.alerts(caplog) == []
+
+    def test_a_verification_error_never_stops_the_worker(self, engine, make_worker, caplog):
+        self.finish(engine)
+        worker = make_worker()
+        worker._verifier.verify = lambda wf: (_ for _ in ()).throw(RuntimeError("redis gone"))
+
+        worker._verify_if_completed("wf-1")  # does not raise
+
+        assert "Could not verify workflow wf-1" in caplog.text
+
+    def test_process_task_verifies_after_the_last_task(self, engine, make_worker, mock_client, caplog):
+        from tests.unit.test_workflow_engine import create_single_node_graph
+
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        engine.start_workflow("wf-1")
+        mock_client.execute.return_value = ExecuteResponse(status="complete", task_id="svc-1")
+        with caplog.at_level("INFO"):
+            assert make_worker().process_task("wf-1") is True
+
+        assert engine.get_workflow_status("wf-1").status.value == "completed"
+        assert any(getattr(r, "event", None) == "workflow_verified" for r in caplog.records)
+
+
+class TestStallDetection:
+    """An idle poll checks the workflow for a stall; a stall raises an alert."""
+
+    @pytest.fixture
+    def engine(self):
+        import fakeredis
+
+        from services.state_store import RedisStateStore
+        from services.task_queue import RedisTaskQueue
+        from services.workflow_engine import WorkflowEngine
+
+        client = fakeredis.FakeRedis(decode_responses=True)
+        return WorkflowEngine(RedisStateStore(client), RedisTaskQueue(client), client)
+
+    @pytest.fixture
+    def worker(self, engine, mock_client, endpoints):
+        return Worker(engine, mock_client, endpoints, poll_interval=0.01, stall_detection=True)
+
+    def stalled(self, engine):
+        from tests.unit.test_workflow_engine import TestStallDetection as Engine
+
+        return Engine().stuck(engine)
+
+    def alerts(self, caplog):
+        return [r for r in caplog.records if getattr(r, "alert", None) == "WORKFLOW_STALLED"]
+
+    def test_an_idle_poll_fails_a_stalled_workflow(self, engine, worker, caplog):
+        _, b = self.stalled(engine)
+
+        assert worker.process_task("wf-1") is False
+
+        assert engine.get_workflow_status("wf-1").status.value == "failed"
+        (alert,) = self.alerts(caplog)
+        assert alert.workflow_id == "wf-1"
+        assert alert.failed_tasks == [b.task_id]
+        assert alert.marked_failed is True
+
+    def test_an_inconsistent_stall_is_reported_once(self, engine, worker, caplog):
+        from tests.unit.test_workflow_engine import create_single_node_graph
+
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        engine.start_workflow("wf-1")
+        engine.task_queue.dequeue_task("wf-1")
+
+        worker.process_task("wf-1")
+        worker.process_task("wf-1")
+
+        (alert,) = self.alerts(caplog)
+        assert alert.marked_failed is False
+        assert "inconsistent" in alert.summary
+        assert engine.get_workflow_status("wf-1").status.value == "running"
+
+    def test_a_workflow_with_work_is_left_alone(self, engine, worker, caplog):
+        from tests.unit.test_workflow_engine import create_single_node_graph
+
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        engine.start_workflow("wf-1")
+        task = engine.claim_task("wf-1")
+        engine.defer_task("wf-1", task.task_id, "service down", delay=3600)
+
+        assert worker.process_task("wf-1") is False
+        assert self.alerts(caplog) == []
+        assert engine.get_workflow_status("wf-1").status.value == "running"
+
+    def test_switched_off(self, engine, mock_client, endpoints, caplog):
+        self.stalled(engine)
+        worker = Worker(engine, mock_client, endpoints, poll_interval=0.01)
+
+        worker.process_task("wf-1")
+
+        assert self.alerts(caplog) == []
+        assert engine.get_workflow_status("wf-1").status.value == "running"
+
+    def test_an_error_in_the_check_never_stops_the_worker(self, engine, worker, caplog):
+        self.stalled(engine)
+        engine.fail_if_stalled = lambda wf: (_ for _ in ()).throw(RuntimeError("redis gone"))
+
+        assert worker.process_task("wf-1") is False
+        assert "Could not check workflow wf-1 for a stall" in caplog.text

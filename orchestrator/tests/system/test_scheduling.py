@@ -197,3 +197,37 @@ def test_retry_refuses_a_completed_task():
 
     assert response.status_code == 409
     assert "only failed tasks" in response.json()["detail"]
+
+
+def test_a_stalled_workflow_is_failed_and_can_be_resumed(workers_stopped, engine):
+    """docs/STALLS.md: running with nothing queued, parked or leased.
+
+    The pipeline is a chain, so the engine's own way into this state (two
+    failed branches, one retried) is not available here. The test puts a
+    workflow into it directly: its first task fails, then the workflow is set
+    back to running without the task being retried, as a partial retry
+    leaves it. The workers must notice on their next idle poll.
+    """
+    from models.state import WorkflowStatus
+
+    wf = submit()
+    claimed = wait_for(
+        lambda: engine.claim_task(wf, timeout=1), timeout=30, what="a task to claim"
+    )
+    engine.fail_task(wf, claimed.task_id, "simulated failure")
+    engine.state_store.update_workflow_status(wf, WorkflowStatus.RUNNING)
+    assert workflow(wf)["status"] == "running"
+
+    compose(ORCHESTRATOR_COMPOSE, "start", "worker")
+    assert wait_for(lambda: finished(wf), timeout=30, what=f"{wf} to be failed") == "failed"
+    assert "Stalled" in workflow(wf)["error"]
+    alerts = api("GET", "/orchestrator/alerts?limit=100").json()["alerts"]
+    assert any(
+        a["alert"] == "WORKFLOW_STALLED" and a.get("workflow_id") == wf and a["marked_failed"]
+        for a in alerts
+    )
+
+    # Failed is a state the operator can act on: resume finishes the job.
+    assert api("POST", f"/workflows/{wf}/resume").status_code == 200
+    assert wait_for(lambda: finished(wf), timeout=60, what=f"{wf} to finish") == "completed"
+    assert api("GET", f"/workflows/{wf}/verify").json()["verified"] is True

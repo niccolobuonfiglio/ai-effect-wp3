@@ -32,10 +32,12 @@ from tests.system.live import (
     compose,
     finished,
     require_live_stack,
+    problems,
     service_health,
     start_service,
     submit,
     tasks,
+    verification,
     wait_for,
     workflow,
 )
@@ -69,6 +71,10 @@ def test_baseline_workflow_completes():
     result = tasks(wf)
     assert set(result) == EXPECTED_TASKS
     assert all(t["status"] == "completed" for t in result.values())
+
+    report = verification(wf)
+    assert report["verified"], problems(report)
+    assert report["history"]["clean"] is True
 
 
 def test_outage_blocks_task_and_recovery_resumes_same_workflow(outage):
@@ -143,6 +149,11 @@ def test_outage_blocks_task_and_recovery_resumes_same_workflow(outage):
     assert all(t["status"] == "completed" for t in after.values())
     for key, stamp in completed_before.items():
         assert after[key]["updated_at"] == stamp, f"{key} was executed again"
+    # consistent, and its history shows the outage
+    report = verification(wf)
+    assert report["verified"], problems(report)
+    assert report["history"]["deferrals"] >= 1
+    assert report["history"]["clean"] is False
 
     recovered = service_health(SERVICE)
     assert recovered["status"] == "HEALTHY"

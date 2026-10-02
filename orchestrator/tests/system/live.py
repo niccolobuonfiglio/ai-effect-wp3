@@ -108,6 +108,15 @@ def tasks(wf: str) -> dict[str, dict]:
     return {t["node_key"]: t for t in body["tasks"]}
 
 
+def verification(wf: str) -> dict:
+    """The orchestrator's own check of a workflow's state (docs/VERIFICATION.md)."""
+    return api("GET", f"/workflows/{wf}/verify").json()
+
+
+def problems(report: dict) -> list[str]:
+    return [f"{c['name']}: {p}" for c in report["checks"] for p in c["problems"]]
+
+
 def service_health(name: str) -> dict:
     return api("GET", f"/orchestrator/health/services/{name}").json()
 

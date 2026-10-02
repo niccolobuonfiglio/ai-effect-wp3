@@ -35,13 +35,16 @@ from api.models import (
     DataReferenceResponse,
     ErrorResponse,
     HealthResponse,
+    TaskHistoryResponse,
     TaskListResponse,
     TaskStatusResponse,
+    WorkflowHistoryResponse,
     WorkflowStatusResponse,
     WorkflowSubmitRequest,
     WorkflowSubmitResponse,
 )
 from models.data_reference import DataReference
+from models.state import HISTORY_COUNTERS, TaskState, history_totals
 from services.blueprint_parser import (
     BlueprintParseError,
     BlueprintParser,
@@ -192,6 +195,22 @@ class OrchestratorAPI:
             metadata=reference.metadata,
         )
 
+    def _task_response(self, task: TaskState) -> TaskStatusResponse:
+        """Build the API view of a task, masking inline payloads."""
+        return TaskStatusResponse(
+            task_id=task.task_id,
+            node_key=task.node_key,
+            status=task.status.value,
+            created_at=task.created_at,
+            updated_at=task.updated_at,
+            error=task.error,
+            input_refs=[self._reference_response(r) for r in task.input_refs],
+            output_refs=[self._reference_response(r) for r in task.output_refs],
+            history=TaskHistoryResponse(
+                **{counter: getattr(task, counter) for counter in HISTORY_COUNTERS}
+            ),
+        )
+
     def _check_message_types(self, graph) -> list[str]:
         """Apply the type check mode; return the warnings to report.
 
@@ -336,27 +355,11 @@ class OrchestratorAPI:
 
             # Get all tasks
             tasks = self._engine.get_all_tasks(workflow_id)
-            task_responses = [
-                TaskStatusResponse(
-                    task_id=task.task_id,
-                    node_key=task.node_key,
-                    status=task.status.value,
-                    created_at=task.created_at,
-                    updated_at=task.updated_at,
-                    error=task.error,
-                    input_refs=[
-                        self._reference_response(r)
-                        for r in task.input_refs
-                    ],
-                    output_refs=[
-                        self._reference_response(r)
-                        for r in task.output_refs
-                    ],
-                )
-                for task in tasks
-            ]
-
-            return TaskListResponse(workflow_id=workflow_id, tasks=task_responses)
+            return TaskListResponse(
+                workflow_id=workflow_id,
+                tasks=[self._task_response(task) for task in tasks],
+                history=WorkflowHistoryResponse(**history_totals(tasks)),
+            )
 
         @app.get(
             "/workflows/{workflow_id}/tasks/{task_id}",
@@ -371,22 +374,7 @@ class OrchestratorAPI:
             except (WorkflowNotFoundError, TaskNotFoundError):
                 raise HTTPException(status_code=404, detail="Task not found")
 
-            return TaskStatusResponse(
-                task_id=task.task_id,
-                node_key=task.node_key,
-                status=task.status.value,
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-                error=task.error,
-                input_refs=[
-                    self._reference_response(r)
-                    for r in task.input_refs
-                ],
-                output_refs=[
-                    self._reference_response(r)
-                    for r in task.output_refs
-                ],
-            )
+            return self._task_response(task)
 
         @app.delete(
             "/workflows/{workflow_id}",

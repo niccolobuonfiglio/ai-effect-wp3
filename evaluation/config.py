@@ -58,6 +58,10 @@ class UseCase:
     recreate_before_recovery: tuple[str, ...] = field(default_factory=tuple)
     # can several workflows run at the same time?
     concurrent: bool = True
+    # Output-equivalence oracle (PROTOCOL.md, Amendment 3): file -> sha256 of
+    # the output every completed job must reproduce, under the folder the
+    # services write each workflow's files to. Empty: no oracle.
+    output_reference: dict[str, str] = field(default_factory=dict)
 
     @property
     def compose_file(self) -> Path:
@@ -65,6 +69,11 @@ class UseCase:
 
     def compose_name(self, service: str) -> str:
         return self.services[service][0]
+
+    @property
+    def data_dir(self) -> Path:
+        """Host folder mounted as the services' ``data/``."""
+        return self.folder / "data"
 
 
 USE_CASES = {
@@ -78,6 +87,14 @@ USE_CASES = {
             "report_generator1": ("report-generator", "http://localhost:18084/health"),
         },
         outage_target="data_analyzer1",
+        # Fixed on 2026-10-03, before the measurements: the 1 562 workflows on
+        # disk that produced a report (2026-09-26 to 09-30, both versions,
+        # earlier campaigns and tests) all have exactly these three files.
+        output_reference={
+            "raw_energy.csv": "sha256:3e58cf09a96f1149f136d3d090bc546da89dfb716cf57e3a1d52530b5ef2e62b",
+            "analyzed_energy.csv": "sha256:030cd7c9c3c47b0e1a8fca67ed597789d0a132df837f2e547eedd11a0ff69a21",
+            "energy_report.csv": "sha256:0f9f46392747e7dc5aa8f85797fe3c4bbf7f6315ca1791e746476cc4e519307d",
+        },
     ),
     "germany": UseCase(
         name="germany",

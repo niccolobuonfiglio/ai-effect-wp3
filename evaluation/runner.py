@@ -38,6 +38,7 @@ from pathlib import Path
 import httpx
 
 from config import API, API_KEY, USE_CASES, VERSIONS, UseCase, Version
+from oracle import EQUIVALENT, check_outputs
 
 TERMINAL = ("completed", "failed")
 EXECUTE_LINE = re.compile(r"Execute: method=(\w+), task=(\w+)")
@@ -262,6 +263,17 @@ class Stack:
             if a.get("service_name") == service and parse_ts(a["timestamp"]) >= since_epoch
         ]
 
+    def workflow_alerts_since(self, since_epoch: float) -> Counter:
+        """NEW's alerts about workflows rather than services (PROTOCOL.md 10.8)."""
+        r = api("GET", "/orchestrator/alerts?limit=1000")
+        if r.status_code != 200:
+            return Counter()
+        return Counter(
+            a["alert"]
+            for a in r.json()["alerts"]
+            if a.get("alert", "").startswith("WORKFLOW_") and parse_ts(a["timestamp"]) >= since_epoch
+        )
+
     def recover(self, service: str) -> dict:
         r = api("POST", f"/orchestrator/health/services/{service}/recover")
         r.raise_for_status()
@@ -359,6 +371,7 @@ def sc_nominal(stack: Stack, rec: dict, args) -> None:
     """No fault: one workflow, end-to-end latency (RQ6 overhead)."""
     t0 = time.monotonic()
     wf = stack.submit()
+    rec["carriers"] = [wf]
     final, _ = wait_for(lambda: stack.finished(wf), args.timeout, interval=0.05)
     rec["e2e_seconds"] = time.monotonic() - t0
     rec["makespan_seconds"] = stack.makespan(wf)
@@ -401,6 +414,7 @@ def sc_burst(stack: Stack, rec: dict, args) -> None:
     late = stack.submit()
     final, _ = wait_for(lambda: stack.finished(late), args.timeout)
     rec["late_workflow_status"] = final or "timeout"
+    rec["carriers"] = wfs + [late]
     rec["late_workflow_seconds"] = time.monotonic() - t1
 
 
@@ -426,6 +440,7 @@ def sc_outage(stack: Stack, rec: dict, args) -> None:
     rec["service_start_seconds"] = stack.start_service(target)
     rec["operator_actions"] += 1  # starting the service: same on both versions
     final_wf = operator_recover(stack, wf, target, rec, args.timeout)
+    rec["carriers"] = [final_wf]
     rec["final_status"] = stack.finished(final_wf) or "timeout"
     rec["job_completed"] = rec["final_status"] == "completed"
     rec["recovery_seconds"] = time.monotonic() - restored_at if rec["job_completed"] else None
@@ -444,6 +459,7 @@ def sc_short_outage(stack: Stack, rec: dict, args) -> None:
         60,
     )
     rec["first_status"] = stack.status(wf)
+    rec["carriers"] = [wf]
     time.sleep(args.down_extra)
     restored_at = time.monotonic()
     rec["service_start_seconds"] = stack.start_service(target)
@@ -477,6 +493,7 @@ def sc_outage_during_task(stack: Stack, rec: dict, args) -> None:
     rec["service_start_seconds"] = stack.start_service(target)
     rec["operator_actions"] += 1
     final_wf = operator_recover(stack, wf, target, rec, args.timeout)
+    rec["carriers"] = [final_wf]
     rec["final_status"] = stack.finished(final_wf) or "timeout"
     rec["job_completed"] = rec["final_status"] == "completed"
     rec["recovery_seconds"] = time.monotonic() - restored_at if rec["job_completed"] else None
@@ -490,6 +507,7 @@ def sc_request_error(stack: Stack, rec: dict, args) -> None:
     count a client-side error against the service's health.
     """
     wf = stack.submit()
+    rec["carriers"] = [wf]
     final, secs = wait_for(lambda: stack.finished(wf), args.timeout)
     rec["final_status"] = final or "timeout"
     rec["time_to_terminal"] = secs
@@ -510,6 +528,7 @@ def sc_worker_death(stack: Stack, rec: dict, args) -> None:
     stack.uc_compose("pause", svc)
     try:
         wf = stack.submit()
+        rec["carriers"] = [wf]
         running, _ = wait_for(lambda: stack.task_status(wf, target) == "running", 60)
         if not running:
             raise RuntimeError(f"{target} was never claimed")
@@ -560,12 +579,47 @@ def sc_concurrent_outage(stack: Stack, rec: dict, args) -> None:
             finals.append(wait_for(lambda w=w: stack.finished(w), args.timeout)[0])
             carriers.append(w)
     _record_failures(stack, rec, carriers)
+    rec["carriers"] = carriers
     rec["workflows"] = k
     rec["jobs"] = k
     rec["completed_workflows"] = sum(f == "completed" for f in finals)
     rec["job_completed"] = rec["completed_workflows"] == k
     rec["recovery_seconds"] = time.monotonic() - restored_at if rec["job_completed"] else None
     _alerts(stack, rec, target, t_fault)
+
+
+def check_job_outputs(stack: Stack, rec: dict) -> None:
+    """RQ9 (PROTOCOL.md, Amendment 3): did each completed job produce the reference output?
+
+    Only jobs whose carrier workflow completed are checked: a job that did not
+    complete has no output to compare. ``silent_divergences`` counts completed
+    jobs whose files differ from the reference or are missing - a success
+    that is wrong. Each check also keeps the orchestrator's own record of how
+    the job got there (``history``: claims, reclaims, deferrals, retries,
+    clean) and its own consistency check (``verified``, from
+    ``/workflows/{id}/verify``); OLD has neither, so both are None there
+    (PROTOCOL.md 10.6 and 10.7).
+    """
+    reference = stack.uc.output_reference
+    if not reference or "carriers" not in rec:
+        return
+    outputs = []
+    for wf in rec["carriers"]:
+        if stack.status(wf) != "completed":
+            continue
+        result = check_outputs(stack.uc.data_dir, wf, reference)
+        result["history"] = api("GET", f"/workflows/{wf}/tasks").json().get("history")
+        verify = api("GET", f"/workflows/{wf}/verify")
+        result["verified"] = verify.json()["verified"] if verify.status_code == 200 else None
+        if result["verified"] is False:
+            result["verification_problems"] = [
+                f"{c['name']}: {p}" for c in verify.json()["checks"] for p in c["problems"]
+            ]
+        outputs.append(result)
+    rec["outputs"] = outputs
+    rec["jobs_checked"] = len(outputs)
+    rec["jobs_equivalent"] = sum(o["verdict"] == EQUIVALENT for o in outputs)
+    rec["silent_divergences"] = len(outputs) - rec["jobs_equivalent"]
 
 
 def _record_failures(stack: Stack, rec: dict, wfs: list[str]) -> None:
@@ -621,6 +675,7 @@ def _submit_and_observe(stack: Stack, rec: dict, args) -> None:
     rec["refusal"] = None if rec["accepted"] else r.text[:300]
     if rec["accepted"]:
         wf = r.json()["workflow_id"]
+        rec["carriers"] = [wf]
         final, _ = wait_for(lambda: stack.finished(wf), args.timeout, interval=0.05)
         rec["final_status"] = final or "timeout"
         rec["job_completed"] = final == "completed"
@@ -748,10 +803,14 @@ def main() -> int:
             stack.prepare_services()
             stack.flush_state()
             since = now_iso()
+            since_epoch = time.time()
             if args.stats:
                 sampler = StatsSampler(stack.version.project)
                 sampler.start()
             fn(stack, rec, args)
+            check_job_outputs(stack, rec)
+            if stack.version.name == "new":
+                rec["workflow_alerts"] = dict(stack.workflow_alerts_since(since_epoch))
             execs = stack.executions_since(since)
             rec["executions"] = dict(execs)
             # every logical job runs each operation once; anything beyond is a re-run
@@ -771,6 +830,7 @@ def main() -> int:
             f"[{args.version} {args.scenario} {'warm' if warm else rec['rep']}] "
             f"completed={rec.get('job_completed')} status={rec.get('final_status')} "
             f"actions={rec['operator_actions']} reexec={rec.get('reexecutions')} "
+            f"{'equivalent=' + str(rec['jobs_equivalent']) + '/' + str(rec['jobs_checked']) + ' ' if 'jobs_checked' in rec else ''}"
             f"{'ERROR ' + rec['error'] if 'error' in rec else ''}",
             flush=True,
         )

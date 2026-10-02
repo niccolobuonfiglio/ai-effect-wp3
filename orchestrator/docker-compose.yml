@@ -81,6 +81,10 @@ services:
       - BLOCKED_TASK_MAX_AGE=${BLOCKED_TASK_MAX_AGE:-0}
       - TASK_MAX_RUNTIME=${TASK_MAX_RUNTIME:-3600}
       - LEASE_SECONDS=${LEASE_SECONDS:-300}
+      # Check each completed workflow's state; alert if it is inconsistent
+      - VERIFY_ON_COMPLETION=${VERIFY_ON_COMPLETION:-true}
+      # Fail a running workflow with nothing queued, parked or leased
+      - STALL_DETECTION=${STALL_DETECTION:-true}
       - ORCHESTRATOR_SECRET=${ORCHESTRATOR_SECRET:-}
       - SERVICE_SCHEME=${SERVICE_SCHEME:-http}
       - SERVICE_TLS_VERIFY=${SERVICE_TLS_VERIFY:-true}

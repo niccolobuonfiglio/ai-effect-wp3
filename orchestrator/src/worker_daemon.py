@@ -17,6 +17,7 @@ from services.privacy import DataPolicy
 from services.secrets import SecretBox, SecretDecryptionError, services_key_name
 from services.state_store import RedisStateStore
 from services.task_queue import RedisTaskQueue
+from services.verifier import WorkflowVerifier
 from services.worker import Worker
 from services.workflow_engine import WorkflowEngine
 
@@ -72,6 +73,17 @@ class WorkerDaemon:
         self.task_max_runtime = float(os.environ.get("TASK_MAX_RUNTIME", "3600"))
         self.policy = DataPolicy.from_env()
         self.secrets = SecretBox.from_env()
+        # Fail running workflows that nothing can move on (docs/STALLS.md).
+        self.stall_detection = os.environ.get(
+            "STALL_DETECTION", "true"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        # Check every workflow this worker completes (docs/VERIFICATION.md).
+        verify = os.environ.get("VERIFY_ON_COMPLETION", "true").strip().lower()
+        self.verifier = (
+            WorkflowVerifier(self.engine)
+            if verify not in ("0", "false", "no", "off")
+            else None
+        )
 
     @staticmethod
     def _tls_verify(value: str) -> bool | str:
@@ -133,6 +145,9 @@ class WorkerDaemon:
             blocked_max_age=self.blocked_max_age,
             task_max_runtime=self.task_max_runtime,
             policy=self.policy,
+            verifier=self.verifier,
+            stall_detection=self.stall_detection,
+            stall_alert_repeat=float(os.environ.get("ALERT_REPEAT_SECONDS", "900")),
         )
         return worker.process_task(workflow_id, timeout=0)
 

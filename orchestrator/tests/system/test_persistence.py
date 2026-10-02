@@ -44,7 +44,9 @@ from tests.system.live import (
     service_health,
     start_service,
     submit,
+    problems,
     tasks,
+    verification,
     wait_for,
     workflow,
 )
@@ -242,6 +244,9 @@ def test_workflow_interrupted_by_a_redis_crash_completes(client, outage):
     )
     # The circuit breaker did not forget the outage.
     assert service_health(SERVICE)["status"] == "UNHEALTHY"
+    # What came back is consistent, not only present.
+    report = verification(wf)
+    assert report["verified"], problems(report)
 
     # --- the workflow goes on ------------------------------------------------
     start_service()

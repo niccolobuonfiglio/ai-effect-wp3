@@ -4,21 +4,33 @@ Exposed as a factory returning an ``APIRouter``, like the health routes, so
 ``OrchestratorAPI`` mounts them with the same API-key dependency.
 
 A failed workflow used to be final: the only way forward was to submit it
-again, re-running everything that had already succeeded. These two routes put
-the failed tasks back on the queue instead, leaving completed tasks and their
-outputs untouched.
+again, re-running everything that had already succeeded. Two routes put the
+failed tasks back on the queue instead, leaving completed tasks and their
+outputs untouched. A third checks a workflow's state against the properties
+the engine promises (docs/VERIFICATION.md).
 
 Endpoints:
     POST /workflows/{workflow_id}/resume
     POST /workflows/{workflow_id}/tasks/{task_id}/retry
+    GET  /workflows/{workflow_id}/verify
 """
 
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from api.models import ErrorResponse, TaskRetryResponse, WorkflowResumeResponse
+from api.models import (
+    ErrorResponse,
+    TaskRetryResponse,
+    VerificationCheckResponse,
+    WorkflowHistoryResponse,
+    WorkflowResumeResponse,
+    WorkflowVerificationResponse,
+)
 from services.state_store import TaskNotFoundError, WorkflowNotFoundError
+from models.state import history_totals
+from services.verifier import WorkflowVerifier, check
 from services.workflow_engine import NotFailedError, WorkflowEngine
 
 logger = logging.getLogger(__name__)
@@ -110,6 +122,37 @@ def create_workflow_router(
             node_key=task.node_key,
             status=task.status.value,
             message="Task re-queued",
+        )
+
+    verifier = WorkflowVerifier(engine)
+
+    @router.get(
+        "/{workflow_id}/verify",
+        response_model=WorkflowVerificationResponse,
+        summary="Check the workflow's state against the engine's properties",
+        responses={404: {"model": ErrorResponse}},
+    )
+    def verify_workflow(workflow_id: str) -> WorkflowVerificationResponse:
+        """Read the workflow at one moment and check every property.
+
+        Changes nothing. ``verified`` is false if any check found a problem;
+        each check lists what it found.
+        """
+        try:
+            snapshot = verifier.snapshot(workflow_id)
+        except WorkflowNotFoundError:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        results = check(snapshot)
+        return WorkflowVerificationResponse(
+            workflow_id=workflow_id,
+            status=snapshot.workflow.status.value,
+            verified=all(r.passed for r in results),
+            checked_at=datetime.now(timezone.utc),
+            checks=[
+                VerificationCheckResponse(name=r.name, passed=r.passed, problems=r.problems)
+                for r in results
+            ],
+            history=WorkflowHistoryResponse(**history_totals(snapshot.tasks.values())),
         )
 
     return router

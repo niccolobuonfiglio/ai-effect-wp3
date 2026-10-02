@@ -2,17 +2,22 @@
 
 import logging
 import time
+from datetime import datetime, timezone
 
 from models.data_reference import DataReference
+from models.state import WorkflowStatus
 from services.backoff import backoff_delay
-from services.circuit_breaker import CircuitBreaker
+from services.circuit_breaker import ALERT_SOURCE, CircuitBreaker
 from services.control_client import ControlClient, ControlClientError
 from services.dockerinfo_parser import ServiceEndpoint
 from services.integrity import IntegrityError, verify_all
+from services.log_service import get_alerts_logger
 from services.privacy import DataPolicy, DataPolicyError
+from services.verifier import WorkflowVerifier
 from services.workflow_engine import WorkflowEngine
 
 logger = logging.getLogger(__name__)
+alerts_logger = get_alerts_logger()
 
 
 class WorkerError(Exception):
@@ -36,6 +41,9 @@ class Worker:
         blocked_retry_initial: float | None = None,
         blocked_max_age: float | None = None,
         task_max_runtime: float | None = None,
+        verifier: WorkflowVerifier | None = None,
+        stall_detection: bool = False,
+        stall_alert_repeat: float = 900.0,
     ):
         """Initialize worker with dependencies.
 
@@ -60,6 +68,15 @@ class Worker:
                 no limit. The service answered, so this does not count against
                 the circuit breaker.
             policy: Limits on the data references a service may return.
+            verifier: When set, a workflow this worker completes is checked
+                against the engine's properties, and a failed check raises a
+                WORKFLOW_VERIFICATION_FAILED alert (docs/VERIFICATION.md).
+            stall_detection: When a poll finds nothing to claim, check whether
+                the workflow is stalled - running with nothing queued, parked
+                or leased - and fail it with a WORKFLOW_STALLED alert
+                (docs/STALLS.md).
+            stall_alert_repeat: Seconds before the alert for a stall that
+                cannot be resolved is repeated.
         """
         if engine is None:
             raise ValueError("engine is required")
@@ -88,6 +105,9 @@ class Worker:
         self._blocked_max_age = blocked_max_age
         self._task_max_runtime = task_max_runtime
         self._policy = policy or DataPolicy.from_env()
+        self._verifier = verifier
+        self._stall_detection = stall_detection
+        self._stall_alert_repeat = stall_alert_repeat
 
     def process_task(self, workflow_id: str, timeout: float = 0) -> bool:
         """Process single task from queue.
@@ -104,6 +124,7 @@ class Worker:
         # Claim task from queue
         task = self._engine.claim_task(workflow_id, timeout)
         if task is None:
+            self._check_stalled(workflow_id)
             return False
 
         try:
@@ -210,6 +231,7 @@ class Worker:
 
             # Complete task with outputs
             self._engine.complete_task(workflow_id, task.task_id, output_refs)
+            self._verify_if_completed(workflow_id)
             return True
 
         except ControlClientError as e:
@@ -231,6 +253,96 @@ class Worker:
                 if timeout > 0:
                     continue
                 break
+
+    def _check_stalled(self, workflow_id: str) -> None:
+        """Fail a workflow that nothing can move on any more, and say so.
+
+        Runs only when this poll found nothing to claim, so a workflow with
+        work in it costs one ``EXISTS``. A stall held by failed tasks fails
+        the workflow (``resume`` then applies). One without failed tasks
+        means the state is damaged; it is only reported, at most once per
+        ``stall_alert_repeat`` seconds across all workers.
+        """
+        if not self._stall_detection:
+            return
+        try:
+            failed = self._engine.fail_if_stalled(workflow_id)
+        except Exception as e:
+            logger.warning("Could not check workflow %s for a stall: %s", workflow_id, e)
+            return
+        if failed is None:
+            return
+        if failed:
+            summary = (
+                f"nothing left to run while {len(failed)} task(s) failed and were "
+                f"not retried; workflow marked failed, resume it to continue"
+            )
+        else:
+            # Reported once per period by whichever worker gets there first.
+            key = f"stall_alerted:{workflow_id}"
+            if not self._engine.redis.set(key, "1", nx=True, ex=int(self._stall_alert_repeat) or None):
+                return
+            summary = (
+                "nothing queued, parked or leased and no task failed: the state "
+                "is inconsistent, see GET /workflows/{id}/verify"
+            )
+        alerts_logger.error(
+            "WORKFLOW STALLED: %s (%s)",
+            workflow_id,
+            summary,
+            extra={
+                "event": "workflow_stalled",
+                "alert": "WORKFLOW_STALLED",
+                "severity": "error",
+                "source": ALERT_SOURCE,
+                "workflow_id": workflow_id,
+                "failed_tasks": failed,
+                "marked_failed": bool(failed),
+                "summary": summary,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def _verify_if_completed(self, workflow_id: str) -> None:
+        """Check a workflow this worker just completed; alert if it fails.
+
+        The workflow is already completed when this runs, so a client sees
+        the result without waiting for it. A problem here never fails the
+        task or stops the worker: the work is done, and the alert says the
+        state that records it is not what it should be.
+        """
+        if self._verifier is None:
+            return
+        try:
+            if self._engine.get_workflow_status(workflow_id).status != WorkflowStatus.COMPLETED:
+                return
+            failed = [r for r in self._verifier.verify(workflow_id) if not r.passed]
+        except Exception as e:
+            logger.warning("Could not verify workflow %s: %s", workflow_id, e)
+            return
+        if not failed:
+            logger.info(
+                "Workflow %s completed and verified", workflow_id,
+                extra={"event": "workflow_verified", "workflow_id": workflow_id},
+            )
+            return
+        problems = [f"{r.name}: {p}" for r in failed for p in r.problems]
+        alerts_logger.error(
+            "WORKFLOW VERIFICATION FAILED: %s (%d problem(s): %s)",
+            workflow_id,
+            len(problems),
+            "; ".join(problems[:3]),
+            extra={
+                "event": "workflow_verification_failed",
+                "alert": "WORKFLOW_VERIFICATION_FAILED",
+                "severity": "error",
+                "source": ALERT_SOURCE,
+                "workflow_id": workflow_id,
+                "failed_checks": [r.name for r in failed],
+                "summary": "; ".join(problems[:3]),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     def _handle_unavailable(
         self,

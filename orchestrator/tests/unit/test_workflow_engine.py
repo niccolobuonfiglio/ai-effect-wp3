@@ -1,5 +1,6 @@
 """Unit tests for WorkflowEngine."""
 
+import json
 import threading
 import time
 
@@ -1310,3 +1311,177 @@ class TestChecksumPassThrough:
         assert received.checksum == output.checksum
         assert received.size_bytes == 1234
         assert received.uri == output.uri
+
+
+class TestTaskHistory:
+    """Each task counts how it got where it is: claims, reclaims, deferrals, retries."""
+
+    @staticmethod
+    def history(state_store, task_id):
+        task = state_store.get_task("wf-1", task_id)
+        return task.claims, task.reclaims, task.deferrals, task.retries
+
+    def start(self, engine, graph=None):
+        engine.initialize_workflow("wf-1", graph or create_single_node_graph())
+        engine.start_workflow("wf-1")
+
+    def test_a_new_task_has_an_empty_history(self, engine, state_store):
+        self.start(engine)
+        (task,) = engine.get_all_tasks("wf-1")
+        assert self.history(state_store, task.task_id) == (0, 0, 0, 0)
+
+    def test_a_clean_run_is_one_claim(self, engine, state_store):
+        self.start(engine)
+        task = engine.claim_task("wf-1")
+        assert task.claims == 1
+        engine.complete_task("wf-1", task.task_id)
+        # kept after the task ends
+        assert self.history(state_store, task.task_id) == (1, 0, 0, 0)
+
+    def test_a_deferral_and_the_claim_after_it(self, engine, state_store):
+        self.start(engine)
+        task = engine.claim_task("wf-1")
+        engine.defer_task("wf-1", task.task_id, "service down", delay=0)
+        assert self.history(state_store, task.task_id) == (1, 0, 1, 0)
+
+        engine.release_due_tasks("wf-1")
+        engine.claim_task("wf-1")
+        assert self.history(state_store, task.task_id) == (2, 0, 1, 0)
+
+    def test_a_reclaim_after_the_lease_expired(self, engine, state_store, task_queue):
+        self.start(engine)
+        task = engine.claim_task("wf-1")
+        task_queue.lease("wf-1", task.task_id, seconds=1, now=0.0)  # long expired
+
+        assert engine.release_due_tasks("wf-1") == 1
+        assert self.history(state_store, task.task_id) == (1, 1, 0, 0)
+        engine.claim_task("wf-1")
+        assert self.history(state_store, task.task_id) == (2, 1, 0, 0)
+
+    def test_a_released_retry_is_not_a_reclaim(self, engine, state_store):
+        """Only an expired lease can mean the work was done twice."""
+        self.start(engine)
+        task = engine.claim_task("wf-1")
+        engine.defer_task("wf-1", task.task_id, "service down", delay=0)
+        engine.release_due_tasks("wf-1")
+        assert state_store.get_task("wf-1", task.task_id).reclaims == 0
+
+    def test_recovering_a_service_is_not_a_retry(self, engine, state_store):
+        """Resuming a blocked task is part of its deferral, not an operator retry."""
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        engine.start_workflow("wf-1")
+        task = engine.claim_task("wf-1")
+        engine.defer_task("wf-1", task.task_id, "service down", delay=3600)
+
+        assert engine.resume_blocked_tasks("wf-1", "service-a") == 1
+        assert self.history(state_store, task.task_id) == (1, 0, 1, 0)
+
+    def test_a_retry_of_a_failed_task(self, engine, state_store):
+        self.start(engine)
+        task = engine.claim_task("wf-1")
+        engine.fail_task("wf-1", task.task_id, "boom")
+
+        assert engine.retry_task("wf-1", task.task_id).retries == 1
+        engine.claim_task("wf-1")
+        assert self.history(state_store, task.task_id) == (2, 0, 0, 1)
+
+    def test_resume_counts_a_retry_for_each_failed_task(self, engine, state_store):
+        self.start(engine, create_parallel_graph())
+        a, b = engine.claim_task("wf-1"), engine.claim_task("wf-1")
+        engine.fail_task("wf-1", a.task_id, "boom")
+        engine.fail_task("wf-1", b.task_id, "boom")
+
+        engine.resume_workflow("wf-1")
+        assert state_store.get_task("wf-1", a.task_id).retries == 1
+        assert state_store.get_task("wf-1", b.task_id).retries == 1
+
+    def test_a_document_written_before_the_history_existed(self, engine, state_store, redis_client):
+        """Tasks stored by an older orchestrator read back with an empty history."""
+        self.start(engine)
+        (task,) = engine.get_all_tasks("wf-1")
+        old = task.model_dump(mode="json")
+        for counter in ("claims", "reclaims", "deferrals", "retries"):
+            del old[counter]
+        redis_client.set(state_store.task_key("wf-1", task.task_id), json.dumps(old))
+
+        assert self.history(state_store, task.task_id) == (0, 0, 0, 0)
+        assert engine.claim_task("wf-1").claims == 1
+
+
+class TestStallDetection:
+    """A running workflow with nothing queued, parked or leased is failed."""
+
+    def stuck(self, engine):
+        """Two failed tasks, one retried and completed: running, nothing to run."""
+        engine.initialize_workflow("wf-1", create_parallel_graph())
+        engine.start_workflow("wf-1")
+        a, b = engine.claim_task("wf-1"), engine.claim_task("wf-1")
+        engine.fail_task("wf-1", a.task_id, "boom")
+        engine.fail_task("wf-1", b.task_id, "boom")
+        engine.retry_task("wf-1", a.task_id)
+        engine.complete_task("wf-1", engine.claim_task("wf-1").task_id)
+        assert engine.get_workflow_status("wf-1").status == WorkflowStatus.RUNNING
+        return a, b
+
+    def test_a_stalled_workflow_is_failed(self, engine, state_store):
+        _, b = self.stuck(engine)
+
+        assert engine.fail_if_stalled("wf-1") == [b.task_id]
+
+        workflow = engine.get_workflow_status("wf-1")
+        assert workflow.status == WorkflowStatus.FAILED
+        assert "Stalled" in workflow.error and b.task_id in workflow.error
+        assert "wf-1" not in state_store.running_workflow_ids()
+
+    def test_then_resume_finishes_it(self, engine):
+        _, b = self.stuck(engine)
+        engine.fail_if_stalled("wf-1")
+
+        assert engine.resume_workflow("wf-1") == [b.task_id]
+        engine.complete_task("wf-1", engine.claim_task("wf-1").task_id)
+        assert engine.get_workflow_status("wf-1").status == WorkflowStatus.COMPLETED
+
+    def test_a_second_check_changes_nothing(self, engine):
+        self.stuck(engine)
+        engine.fail_if_stalled("wf-1")
+        assert engine.fail_if_stalled("wf-1") is None
+
+    def test_queued_work_is_not_a_stall(self, engine):
+        engine.initialize_workflow("wf-1", create_chain_graph())
+        engine.start_workflow("wf-1")
+        assert engine.fail_if_stalled("wf-1") is None
+
+    def test_running_work_is_not_a_stall(self, engine):
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        engine.start_workflow("wf-1")
+        engine.claim_task("wf-1")
+        assert engine.fail_if_stalled("wf-1") is None
+
+    def test_parked_work_is_not_a_stall(self, engine):
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        engine.start_workflow("wf-1")
+        task = engine.claim_task("wf-1")
+        engine.defer_task("wf-1", task.task_id, "service down", delay=3600)
+        assert engine.fail_if_stalled("wf-1") is None
+        assert engine.get_workflow_status("wf-1").status == WorkflowStatus.RUNNING
+
+    def test_finished_workflows_are_not_stalled(self, engine):
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        engine.start_workflow("wf-1")
+        task = engine.claim_task("wf-1")
+        engine.fail_task("wf-1", task.task_id, "boom")
+        assert engine.fail_if_stalled("wf-1") is None
+
+        engine.initialize_workflow("wf-2", create_single_node_graph())
+        engine.start_workflow("wf-2")
+        engine.complete_task("wf-2", engine.claim_task("wf-2").task_id)
+        assert engine.fail_if_stalled("wf-2") is None
+
+    def test_a_stall_without_a_failed_task_is_reported_not_repaired(self, engine, task_queue):
+        """A lost queue entry: the state is damaged, so nothing is changed."""
+        engine.initialize_workflow("wf-1", create_single_node_graph())
+        engine.start_workflow("wf-1")
+        task_queue.dequeue_task("wf-1")  # the entry is gone, the task still pending
+
+        assert engine.fail_if_stalled("wf-1") == []
+        assert engine.get_workflow_status("wf-1").status == WorkflowStatus.RUNNING

@@ -68,6 +68,17 @@ class DataReferenceResponse(BaseModel):
     metadata: dict[str, Any] = {}
 
 
+class TaskHistoryResponse(BaseModel):
+    """How a task got where it is (docs/SCHEDULING.md section 12)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    claims: int = 0
+    reclaims: int = 0
+    deferrals: int = 0
+    retries: int = 0
+
+
 class TaskStatusResponse(BaseModel):
     """Response for task status."""
 
@@ -81,6 +92,19 @@ class TaskStatusResponse(BaseModel):
     error: str | None = None
     input_refs: list[DataReferenceResponse] = []
     output_refs: list[DataReferenceResponse] = []
+    history: TaskHistoryResponse = TaskHistoryResponse()
+
+
+class WorkflowHistoryResponse(TaskHistoryResponse):
+    """The tasks' histories added up.
+
+    ``clean`` means no task was claimed more than once, so nothing was
+    deferred, taken back from a worker or retried. ``reclaims`` counts the
+    times a service may have done a task's work twice (execution is
+    at-least-once).
+    """
+
+    clean: bool = True
 
 
 class TaskListResponse(BaseModel):
@@ -90,6 +114,7 @@ class TaskListResponse(BaseModel):
 
     workflow_id: str
     tasks: list[TaskStatusResponse]
+    history: WorkflowHistoryResponse = WorkflowHistoryResponse()
 
 
 class ErrorResponse(BaseModel):
@@ -238,6 +263,29 @@ class AlertListResponse(BaseModel):
 
     alerts: list[dict[str, Any]] = []
     total: int
+
+
+class VerificationCheckResponse(BaseModel):
+    """One property checked on a workflow (docs/VERIFICATION.md)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    passed: bool
+    problems: list[str] = []
+
+
+class WorkflowVerificationResponse(BaseModel):
+    """Whether a workflow's state in Redis has the properties the engine promises."""
+
+    model_config = ConfigDict(frozen=True)
+
+    workflow_id: str
+    status: str
+    verified: bool
+    checked_at: datetime
+    checks: list[VerificationCheckResponse]
+    history: WorkflowHistoryResponse
 
 
 class WorkflowResumeResponse(BaseModel):

@@ -232,12 +232,12 @@ async function loadSelected() {
 async function loadAlerts() {
   const data = await (await api('/orchestrator/alerts?limit=15')).json();
   if (!data.alerts.length) { $('alerts').innerHTML = '<div class="empty">No alerts.</div>'; return; }
-  const cls = { SERVICE_DOWN: 'st-failed', SERVICE_RECOVERED: 'st-completed', SERVICE_MANUAL_RECOVERY: 'st-blocked' };
+  const cls = { SERVICE_DOWN: 'st-failed', SERVICE_RECOVERED: 'st-completed', SERVICE_MANUAL_RECOVERY: 'st-blocked', WORKFLOW_VERIFICATION_FAILED: 'st-failed' };
   $('alerts').innerHTML = `<table>${data.alerts.map(a => `<tr>
     <td class="small">${time(a.timestamp)}</td>
     <td class="st ${cls[a.alert] || ''}">${esc(a.alert || '')}</td>
-    <td class="mono">${esc(a.service_name || '')}</td>
-    <td class="small">${esc(a.last_error || '')}</td></tr>`).join('')}</table>`;
+    <td class="mono">${esc(a.service_name || a.workflow_id || '')}</td>
+    <td class="small">${esc(a.last_error || a.summary || '')}</td></tr>`).join('')}</table>`;
 }
 
 // Without a valid key no panel can load: say so in every panel instead of

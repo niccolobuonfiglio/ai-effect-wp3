@@ -36,6 +36,11 @@ def _decode(value):
     return value.decode("utf-8") if isinstance(value, bytes) else value
 
 
+def _counted(task: TaskState, counter: str) -> TaskState:
+    """``task`` with one more of ``counter`` (claims, reclaims, deferrals, retries)."""
+    return task.model_copy(update={counter: getattr(task, counter) + 1})
+
+
 class NotFailedError(Exception):
     """Raised when retrying something that has not failed."""
 
@@ -62,13 +67,25 @@ class WorkflowEngine:
         self._redis = redis_client
         self._lease_seconds = lease_seconds
 
-    def _deps_key(self, workflow_id: str, task_id: str) -> str:
+    @property
+    def state_store(self) -> RedisStateStore:
+        return self._state_store
+
+    @property
+    def task_queue(self) -> RedisTaskQueue:
+        return self._task_queue
+
+    @property
+    def redis(self) -> Redis:
+        return self._redis
+
+    def deps_key(self, workflow_id: str, task_id: str) -> str:
         return f"deps:{workflow_id}:{task_id}"
 
-    def _dependents_key(self, workflow_id: str, task_id: str) -> str:
+    def dependents_key(self, workflow_id: str, task_id: str) -> str:
         return f"dependents:{workflow_id}:{task_id}"
 
-    def _graph_key(self, workflow_id: str) -> str:
+    def graph_key(self, workflow_id: str) -> str:
         return f"graph:{workflow_id}"
 
     def _task_id_from_node_key(self, node_key: str) -> str:
@@ -105,18 +122,18 @@ class WorkflowEngine:
             for node_key, graph_node in graph.all_nodes.items():
                 task_id = tasks[node_key].task_id
                 store.write_task(tasks[node_key], pipe)
-                pipe.hset(self._graph_key(workflow_id), node_key, task_id)
+                pipe.hset(self.graph_key(workflow_id), node_key, task_id)
 
                 # Track dependencies (tasks this task waits for)
                 for dep in graph_node.dependencies:
                     pipe.sadd(
-                        self._deps_key(workflow_id, task_id), tasks[dep.key].task_id
+                        self.deps_key(workflow_id, task_id), tasks[dep.key].task_id
                     )
 
                 # Track dependents (tasks waiting for this task)
                 for next_node in graph_node.next_nodes:
                     pipe.sadd(
-                        self._dependents_key(workflow_id, task_id),
+                        self.dependents_key(workflow_id, task_id),
                         tasks[next_node.key].task_id,
                     )
 
@@ -152,8 +169,8 @@ class WorkflowEngine:
             # Tasks with no dependencies
             starts = [
                 task_id
-                for task_id in map(_decode, pipe.hvals(self._graph_key(workflow_id)))
-                if pipe.scard(self._deps_key(workflow_id, task_id)) == 0
+                for task_id in map(_decode, pipe.hvals(self.graph_key(workflow_id)))
+                if pipe.scard(self.deps_key(workflow_id, task_id)) == 0
             ]
             if starts:
                 pipe.watch(*(queue.queued_key(workflow_id, t) for t in starts))
@@ -205,10 +222,13 @@ class WorkflowEngine:
                 store.task_key(workflow_id, task_id),
                 self._task_queue.inputs_key(workflow_id, task_id),
             )
-            claimed = store.with_task_status(
-                store.get_task(workflow_id, task_id, client=pipe),
-                TaskStatus.RUNNING,
-                input_refs=self._collect_inputs(workflow_id, task_id, client=pipe),
+            claimed = _counted(
+                store.with_task_status(
+                    store.get_task(workflow_id, task_id, client=pipe),
+                    TaskStatus.RUNNING,
+                    input_refs=self._collect_inputs(workflow_id, task_id, client=pipe),
+                ),
+                "claims",
             )
             return lambda p: store.write_task(claimed, p)
 
@@ -263,12 +283,12 @@ class WorkflowEngine:
             task = store.get_task(workflow_id, task_id, client=pipe)
             dependents = [
                 _decode(d)
-                for d in pipe.smembers(self._dependents_key(workflow_id, task_id))
+                for d in pipe.smembers(self.dependents_key(workflow_id, task_id))
             ]
             others = [t for t in store.task_ids(workflow_id, client=pipe) if t != task_id]
             watched = [store.task_key(workflow_id, t) for t in others]
             for dep_id in dependents:
-                watched.append(self._deps_key(workflow_id, dep_id))
+                watched.append(self.deps_key(workflow_id, dep_id))
                 watched.append(queue.queued_key(workflow_id, dep_id))
             if watched:
                 pipe.watch(*watched)
@@ -278,7 +298,7 @@ class WorkflowEngine:
             ready = [
                 dep_id
                 for dep_id in dependents
-                if {_decode(d) for d in pipe.smembers(self._deps_key(workflow_id, dep_id))}
+                if {_decode(d) for d in pipe.smembers(self.deps_key(workflow_id, dep_id))}
                 <= {task_id}
                 and not queue.is_enqueued(workflow_id, dep_id, pipe)
             ]
@@ -306,7 +326,7 @@ class WorkflowEngine:
                 # same moment cannot overwrite each other.
                 if payload is not None:
                     queue.add_inputs(workflow_id, dep_id, task_id, payload, client=pipe)
-                pipe.srem(self._deps_key(workflow_id, dep_id), task_id)
+                pipe.srem(self.deps_key(workflow_id, dep_id), task_id)
             for dep_id in ready:
                 queue.enqueue_once(workflow_id, dep_id, client=pipe)
 
@@ -321,7 +341,7 @@ class WorkflowEngine:
         return self._redis.transaction(
             complete,
             store.task_key(workflow_id, task_id),
-            self._dependents_key(workflow_id, task_id),
+            self.dependents_key(workflow_id, task_id),
             store.workflow_tasks_key(workflow_id),
             value_from_callable=True,
         )
@@ -406,10 +426,13 @@ class WorkflowEngine:
         store, queue = self._state_store, self._task_queue
 
         def defer(pipe):
-            blocked = store.with_task_status(
-                store.get_task(workflow_id, task_id, client=pipe),
-                TaskStatus.BLOCKED,
-                error=sanitize_error(reason),
+            blocked = _counted(
+                store.with_task_status(
+                    store.get_task(workflow_id, task_id, client=pipe),
+                    TaskStatus.BLOCKED,
+                    error=sanitize_error(reason),
+                ),
+                "deferrals",
             )
             pipe.multi()
             store.write_task(blocked, pipe)
@@ -455,7 +478,8 @@ class WorkflowEngine:
             workflow_id, on_release=self._back_to_pending(workflow_id)
         )
         reclaimed = self._task_queue.reclaim_expired(
-            workflow_id, on_reclaim=self._back_to_pending(workflow_id)
+            workflow_id,
+            on_reclaim=self._back_to_pending(workflow_id, counter="reclaims"),
         )
         for task_id in reclaimed:
             logger.warning(
@@ -470,8 +494,11 @@ class WorkflowEngine:
             )
         return len(released) + len(reclaimed)
 
-    def _back_to_pending(self, workflow_id: str):
-        """Queue hook that resets a task to PENDING as it is re-queued."""
+    def _back_to_pending(self, workflow_id: str, counter: str | None = None):
+        """Queue hook that resets a task to PENDING as it is re-queued.
+
+        ``counter`` names the history field to add one to, e.g. ``reclaims``.
+        """
         store = self._state_store
 
         def hook(pipe, task_id: str) -> Writer:
@@ -481,6 +508,8 @@ class WorkflowEngine:
                 TaskStatus.PENDING,
                 clear_error=True,
             )
+            if counter is not None:
+                pending = _counted(pending, counter)
             return lambda p: store.write_task(pending, p)
 
         return hook
@@ -600,10 +629,12 @@ class WorkflowEngine:
         """
         store, queue = self._state_store, self._task_queue
         task_id = task.task_id
-        deps_key = self._deps_key(workflow_id, task_id)
+        deps_key = self.deps_key(workflow_id, task_id)
         pipe.watch(deps_key)
         ready = pipe.scard(deps_key) == 0
-        pending = store.with_task_status(task, TaskStatus.PENDING, clear_error=True)
+        pending = _counted(
+            store.with_task_status(task, TaskStatus.PENDING, clear_error=True), "retries"
+        )
 
         def write(p) -> None:
             store.write_task(pending, p)
@@ -613,6 +644,72 @@ class WorkflowEngine:
                 queue.enqueue_once(workflow_id, task_id, client=p)
 
         return pending, write
+
+    def fail_if_stalled(self, workflow_id: str) -> list[str] | None:
+        """Fail a running workflow that can no longer make progress.
+
+        A workflow is stalled when it is ``running`` but nothing is queued,
+        parked or leased: no worker will ever pick anything up. Every
+        transition is atomic, so this is never a passing moment; the one way
+        the engine reaches it is an operator retrying some, but not all, of
+        several failed tasks (docs/STALLS.md). The workflow is then failed,
+        which is what its status should have said, so ``resume`` applies.
+
+        Returns None if the workflow is not stalled. Otherwise returns the
+        failed tasks that hold it; the workflow is then ``failed``. An empty
+        list means a stall with no failed task, which a consistent state
+        cannot have (``/verify`` will say what is wrong); nothing is changed.
+        """
+        if not workflow_id:
+            raise ValueError("workflow_id is required")
+
+        store, queue = self._state_store, self._task_queue
+        scheduled = (
+            queue.queue_key(workflow_id),
+            queue.delayed_key(workflow_id),
+            queue.processing_key(workflow_id),
+        )
+        # Cheap test first: a workflow with anything scheduled is not stalled.
+        if self._redis.exists(*scheduled):
+            return None
+
+        def check(pipe):
+            if pipe.exists(*scheduled):
+                return None
+            workflow = store.get_workflow(workflow_id, client=pipe)
+            if workflow.status != WorkflowStatus.RUNNING:
+                return None
+            task_ids = store.task_ids(workflow_id, client=pipe)
+            if task_ids:
+                pipe.watch(*(store.task_key(workflow_id, t) for t in task_ids))
+            tasks = [store.get_task(workflow_id, t, client=pipe) for t in task_ids]
+            if all(t.status == TaskStatus.COMPLETED for t in tasks):
+                return None
+            failed = sorted(t.task_id for t in tasks if t.status == TaskStatus.FAILED)
+            if not failed:
+                return []
+            pipe.multi()
+            store.write_workflow(
+                store.with_workflow_status(
+                    workflow,
+                    WorkflowStatus.FAILED,
+                    error=(
+                        f"Stalled: nothing left to run while task(s) "
+                        f"{', '.join(failed)} failed and were not retried; "
+                        f"resume the workflow or retry them"
+                    ),
+                ),
+                pipe,
+            )
+            return failed
+
+        return self._redis.transaction(
+            check,
+            store.workflow_key(workflow_id),
+            store.workflow_tasks_key(workflow_id),
+            *scheduled,
+            value_from_callable=True,
+        )
 
     def get_workflow_status(self, workflow_id: str) -> WorkflowState:
         """Get current workflow state."""

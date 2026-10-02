@@ -39,6 +39,8 @@ def clean_env(monkeypatch):
         "ALERT_REPEAT_SECONDS",
         "ALLOW_INLINE",
         "MAX_INLINE_BYTES",
+        "VERIFY_ON_COMPLETION",
+        "STALL_DETECTION",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -108,6 +110,21 @@ class TestConfiguration:
         assert daemon.breaker._reset_timeout == 60.0
         assert daemon.secrets.enabled is False
         assert daemon.policy.allow_inline is True
+
+    def test_detects_stalls_by_default(self, daemon):
+        assert daemon.stall_detection is True
+
+    def test_stall_detection_can_be_switched_off(self, redis_client, monkeypatch):
+        monkeypatch.setenv("STALL_DETECTION", "false")
+        assert WorkerDaemon(redis_client).stall_detection is False
+
+    def test_verifies_completed_workflows_by_default(self, daemon):
+        assert daemon.verifier is not None
+
+    @pytest.mark.parametrize("value", ["false", "0", "off"])
+    def test_verification_can_be_switched_off(self, redis_client, monkeypatch, value):
+        monkeypatch.setenv("VERIFY_ON_COMPLETION", value)
+        assert WorkerDaemon(redis_client).verifier is None
 
     def test_reads_environment(self, redis_client, monkeypatch):
         monkeypatch.setenv("BLOCKED_TASK_RETRY_DELAY", "5")
