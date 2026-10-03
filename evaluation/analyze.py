@@ -21,6 +21,14 @@ Statistics (see PROTOCOL.md, "Analysis"):
   output equivalence  completed jobs whose output files equal the reference,
                       with an exact (Clopper-Pearson) 95% CI (PROTOCOL.md,
                       Amendment 3)
+  latency dispersion  EXPLORATORY, not pre-registered: percentiles, IQR, SD and
+                      CV of nominal latency per use case, Brown-Forsythe and
+                      Fligner-Killeen tests of equal spread, ECDF figure
+  sweeps              Amendment 4 (PROTOCOL.md 11), per point of each sweep:
+                      scaling (K workflows x W workers: throughput, latency
+                      percentiles, NEW/OLD throughput ratio), inline size and
+                      data size (latency, refusals, cross-version output hashes);
+                      Mann-Whitney U and Cliff's delta per point
 Metrics that OLD cannot produce at all are reported as "n/s" (not supported),
 never as 0.
 """
@@ -38,6 +46,8 @@ from scipy import stats
 
 RNG = np.random.default_rng(20260925)
 MARGIN = 0.05  # equivalence margin for overhead
+# Amendment 4 (PROTOCOL.md 11): analysed per point of their sweep, never pooled
+SWEEP_SCENARIOS = ("scale", "inline-size", "data-size")
 VERSIONS = ("old", "new")
 # Reference palette slots 1 and 2 (validated adjacent pair); OLD also hatched,
 # so the two versions stay distinguishable in greyscale print.
@@ -144,8 +154,10 @@ def analyse_trials(trials: list[dict]) -> dict:
     groups: dict[tuple, dict[str, list]] = defaultdict(lambda: {"old": [], "new": []})
     for t in trials:
         # Only the shipped configuration of each version is compared here; the
-        # checks-off arm is analysed separately (analyse_overhead).
-        if not t.get("warmup") and t.get("variant", "default") == "default":
+        # checks-off arm is analysed separately (analyse_overhead), and so are
+        # the sweeps, whose points must not be pooled (analyse_sweeps).
+        if (not t.get("warmup") and t.get("variant", "default") == "default"
+                and t["scenario"] not in SWEEP_SCENARIOS):
             groups[(t["scenario"], t["use_case"])][t["version"]].append(t)
 
     result = {}
@@ -191,10 +203,14 @@ def analyse_trials(trials: list[dict]) -> dict:
 
 
 def analyse_overhead(trials: list[dict]) -> dict:
-    """RQ6 with attribution (PROTOCOL.md 8.4): what do NEW's submission checks cost?"""
+    """RQ6 with attribution (PROTOCOL.md 8.4): what do NEW's submission checks cost?
+
+    File-based only: the checks-off arm exists only there, and latencies of
+    different use cases are never pooled (PROTOCOL.md 9.4)."""
     def e2e(version, variant):
         return [t["e2e_seconds"] for t in trials
-                if t["scenario"] == "nominal" and not t.get("warmup") and "error" not in t
+                if t["scenario"] == "nominal" and t.get("use_case", "file_based") == "file_based"
+                and not t.get("warmup") and "error" not in t
                 and t["version"] == version and t.get("variant", "default") == variant
                 and t.get("e2e_seconds") is not None]
 
@@ -213,6 +229,149 @@ def analyse_overhead(trials: list[dict]) -> dict:
             "mwu_p": cost.get("mwu_p"), "cliffs_delta": cost.get("cliffs_delta"),
         },
     }
+
+
+def nominal_latencies(trials: list[dict]) -> dict[tuple, list[float]]:
+    """(use case, version, variant) -> end-to-end latencies of the nominal trials."""
+    out: dict[tuple, list[float]] = defaultdict(list)
+    for t in trials:
+        if (t["scenario"] == "nominal" and not t.get("warmup") and "error" not in t
+                and t.get("e2e_seconds") is not None):
+            out[(t.get("use_case", "file_based"), t["version"], t.get("variant", "default"))].append(t["e2e_seconds"])
+    return out
+
+
+def describe_spread(x) -> dict:
+    x = np.asarray(x)
+    p = np.percentile(x, [0, 5, 25, 50, 75, 95, 100])
+    sd = float(x.std(ddof=1)) if len(x) > 1 else float("nan")
+    return {
+        "n": len(x), "min": float(p[0]), "p5": float(p[1]), "q1": float(p[2]), "median": float(p[3]),
+        "q3": float(p[4]), "p95": float(p[5]), "max": float(p[6]), "iqr": float(p[4] - p[2]),
+        "sd": sd, "cv": sd / float(x.mean()),
+    }
+
+
+def analyse_dispersion(trials: list[dict]) -> dict:
+    """Exploratory, not pre-registered: is nominal latency equally spread on OLD and NEW?
+
+    Per use case, never pooled. Brown-Forsythe (Levene centred on the median)
+    and Fligner-Killeen both test equal spread and are robust to non-normal
+    data; Fligner is the more robust to outliers. The checks-off arm is
+    described but not tested.
+    """
+    lat = nominal_latencies(trials)
+    result = {}
+    for uc in sorted({k[0] for k in lat}):
+        order = lambda k: (VERSIONS.index(k[1]), k[2] != "default", k[2])  # OLD, NEW, NEW variants
+        cells = {f"{v}/{var}": describe_spread(lat[(u, v, var)])
+                 for (u, v, var) in sorted(lat, key=order) if u == uc and len(lat[(u, v, var)]) > 1}
+        old, new = lat.get((uc, "old", "default"), []), lat.get((uc, "new", "default"), [])
+        r = {"cells": cells}
+        if len(old) > 1 and len(new) > 1:
+            r["brown_forsythe_p"] = float(stats.levene(old, new, center="median").pvalue)
+            r["fligner_p"] = float(stats.fligner(old, new).pvalue)
+        result[uc] = r
+    return result
+
+
+def _history_totals(trials: list[dict]) -> dict | None:
+    """NEW's own record over every checked job of these trials (None on OLD)."""
+    outputs = [o for t in trials for o in t.get("outputs") or [] if o.get("history")]
+    if not outputs:
+        return None
+    total = Counter()
+    for o in outputs:
+        h = o["history"]
+        total.update({"jobs": 1, "not_clean": not h["clean"], "claims": h["claims"],
+                      "reclaims": h["reclaims"], "deferrals": h["deferrals"], "retries": h["retries"]})
+    return dict(total)
+
+
+def _equivalence_counts(trials: list[dict]) -> dict:
+    verdicts = Counter(o["verdict"] for t in trials for o in t.get("outputs") or [])
+    return {"jobs": sum(verdicts.values()), "equivalent": verdicts["equivalent"]}
+
+
+def analyse_sweeps(trials: list[dict]) -> dict:
+    """Amendment 4 (PROTOCOL.md 11): each point of each sweep on its own.
+
+    A point is (scenario, swept values); OLD and NEW are compared within a
+    point with the tests of PROTOCOL.md 5. Errors are counted, never dropped.
+    """
+    points: dict[tuple, dict[str, list]] = defaultdict(lambda: {"old": [], "new": []})
+    for t in trials:
+        if t["scenario"] in SWEEP_SCENARIOS and not t.get("warmup"):
+            if t["scenario"] == "scale":
+                key = (t["scenario"], t.get("workers_requested"), t.get("workflows"))
+            elif t["scenario"] == "inline-size":
+                key = (t["scenario"], t.get("inline_bytes"))
+            else:
+                key = (t["scenario"], t.get("records"))
+            points[key][t["version"]].append(t)
+
+    result: dict = {"scale": {}, "inline-size": {}, "data-size": {}}
+    for key, by in sorted(points.items(), key=lambda kv: tuple(x if x is not None else -1 for x in kv[0])):
+        scenario = key[0]
+        valid = {v: [t for t in by[v] if "error" not in t] for v in VERSIONS}
+        r: dict = {"errors": {v: sum("error" in t for t in by[v]) for v in VERSIONS},
+                   "n": {v: len(valid[v]) for v in VERSIONS}}
+
+        if scenario == "scale":
+            name = f"W={key[1]}/K={key[2]}"
+            for v in VERSIONS:
+                ts = valid[v]
+                r[v] = {
+                    "trials_all_completed": sum(bool(t.get("job_completed")) for t in ts),
+                    "workflows_completed": sum(t.get("completed_workflows", 0) for t in ts),
+                    "workflows": sum(t.get("workflows", 0) for t in ts),
+                    "throughput_median": _med(values(ts, "throughput_wf_per_min")),
+                    "throughput_iqr": _iqr(values(ts, "throughput_wf_per_min")),
+                    # per trial, then the median over trials
+                    "latency_p50_median": _med([float(np.percentile(t["latencies"], 50)) for t in ts if t.get("latencies")]),
+                    "latency_p95_median": _med([float(np.percentile(t["latencies"], 95)) for t in ts if t.get("latencies")]),
+                    "submit_seconds_median": _med(values(ts, "submit_seconds")),
+                    "reexecutions": sum(t.get("reexecutions") or 0 for t in ts),
+                    "equivalence": _equivalence_counts(ts),
+                    "history": _history_totals(ts),
+                }
+            o, n = values(valid["old"], "throughput_wf_per_min"), values(valid["new"], "throughput_wf_per_min")
+            if o and n:
+                r["throughput"] = compare_continuous(o, n)
+                r["throughput_ratio_new_over_old"] = _med(n) / _med(o)
+
+        else:
+            name = str(key[1])
+            for v in VERSIONS:
+                ts = valid[v]
+                r[v] = {
+                    "accepted": sum(bool(t.get("accepted")) for t in ts),
+                    "refused": sum(bool(t.get("refused")) for t in ts),
+                    "completed": sum(bool(t.get("job_completed")) for t in ts),
+                    "e2e_median": _med(values(ts, "e2e_seconds")),
+                    "e2e_iqr": _iqr(values(ts, "e2e_seconds")),
+                    "makespan_median": _med(values(ts, "makespan_seconds")),
+                    "submit_seconds_median": _med(values(ts, "submit_seconds")),
+                }
+                if scenario == "inline-size":
+                    r[v]["equivalence"] = _equivalence_counts(ts)
+                else:
+                    sizes = [t["output_bytes"].get("raw_energy.csv") for t in ts if t.get("output_bytes")]
+                    r[v]["raw_bytes"] = sizes[0] if sizes else None
+            o, n = values(valid["old"], "e2e_seconds"), values(valid["new"], "e2e_seconds")
+            if o and n:
+                r["e2e"] = compare_continuous(o, n)
+                r["e2e_ratio_new_over_old"] = _med(n) / _med(o)
+            if scenario == "data-size":
+                # Every completed job of a point, on both versions, must have
+                # produced the same files: one distinct set of hashes.
+                hashes = {json.dumps(t["output_hashes"], sort_keys=True)
+                          for v in VERSIONS for t in valid[v] if t.get("output_hashes")}
+                r["distinct_outputs"] = len(hashes)
+                r["outputs_consistent"] = len(hashes) == 1
+
+        result[scenario][name] = r
+    return {k: v for k, v in result.items() if v}
 
 
 def exact_ci(k: int, n: int) -> tuple[float, float] | None:
@@ -497,6 +656,88 @@ def write_tables(out: Path, summary: dict) -> None:
         ]
         (out / "table_overhead.tex").write_text("\n".join(lines) + "\n")
 
+    dispersion = summary.get("dispersion", {})
+    if dispersion:
+        lines = [
+            r"\begin{tabular}{llrrrrrrrrrr}", r"\toprule",
+            r"Use case & Version & $n$ & min & P5 & median & P95 & max & IQR & SD & CV"
+            r" & $p_{\mathrm{BF}}$ / $p_{\mathrm{FK}}$ \\",
+            r"\midrule",
+        ]
+        for uc, r in dispersion.items():
+            test = f"{fmt_p(r.get('brown_forsythe_p'))} / {fmt_p(r.get('fligner_p'))}"
+            for i, (cell, d) in enumerate(r["cells"].items()):
+                version, variant = cell.split("/")
+                label = version.upper() + (f" ({variant})" if variant != "default" else "")
+                lines.append(
+                    f"{tex_escape(uc) if i == 0 else ''} & {label} & {d['n']} & {fmt(d['min'], 3)} & "
+                    f"{fmt(d['p5'], 3)} & {fmt(d['median'], 3)} & {fmt(d['p95'], 3)} & {fmt(d['max'], 3)} & "
+                    f"{fmt(d['iqr'], 3)} & {fmt(d['sd'], 3)} & {fmt(d['cv'], 3)} & {test if i == 0 else ''} \\\\"
+                )
+            lines.append(r"\midrule")
+        lines[-1] = r"\bottomrule"
+        lines.append(r"\end{tabular}")
+        (out / "table_dispersion.tex").write_text("\n".join(lines) + "\n")
+
+    sweeps = summary.get("sweeps", {})
+    if sweeps.get("scale"):
+        lines = [
+            r"\begin{tabular}{rrllrrrrrrl}", r"\toprule",
+            r"$W$ & $K$ & & completed & thr. [wf/min] & lat. P50 [s] & lat. P95 [s] & submit [s]"
+            r" & re-exec. & equivalent & NEW/OLD thr. ($\delta$) \\",
+            r"\midrule",
+        ]
+        for name, r in sweeps["scale"].items():
+            w, k = (part.split("=")[1] for part in name.split("/"))
+            for i, v in enumerate(VERSIONS):
+                d = r[v]
+                eq = d["equivalence"]
+                ratio = ""
+                if i == 0 and "throughput" in r:
+                    ratio = f"{fmt(r['throughput_ratio_new_over_old'], 2)} ({fmt(r['throughput'].get('cliffs_delta'), 2)})"
+                lines.append(
+                    f"{w if i == 0 else ''} & {k if i == 0 else ''} & {v.upper()} & "
+                    f"{d['workflows_completed']}/{d['workflows']} & {fmt(d['throughput_median'], 0)} & "
+                    f"{fmt(d['latency_p50_median'], 2)} & {fmt(d['latency_p95_median'], 2)} & "
+                    f"{fmt(d['submit_seconds_median'], 2)} & {d['reexecutions']} & "
+                    f"{eq['equivalent']}/{eq['jobs']} & {ratio} \\\\"
+                )
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        (out / "table_scaling.tex").write_text("\n".join(lines) + "\n")
+
+    for scenario, fname, label in (("inline-size", "table_inline_size.tex", "inline bytes"),
+                                   ("data-size", "table_data_size.tex", "records")):
+        if not sweeps.get(scenario):
+            continue
+        extra = "equivalent" if scenario == "inline-size" else "raw file [B]"
+        lines = [
+            r"\begin{tabular}{rlrrrrrl}", r"\toprule",
+            f"{label} & & accepted & completed & latency [s] & makespan [s] & {extra} & NEW/OLD lat. ($\\delta$) \\\\",
+            r"\midrule",
+        ]
+        for name, r in sweeps[scenario].items():
+            for i, v in enumerate(VERSIONS):
+                d = r[v]
+                if scenario == "inline-size":
+                    eq = d["equivalence"]
+                    col = f"{eq['equivalent']}/{eq['jobs']}"
+                else:
+                    col = fmt(d.get("raw_bytes"))
+                ratio = ""
+                if i == 0 and "e2e" in r:
+                    ratio = f"{fmt(r['e2e_ratio_new_over_old'], 2)} ({fmt(r['e2e'].get('cliffs_delta'), 2)})"
+                lines.append(
+                    f"{name if i == 0 else ''} & {v.upper()} & {d['accepted']}/{r['n'][v]} & "
+                    f"{d['completed']}/{r['n'][v]} & {fmt(d['e2e_median'], 2)} & {fmt(d['makespan_median'], 2)} & "
+                    f"{col} & {ratio} \\\\"
+                )
+            if scenario == "data-size":
+                lines.append(f"\\multicolumn{{8}}{{l}}{{\\quad output files identical across trials and versions: "
+                             f"{'yes' if r.get('outputs_consistent') else 'NO'} "
+                             f"({r.get('distinct_outputs')} distinct)}} \\\\")
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        (out / fname).write_text("\n".join(lines) + "\n")
+
     suites_d = summary.get("suites", {})
     old_cases = suites_d.get("diff-on-old", {}).get("cases", {})
     new_cases = suites_d.get("diff-on-new", {}).get("cases", {})
@@ -553,9 +794,12 @@ def write_figures(out: Path, trials: list[dict]) -> None:
 
     by = defaultdict(lambda: {"old": [], "new": []})
     for t in trials:
-        if not t.get("warmup") and "error" not in t:
+        if not t.get("warmup") and "error" not in t and t["scenario"] not in SWEEP_SCENARIOS:
             by[f"{t['scenario']}\n{t['use_case']}"][t["version"]].append(t)
     names = sorted(by)
+    if not names:  # a run with only the Amendment 4 sweeps
+        write_sweep_figures(out, trials, plt)
+        return
 
     # 1. completion rate per scenario (magnitude -> bars, shared zero baseline)
     fig, ax = plt.subplots(figsize=(6.3, 2.6))
@@ -610,6 +854,117 @@ def write_figures(out: Path, trials: list[dict]) -> None:
         fig.savefig(out / fname)
         plt.close(fig)
 
+    # 3. exploratory: ECDF of nominal latency per use case (each its own x axis,
+    # since the use cases' latencies differ by an order of magnitude)
+    lat = nominal_latencies(trials)
+    ucs = sorted({k[0] for k in lat})
+    if ucs:
+        fig, axes = plt.subplots(1, len(ucs), figsize=(6.3, 2.3), squeeze=False)
+        for ax, uc in zip(axes[0], ucs):
+            for v in VERSIONS:
+                x = np.sort(lat.get((uc, v, "default"), []))
+                if len(x):
+                    ax.step(x, np.arange(1, len(x) + 1) / len(x), where="post", color=COLOR[v],
+                            linewidth=1.5, linestyle="--" if v == "old" else "-", label=v.upper())
+            ax.set_title(uc, fontsize=8)
+            ax.set_xlabel("latency, no fault [s]", fontsize=7)
+            ax.set_ylim(0, 1.02)
+        axes[0][0].set_ylabel("fraction of trials")
+        axes[0][0].legend(loc="upper left", fontsize=7)
+        fig.tight_layout()
+        fig.savefig(out / "fig_latency_ecdf.pdf")
+        plt.close(fig)
+
+    write_sweep_figures(out, trials, plt)
+
+
+def _sweep_series(ax, xs_by_version: dict, x_of, y_of, log_x=True):
+    """Every trial as a point, the median per x as a line (OLD dashed)."""
+    for v in VERSIONS:
+        pts = [(x_of(t), y_of(t)) for t in xs_by_version.get(v, []) if y_of(t) is not None]
+        if not pts:
+            continue
+        xs = sorted({x for x, _ in pts})
+        med = [float(np.median([y for x2, y in pts if x2 == x])) for x in xs]
+        shift = 0.94 if v == "old" else 1.06  # side by side on a log axis
+        ax.scatter([x * shift if log_x else x for x, _ in pts], [y for _, y in pts], s=10,
+                   color=COLOR[v], alpha=0.55, marker="D" if v == "old" else "o", linewidths=0, zorder=3)
+        ax.plot(xs, med, color=COLOR[v], linewidth=1.5, linestyle="--" if v == "old" else "-",
+                label=v.upper(), zorder=2)
+    if log_x:
+        ax.set_xscale("log")
+
+
+def write_sweep_figures(out: Path, trials: list[dict], plt) -> None:
+    """Amendment 4 (PROTOCOL.md 11): one curve per version along each sweep."""
+    import matplotlib.ticker  # noqa: F401  (matplotlib is imported by write_figures)
+    import matplotlib
+    sweep = defaultdict(lambda: {"old": [], "new": []})
+    for t in trials:
+        if t["scenario"] in SWEEP_SCENARIOS and not t.get("warmup") and "error" not in t:
+            group = (t["scenario"], t.get("workers_requested")) if t["scenario"] == "scale" else (t["scenario"],)
+            sweep[group][t["version"]].append(t)
+
+    workers = sorted(g[1] for g in sweep if g[0] == "scale" and g[1] is not None)
+    if workers:
+        fig, axes = plt.subplots(2, len(workers), figsize=(6.3, 4.2), squeeze=False, sharex=True)
+        for col, w in enumerate(workers):
+            by = sweep[("scale", w)]
+            _sweep_series(axes[0][col], by, lambda t: t["workflows"], lambda t: t.get("throughput_wf_per_min"))
+            _sweep_series(axes[1][col], by, lambda t: t["workflows"],
+                          lambda t: float(np.percentile(t["latencies"], 95)) if t.get("latencies") else None)
+            axes[0][col].set_title(f"{w} worker{'s' if w != 1 else ''}", fontsize=8)
+            axes[1][col].set_xlabel("workflows submitted at once", fontsize=7)
+            axes[0][col].set_ylim(bottom=0)
+            axes[1][col].set_ylim(bottom=0)
+        axes[0][0].set_ylabel("throughput [wf/min]")
+        axes[1][0].set_ylabel("workflow latency P95 [s]")
+        axes[0][0].legend(loc="upper left", fontsize=7)
+        fig.tight_layout()
+        fig.savefig(out / "fig_scaling.pdf")
+        plt.close(fig)
+
+    inline, data = sweep.get(("inline-size",)), sweep.get(("data-size",))
+    if inline or data:
+        fig, axes = plt.subplots(1, 2, figsize=(6.3, 2.5), squeeze=False)
+        if inline:
+            ax = axes[0][0]
+            sizes = sorted({t["inline_bytes"] for v in VERSIONS for t in inline[v]})
+            pos = {s: i for i, s in enumerate(sizes)}  # categorical: 0 means no input
+            _sweep_series(ax, inline, lambda t: pos[t["inline_bytes"]], lambda t: t.get("e2e_seconds"), log_x=False)
+            for v in VERSIONS:  # a refused submission has no latency: a cross on the axis
+                refused = sorted({pos[t["inline_bytes"]] for t in inline[v] if t.get("refused")})
+                if refused:
+                    ax.scatter(refused, [0] * len(refused), marker="x", s=28, color=COLOR[v],
+                               clip_on=False, zorder=4, label=f"{v.upper()} refused")
+            ax.set_xticks(range(len(sizes)), [_bytes_label(s) for s in sizes], fontsize=6, rotation=30)
+            ax.set_xlabel("inline input [decoded bytes]", fontsize=7)
+            ax.set_ylabel("end-to-end latency [s]")
+            ax.set_ylim(bottom=0)
+            ax.legend(loc="upper left", fontsize=7)
+        if data:
+            ax = axes[0][1]
+            _sweep_series(ax, data, lambda t: t["records"], lambda t: t.get("e2e_seconds"))
+            ax.set_yscale("log")
+            ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(subs=(1, 2, 5)))
+            ax.yaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("%g"))
+            ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+            ax.set_xlabel("records generated", fontsize=7)
+            ax.set_ylabel("end-to-end latency [s]")
+        fig.tight_layout()
+        fig.savefig(out / "fig_size.pdf")
+        plt.close(fig)
+
+
+def _bytes_label(n: int) -> str:
+    if n == 0:
+        return "none"
+    for unit, size in (("MiB", 2**20), ("KiB", 2**10)):
+        if n >= size:
+            whole, rest = divmod(n, size)
+            return f"{whole} {unit}" + (f"+{rest}" if rest else "")
+    return f"{n} B"
+
 
 # ----------------------------------------------------------------------
 def main() -> int:
@@ -624,6 +979,8 @@ def main() -> int:
     summary = {
         "trials": analyse_trials(raw),
         "overhead": analyse_overhead(raw),
+        "dispersion": analyse_dispersion(raw),
+        "sweeps": analyse_sweeps(raw),
         "equivalence": analyse_equivalence(raw),
         "t33": analyse_t33(run),
         "suites": analyse_suites(run),

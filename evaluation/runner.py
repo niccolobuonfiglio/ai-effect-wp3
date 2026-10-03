@@ -38,7 +38,7 @@ from pathlib import Path
 import httpx
 
 from config import API, API_KEY, USE_CASES, VERSIONS, UseCase, Version
-from oracle import EQUIVALENT, check_outputs
+from oracle import EQUIVALENT, check_outputs, sha256_file, workflow_dir
 
 TERMINAL = ("completed", "failed")
 EXECUTE_LINE = re.compile(r"Execute: method=(\w+), task=(\w+)")
@@ -100,7 +100,7 @@ def parse_ts(value: str) -> float:
 # the system under test
 # ----------------------------------------------------------------------
 class Stack:
-    def __init__(self, version: Version, use_case: UseCase, payload_override=None):
+    def __init__(self, version: Version, use_case: UseCase, payload_override=None, args=None):
         self.version = version
         self.uc = use_case
         export = use_case.folder / "export"
@@ -109,7 +109,7 @@ class Stack:
             "dockerinfo": json.loads((export / "dockerinfo.json").read_text()),
         }
         if payload_override:
-            self.payload = payload_override(self.payload, use_case)
+            self.payload = payload_override(self.payload, use_case, args)
 
     # --- version check -------------------------------------------------
     def detect_version(self) -> str:
@@ -131,6 +131,21 @@ class Stack:
         """Redis connections currently blocked in BRPOP (the OLD idle-worker hang)."""
         out = self.orch("exec", "-T", "redis", "redis-cli", "CLIENT", "LIST")
         return sum(1 for line in out.splitlines() if "cmd=brpop" in line)
+
+    def running_workers(self) -> int:
+        return len(self.orch("ps", "--status", "running", "-q", "worker").split())
+
+    def set_workers(self, n: int) -> None:
+        """Scale the worker service to ``n`` replicas (Amendment 4, RQ10).
+
+        ``--no-recreate`` keeps the running workers as they are; only the
+        added ones are created, with the shipped defaults. The next
+        ``stack.sh`` switch brings the stack back to its configured replicas.
+        """
+        self.orch("up", "-d", "--no-recreate", "--scale", f"worker={n}", "worker")
+        ok, _ = wait_for(lambda: self.running_workers() == n, 60, 0.5)
+        if not ok:
+            raise RuntimeError(f"expected {n} running workers, found {self.running_workers()}")
 
     def restart_workers(self) -> None:
         # "start", not "up": the same containers come back with the settings
@@ -236,14 +251,18 @@ class Stack:
         s = self.status(wf)
         return s if s in TERMINAL else None
 
-    def makespan(self, wf: str) -> float | None:
-        """Server-side time from the first task created to the last update."""
+    def task_span(self, wf: str) -> tuple[float, float] | None:
+        """Server-side (first task created, last task updated), as epoch seconds."""
         ts = self.tasks(wf).values()
         if not ts:
             return None
-        return max(parse_ts(t["updated_at"]) for t in ts) - min(
-            parse_ts(t["created_at"]) for t in ts
-        )
+        return (min(parse_ts(t["created_at"]) for t in ts),
+                max(parse_ts(t["updated_at"]) for t in ts))
+
+    def makespan(self, wf: str) -> float | None:
+        """Server-side time from the first task created to the last update."""
+        span = self.task_span(wf)
+        return span[1] - span[0] if span else None
 
     def task_status(self, wf: str, service: str):
         return self.tasks(wf).get(service, {}).get("status")
@@ -588,6 +607,139 @@ def sc_concurrent_outage(stack: Stack, rec: dict, args) -> None:
     _alerts(stack, rec, target, t_fault)
 
 
+# ----------------------------------------------------------------------
+# Amendment 4: scaling and data size (PROTOCOL.md 11)
+# ----------------------------------------------------------------------
+def sc_scale(stack: Stack, rec: dict, args) -> None:
+    """RQ10: K workflows submitted at once, on the W workers set by --workers.
+
+    Latency and throughput come from the orchestrator's own task timestamps,
+    not from the client's polling, so that polling K workflows (which loads the
+    API equally on both versions) does not set the resolution. A workflow's
+    latency runs from its first task created (at submission) to its last task
+    updated; the trial's makespan from the first task of any workflow to the
+    last update of any.
+    """
+    if not stack.uc.concurrent:
+        raise SystemExit(f"use case {stack.uc.name} cannot run workflows concurrently")
+    k = args.workflows
+    rec["workflows"] = rec["jobs"] = k
+    rec["workers"] = stack.running_workers()
+    t0 = time.monotonic()
+    wfs = [stack.submit() for _ in range(k)]
+    rec["submit_seconds"] = time.monotonic() - t0
+    rec["carriers"] = wfs
+    pending = set(wfs)
+
+    def drain():
+        for wf in list(pending):
+            if stack.finished(wf):
+                pending.discard(wf)
+        return not pending
+
+    wait_for(drain, args.timeout, interval=0.5)
+    rec["client_seconds"] = time.monotonic() - t0
+    statuses = {wf: stack.finished(wf) or "timeout" for wf in wfs}
+    rec["completed_workflows"] = sum(s == "completed" for s in statuses.values())
+    rec["job_completed"] = rec["completed_workflows"] == k
+    spans = {wf: stack.task_span(wf) for wf in wfs}
+    done = [spans[wf] for wf in wfs if statuses[wf] == "completed" and spans[wf]]
+    rec["latencies"] = [end - start for start, end in done]
+    if rec["job_completed"] and done:
+        rec["makespan_seconds"] = max(end for _, end in done) - min(start for start, _ in done)
+        rec["throughput_wf_per_min"] = 60 * k / rec["makespan_seconds"] if rec["makespan_seconds"] > 0 else None
+    else:
+        rec["makespan_seconds"] = rec["throughput_wf_per_min"] = None
+    _record_failures(stack, rec, wfs)
+
+
+def _single_workflow(stack: Stack, rec: dict, args) -> str | None:
+    """Submit once and follow the workflow; a refusal is a result, not an error.
+
+    Returns the workflow id, or None if the submission was refused.
+    """
+    t0 = time.monotonic()
+    r, took = stack.try_submit()
+    rec["submit_status"] = r.status_code
+    rec["submit_seconds"] = took
+    rec["accepted"] = r.status_code == 200
+    rec["refused"] = r.status_code == 400
+    if not rec["accepted"]:
+        rec["refusal"] = r.text[:300]
+        rec["final_status"] = "refused" if rec["refused"] else f"http {r.status_code}"
+        rec["job_completed"] = False
+        return None
+    wf = r.json()["workflow_id"]
+    final, _ = wait_for(lambda: stack.finished(wf), args.timeout, interval=0.05)
+    rec["e2e_seconds"] = time.monotonic() - t0
+    rec["makespan_seconds"] = stack.makespan(wf)
+    rec["final_status"] = final or "timeout"
+    rec["job_completed"] = final == "completed"
+    return wf
+
+
+def sc_inline_size(stack: Stack, rec: dict, args) -> None:
+    """RQ11a: one workflow whose initial inline input is --size decoded bytes.
+
+    The input is valid (its checksum matches) and the pipeline ignores
+    everything in it but ``num_records`` = 10, so the output must still equal
+    the reference. NEW refuses inline data above MAX_INLINE_BYTES (64 KiB by
+    default) by design; OLD has no limit. --size 0 submits no inline input.
+    """
+    rec["inline_bytes"] = args.size
+    wf = _single_workflow(stack, rec, args)
+    if wf:
+        rec["carriers"] = [wf]
+
+
+def sc_data_size(stack: Stack, rec: dict, args) -> None:
+    """RQ11b: one workflow that makes the pipeline generate --records records.
+
+    The orchestrator passes file references, not data, so the files' size
+    should change only the services' work. There is no fixed reference for
+    sizes other than 10 records, so the output files' hashes are recorded and
+    compared across trials and versions instead (analyze.py).
+    """
+    rec["records"] = args.records
+    wf = _single_workflow(stack, rec, args)
+    if wf and rec["job_completed"]:
+        folder = workflow_dir(stack.uc.data_dir, wf)
+        names = list(stack.uc.output_reference)
+        rec["output_hashes"] = {name: sha256_file(folder / name) for name in names}
+        rec["output_bytes"] = {name: (folder / name).stat().st_size if (folder / name).is_file() else None
+                               for name in names}
+
+
+def inline_config_input(config: dict, size: int | None = None) -> dict:
+    """A valid inline JSON initial input, padded to exactly ``size`` decoded bytes."""
+    data = json.dumps(config).encode()
+    if size is not None:
+        base = len(json.dumps({**config, "padding": ""}).encode())
+        if size < base:
+            raise ValueError(f"an inline input of this config needs at least {base} bytes")
+        data = json.dumps({**config, "padding": "x" * (size - base)}).encode()
+    return {
+        "protocol": "inline",
+        "uri": base64.b64encode(data).decode(),
+        "format": "json",
+        "checksum": "sha256:" + hashlib.sha256(data).hexdigest(),
+        "size_bytes": len(data),
+    }
+
+
+def with_inline_size(payload: dict, uc: UseCase, args) -> dict:
+    p = copy.deepcopy(payload)
+    if args.size:
+        p["inputs"] = [inline_config_input({"num_records": 10, "output_format": "csv"}, args.size)]
+    return p
+
+
+def with_records(payload: dict, uc: UseCase, args) -> dict:
+    p = copy.deepcopy(payload)
+    p["inputs"] = [inline_config_input({"num_records": args.records, "output_format": "csv"})]
+    return p
+
+
 def check_job_outputs(stack: Stack, rec: dict) -> None:
     """RQ9 (PROTOCOL.md, Amendment 3): did each completed job produce the reference output?
 
@@ -708,7 +860,7 @@ def sc_corrupt_inline(stack: Stack, rec: dict, args) -> None:
     _submit_and_observe(stack, rec, args)
 
 
-def corrupt_inline_input(payload: dict, uc: UseCase) -> dict:
+def corrupt_inline_input(payload: dict, uc: UseCase, args=None) -> dict:
     """Add an inline initial input whose stated checksum is not its own."""
     p = copy.deepcopy(payload)
     data = json.dumps({"num_records": 10, "output_format": "csv"}).encode()
@@ -721,7 +873,7 @@ def corrupt_inline_input(payload: dict, uc: UseCase) -> dict:
     return p
 
 
-def break_operation(payload: dict, uc: UseCase) -> dict:
+def break_operation(payload: dict, uc: UseCase, args=None) -> dict:
     """Ask the outage target for an operation it does not implement.
 
     The blueprint stays consistent (the node and every link to it use the new
@@ -750,6 +902,18 @@ SCENARIOS = {
     "concurrent-outage": (sc_concurrent_outage, None),
     "credential-misconfig": (sc_credential_misconfig, None),
     "corrupt-inline": (sc_corrupt_inline, corrupt_inline_input),
+    # Amendment 4 (PROTOCOL.md 11): swept by campaign_sweeps.sh
+    "scale": (sc_scale, None),
+    "inline-size": (sc_inline_size, with_inline_size),
+    "data-size": (sc_data_size, with_records),
+}
+
+
+# The swept parameters of each Amendment 4 scenario, as (record key, argument)
+SWEEPS = {
+    "scale": (("workflows", "workflows"), ("workers_requested", "workers")),
+    "inline-size": (("inline_bytes", "size"),),
+    "data-size": (("records", "records"),),
 }
 
 
@@ -763,7 +927,10 @@ def main() -> int:
     p.add_argument("--use-case", choices=USE_CASES, default="file_based")
     p.add_argument("--reps", type=int, default=10)
     p.add_argument("--warmup", type=int, default=0, help="unrecorded trials first")
-    p.add_argument("--workflows", type=int, default=10, help="K for burst/concurrent-outage")
+    p.add_argument("--workflows", type=int, default=10, help="K for burst/concurrent-outage/scale")
+    p.add_argument("--workers", type=int, help="scale the worker service to W replicas first (scale)")
+    p.add_argument("--size", type=int, default=0, help="inline input size in decoded bytes (inline-size)")
+    p.add_argument("--records", type=int, default=10, help="records the pipeline generates (data-size)")
     p.add_argument("--timeout", type=float, default=180, help="per-workflow wait (s)")
     p.add_argument("--observe", type=float, default=30, help="fault observation window (s)")
     p.add_argument("--down-extra", type=float, default=10, help="short-outage extra downtime (s)")
@@ -775,11 +942,14 @@ def main() -> int:
     args = p.parse_args()
 
     fn, override = SCENARIOS[args.scenario]
-    stack = Stack(VERSIONS[args.version], USE_CASES[args.use_case], override)
+    stack = Stack(VERSIONS[args.version], USE_CASES[args.use_case], override, args)
     live = stack.detect_version()
     if live != args.version:
         print(f"refusing: asked for {args.version} but {live.upper()} is live", file=sys.stderr)
         return 2
+
+    if args.workers:
+        stack.set_workers(args.workers)
 
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out / "trials.jsonl"
@@ -798,6 +968,8 @@ def main() -> int:
             "attempts": [],
             "max_resubmits": args.max_resubmits,
         }
+        if args.scenario in SWEEPS:  # the point of the sweep this trial belongs to
+            rec.update({key: getattr(args, attr) for key, attr in SWEEPS[args.scenario]})
         sampler = None
         try:
             stack.prepare_services()

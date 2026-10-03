@@ -12,11 +12,20 @@ Services share data through a mounted volume (`./data`). The orchestrator contro
 input-provider → data-generator → data-analyzer → report-generator
 ```
 
+### Data size
+
+By default the pipeline generates 10 records. A workflow can ask for another
+number with an inline JSON initial input, for example
+`"inputs": [{"protocol": "inline", "format": "json", "uri": "<base64 of {\"num_records\": 1000}>"}]`
+(1 to 1 000 000). The evaluation uses this to vary the size of the files the
+services exchange (`evaluation/PROTOCOL.md`, Amendment 4). Without such an
+input, the output is unchanged.
+
 ### Services
 
 | Service | Port | Description |
 |---------|------|-------------|
-| input-provider | 18081 | Provides initial configuration |
+| input-provider | 18081 | Provides initial configuration (`num_records` = 10, or the value of an inline JSON workflow input) |
 | data-generator | 18082 | Generates energy data files |
 | data-analyzer | 18083 | Analyzes generated data |
 | report-generator | 18084 | Produces final report |
