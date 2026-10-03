@@ -1,19 +1,4 @@
 """Scheduling safety nets, against the live stacks.
-
-Two things that cannot be shown with mocks alone:
-
-* a task whose worker disappears mid-flight is picked up by another worker and
-  the workflow still finishes (leases and reclaim),
-* a workflow that failed can be resumed from where it stopped, without
-  re-running what already succeeded.
-
-To make both deterministic the orchestrator's workers are stopped for a moment
-and the test process itself plays the part of the worker that dies: it claims a
-task through the real engine against the live Redis and then simply stops,
-exactly as a killed container would. The workers are always started again, even
-when an assertion fails.
-
-Settings (environment): see ``live.py``.
 """
 
 import time
@@ -42,8 +27,6 @@ from tests.system.live import (
     workflow,
 )
 
-# Short enough that a reclaim happens within a test, long enough that a claim
-# does not expire before the test has looked at it.
 LEASE = 5.0
 
 
@@ -81,8 +64,6 @@ def test_task_whose_worker_dies_is_rerun(workers_stopped, engine):
     """A claimed task with an expired lease is re-queued and runs to completion."""
     wf = submit()
 
-    # Play the worker that dies: claim the first task (which takes a lease and
-    # marks it running), then do nothing at all.
     claimed = wait_for(
         lambda: engine.claim_task(wf, timeout=1), timeout=30, what="a task to claim"
     )
@@ -120,18 +101,11 @@ def test_reclaim_is_logged(workers_stopped, engine):
 
 def test_failed_workflow_resumes_where_it_stopped(workers_stopped, engine):
     """Resume re-runs only the failed task, keeping completed results.
-
-    The failure is the one resume exists for: a service stays down until its
-    task gives up (``BLOCKED_TASK_MAX_AGE``), the service comes back, and the
-    operator resumes. The workflow never completes before that, so it still
-    holds its services API key, which is dropped only on completion.
     """
     blocked = f"{SERVICE}:AnalyzeData"
     compose(USE_CASE_COMPOSE, "stop", COMPOSE_SERVICE)
     try:
         compose(ORCHESTRATOR_COMPOSE, "start", "worker")
-        # Submitting while a service is down is allowed: the credential check
-        # at submission only refuses services that answer 401/403.
         wf = submit()
         wait_for(
             lambda: tasks(wf)[blocked]["status"] == "blocked",
@@ -139,8 +113,6 @@ def test_failed_workflow_resumes_where_it_stopped(workers_stopped, engine):
             what=f"{blocked} to be blocked",
         )
 
-        # Give up on the task as a worker does once it has been blocked for
-        # longer than BLOCKED_TASK_MAX_AGE.
         compose(ORCHESTRATOR_COMPOSE, "stop", "worker")
         engine.fail_task(wf, task_id_of(wf, blocked), "simulated: blocked too long")
     finally:
@@ -200,14 +172,6 @@ def test_retry_refuses_a_completed_task():
 
 
 def test_a_stalled_workflow_is_failed_and_can_be_resumed(workers_stopped, engine):
-    """docs/STALLS.md: running with nothing queued, parked or leased.
-
-    The pipeline is a chain, so the engine's own way into this state (two
-    failed branches, one retried) is not available here. The test puts a
-    workflow into it directly: its first task fails, then the workflow is set
-    back to running without the task being retried, as a partial retry
-    leaves it. The workers must notice on their next idle poll.
-    """
     from models.state import WorkflowStatus
 
     wf = submit()

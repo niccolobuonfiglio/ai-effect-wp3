@@ -1,18 +1,11 @@
 """Read-only routes that feed the dashboard page (``/ui``).
 
-Built as a router factory like ``health_routes`` so dependencies stay explicit.
-
 Endpoints:
     GET /workflows                      list of workflows, newest first
     GET /workflows/{workflow_id}/graph  nodes and edges with live status
     GET /workflows/{workflow_id}/logs   log lines mentioning the workflow
     GET /orchestrator/alerts            recent alerts from all processes
 
-There is deliberately no route that returns a task's output data. The
-orchestrator only carries references to data; fetching them on a caller's
-behalf would mean requesting whatever URL a service put in a reference, possibly
-with the workflow's services key attached, and would bypass the masking of
-inline payloads.
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -67,13 +60,6 @@ def create_dashboard_router(
     dependencies: list | None = None,
 ) -> APIRouter:
     """Build the dashboard router.
-
-    Args:
-        engine: Workflow engine, for workflow and task state.
-        catalog: Workflow ids and stored blueprints.
-        registry: Service registry, for per-node service health.
-        log_reader: Reader over the shared logs directory.
-        dependencies: FastAPI dependencies for every route (the API-key check).
     """
     if engine is None:
         raise ValueError("engine is required")
@@ -93,7 +79,7 @@ def create_dashboard_router(
             try:
                 state = engine.get_workflow_status(workflow_id)
             except WorkflowNotFoundError:
-                # Its state is gone (deleted or Redis was reset): drop it.
+                # Its state is gone: drop it.
                 catalog.forget(workflow_id)
                 continue
             blueprint = catalog.blueprint(workflow_id) or {}

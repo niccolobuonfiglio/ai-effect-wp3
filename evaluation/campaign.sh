@@ -1,5 +1,4 @@
 #!/bin/bash
-# Layer 3 of the evaluation: every scenario, on both versions, in alternating blocks.
 #
 #   evaluation/campaign.sh <out-dir> [blocks] [reps-per-block]
 #
@@ -15,18 +14,12 @@ REPS="${3:-5}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$HERE/.venv/bin/python"
 mkdir -p "$OUT"
-OUT="$(cd "$OUT" && pwd)"   # absolute: the runner is started from evaluation/
+OUT="$(cd "$OUT" && pwd)"   
 "$HERE/env_snapshot.sh" "$OUT" >/dev/null
 
-# The runner sends no service key, so neither the orchestrators nor the
-# pipeline may run with one: a key left in the shell would make every call fail
-# on both versions. Starting the pipeline here also recreates it without one.
+
 unset ORCHESTRATOR_API_KEY SERVICE_API_KEY ORCHESTRATOR_SECRET
 
-# Use cases and the scenarios each one supports (PROTOCOL.md 3 and 9.2).
-# CAMPAIGN_USE_CASES selects use cases, CAMPAIGN_SCENARIOS filters scenarios
-# (both space-separated), e.g. for a smoke run or the Amendment 2 cells only.
-# Germany and protobuf are sequential-only: no burst, no concurrent-outage.
 use_cases=(${CAMPAIGN_USE_CASES:-file_based germany protobuf})
 declare -A SCENARIOS=(
   [file_based]="nominal burst outage short-outage request-error concurrent-outage worker-death credential-misconfig corrupt-inline"
@@ -44,7 +37,7 @@ for uc in "${use_cases[@]}"; do
     docker compose -f "$HERE/../use-cases/${COMPOSE[$uc]}/docker-compose.yml" up -d
 done
 
-selected() {  # use-case -> the scenarios to run for it
+selected() {  
     local s out=()
     for s in ${SCENARIOS[$1]}; do
         if [ -z "${CAMPAIGN_SCENARIOS:-}" ] || [[ " $CAMPAIGN_SCENARIOS " == *" $s "* ]]; then
@@ -54,9 +47,8 @@ selected() {  # use-case -> the scenarios to run for it
     echo "${out[@]}"
 }
 
-# NEW's lease is shortened for the worker-death scenario only; everything else
-# runs with the shipped defaults of each version.
-run_cell() {  # version use-case scenario
+
+run_cell() {  
     local v=$1 uc=$2 s=$3 reps=$REPS extra=()
     [ "$s" = nominal ] && { reps=$((REPS * 3)); extra=(--warmup 2); }
     [ "$s" = worker-death ] && extra=(--timeout 120)   # lease 20 s + slack; OLD never finishes
@@ -68,8 +60,7 @@ run_cell() {  # version use-case scenario
     if [ "$s" = worker-death ] && [ "$v" = new ]; then
         "$HERE/stack.sh" new >/dev/null   # back to the default lease
     fi
-    # RQ6 attribution (PROTOCOL.md 8.4), file-based only: the same nominal
-    # workload on NEW with the submission-time checks switched off.
+
     if [ "$s" = nominal ] && [ "$v" = new ] && [ "$uc" = file_based ]; then
         SERVICE_AUTH_CHECK=false BLUEPRINT_TYPE_CHECK=off "$HERE/stack.sh" new >/dev/null
         (cd "$HERE" && "$PY" runner.py --version new --scenario nominal --variant checks-off \
@@ -85,8 +76,7 @@ run_block() {  # version
             run_cell "$v" "$uc" "$s"
         done
     done
-    # CPU/RAM are sampled in a separate burst run: "docker stats" itself costs
-    # CPU and would bias the latency and throughput measured above.
+
     if [[ " ${use_cases[*]} " == *" file_based "* ]] && [ -z "${CAMPAIGN_SCENARIOS:-}" ]; then
         (cd "$HERE" && "$PY" runner.py --version "$v" --scenario burst --reps 2 --stats \
             --use-case file_based --out "$OUT/resources") | tee -a "$OUT/campaign.log"

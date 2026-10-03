@@ -101,7 +101,6 @@ class TestFullWorkflowExecution:
         engine.initialize_workflow("wf-diamond", graph)
         engine.start_workflow("wf-diamond")
 
-        # Step 1: Execute A
         task_a = engine.claim_task("wf-diamond", timeout=1)
         assert task_a.node_key == "service-a:Process"
         output_a = DataReference(
@@ -109,20 +108,16 @@ class TestFullWorkflowExecution:
         )
         engine.complete_task("wf-diamond", task_a.task_id, output_refs=[output_a])
 
-        # Step 2: Execute B and C (both ready after A completes)
         task_b = engine.claim_task("wf-diamond", timeout=1)
         task_c = engine.claim_task("wf-diamond", timeout=1)
 
-        # Complete both B and C
         engine.complete_task("wf-diamond", task_b.task_id)
         engine.complete_task("wf-diamond", task_c.task_id)
 
-        # Step 3: Execute D (ready after both B and C complete)
         task_d = engine.claim_task("wf-diamond", timeout=1)
         assert task_d.node_key == "service-d:Process"
         engine.complete_task("wf-diamond", task_d.task_id)
 
-        # Verify workflow completed
         assert engine.is_workflow_complete("wf-diamond")
         status = engine.get_workflow_status("wf-diamond")
         assert status.status == WorkflowStatus.COMPLETED
@@ -192,7 +187,6 @@ class TestDataPersistence:
 
     def test_workflow_state_survives_reconnect(self, redis_container):
         """Workflow state persists across connections."""
-        # First connection: initialize and start workflow
         client1 = Redis(
             host=redis_container.get_container_host_ip(),
             port=redis_container.get_exposed_port(6379),
@@ -211,7 +205,6 @@ class TestDataPersistence:
         engine1.start_workflow("wf-persist")
         client1.close()
 
-        # Second connection: verify and continue
         client2 = Redis(
             host=redis_container.get_container_host_ip(),
             port=redis_container.get_exposed_port(6379),

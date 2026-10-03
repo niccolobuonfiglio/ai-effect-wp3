@@ -343,7 +343,6 @@ class TestRun:
 
         worker.run("wf-123")
 
-        # Loop: check complete (False) -> process task1 -> check complete (False) -> process task2 -> check complete (True) -> exit
         assert mock_engine.claim_task.call_count == 2
         assert mock_engine.complete_task.call_count == 2
 

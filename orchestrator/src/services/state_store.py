@@ -1,11 +1,4 @@
 """Redis-based state store for workflow and task management.
-
-Every multi-key change is applied with ``MULTI``/``EXEC``, and every
-read-modify-write of a state document is guarded by ``WATCH``, so a crash
-cannot leave a change half-written and two writers cannot overwrite each
-other's update. Methods that read or write take an optional ``client``: the
-engine passes the pipeline of its own transaction, so its reads are watched and
-its writes are applied together with those of the task queue.
 """
 
 import json
@@ -16,8 +9,6 @@ from redis import Redis
 from models.data_reference import DataReference
 from models.state import TaskState, TaskStatus, WorkflowState, WorkflowStatus
 
-# Ids of the workflows in RUNNING status, kept in step with the status itself
-# so workers find them without scanning the keyspace.
 RUNNING_WORKFLOWS_KEY = "workflows:running"
 
 
@@ -62,9 +53,7 @@ class RedisStateStore:
     def _utc_now(self) -> datetime:
         return datetime.now(timezone.utc)
 
-    # ------------------------------------------------------------------
     # building and writing state documents
-    # ------------------------------------------------------------------
     def new_workflow(self, workflow_id: str) -> WorkflowState:
         """A workflow in pending state, not yet stored."""
         if not workflow_id:
@@ -119,11 +108,6 @@ class RedisStateStore:
         error: str | None = None,
         clear_error: bool = False,
     ) -> TaskState:
-        """``state`` with a new status and optionally new refs or error.
-
-        ``clear_error`` resets a previously stored error (ignored if ``error``
-        is given).
-        """
         update_data: dict = {"status": status, "updated_at": self._utc_now()}
         if input_refs is not None:
             update_data["input_refs"] = input_refs
@@ -136,11 +120,6 @@ class RedisStateStore:
         return state.model_copy(update=update_data)
 
     def write_workflow(self, state: WorkflowState, client=None) -> None:
-        """Store a workflow document and keep the running index in step.
-
-        Pass a pipeline in ``MULTI`` mode as ``client`` so both writes are
-        applied together.
-        """
         r = client if client is not None else self._redis.pipeline(transaction=True)
         r.set(self.workflow_key(state.workflow_id), state.model_dump_json())
         if state.status == WorkflowStatus.RUNNING:
@@ -158,9 +137,7 @@ class RedisStateStore:
         if client is None:
             r.execute()
 
-    # ------------------------------------------------------------------
     # workflows
-    # ------------------------------------------------------------------
     def create_workflow(self, workflow_id: str) -> WorkflowState:
         """Create a new workflow in pending state."""
         state = self.new_workflow(workflow_id)
@@ -215,12 +192,6 @@ class RedisStateStore:
 
     def rebuild_running_index(self) -> int:
         """Add running workflows missing from the index.
-
-        Needed once for data written before the index existed; returns the
-        number of running workflows found. Each workflow is added in a
-        transaction that watches its document, so one that finishes during the
-        scan is not added, and workflows changing status meanwhile keep the
-        index entries their own writes gave them.
         """
         found = 0
         for key in self._redis.scan_iter(match="workflow:*", count=100):
@@ -245,9 +216,7 @@ class RedisStateStore:
                 found += 1
         return found
 
-    # ------------------------------------------------------------------
     # tasks
-    # ------------------------------------------------------------------
     def create_task(
         self,
         workflow_id: str,
@@ -295,9 +264,6 @@ class RedisStateStore:
         clear_error: bool = False,
     ) -> TaskState:
         """Update task status and optionally set input or output refs.
-
-        ``clear_error`` resets a previously stored error (ignored if ``error``
-        is given).
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")

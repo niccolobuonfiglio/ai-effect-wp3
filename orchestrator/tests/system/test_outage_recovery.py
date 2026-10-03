@@ -1,18 +1,4 @@
-"""Automated version of the manual outage/recovery runs (run 3 and run 4).
-
-Runs against the live stacks: the orchestrator from ``orchestrator/`` and the
-``file_based_energy_pipeline`` use case. One service (``data-analyzer``) is
-stopped to simulate an outage, and the test checks that
-
-* the outage is detected, alerted and shown by the health API,
-* the task is BLOCKED while the workflow keeps running,
-* one recover call resumes the *same* workflow, which then completes,
-* already completed tasks are not executed again.
-
-The stopped service is always restarted, even when an assertion fails.
-
-Addresses, compose files and the API wrappers come from ``live.py``, which the
-other system modules share.
+"""Automated version of the manual outage/recovery runs.
 """
 
 import time
@@ -42,9 +28,7 @@ from tests.system.live import (
     workflow,
 )
 
-# ----------------------------------------------------------------------
 # fixtures
-# ----------------------------------------------------------------------
 @pytest.fixture(scope="module", autouse=True)
 def live_stack():
     """Fail fast, with a clear message, if the stacks are not up."""
@@ -61,9 +45,7 @@ def outage():
         start_service()
 
 
-# ----------------------------------------------------------------------
 # tests
-# ----------------------------------------------------------------------
 def test_baseline_workflow_completes():
     wf = submit()
 
@@ -81,7 +63,7 @@ def test_outage_blocks_task_and_recovery_resumes_same_workflow(outage):
     since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     wf = submit()
 
-    # --- during the outage -------------------------------------------------
+    # --- during the outage 
     blocked = wait_for(
         lambda: tasks(wf)[f"{SERVICE}:AnalyzeData"]["status"] == "blocked",
         timeout=60,
@@ -100,8 +82,6 @@ def test_outage_blocks_task_and_recovery_resumes_same_workflow(outage):
         for key in ("input_provider1:GetConfiguration", "data_generator1:GenerateData")
     }
 
-    # The task blocks on the first refused call; the circuit opens after
-    # CIRCUIT_FAILURE_THRESHOLD (3) failures, i.e. a few seconds of backoff later.
     health = wait_for(
         lambda: (h := service_health(SERVICE))["status"] == "UNHEALTHY" and h,
         timeout=30,
@@ -116,7 +96,6 @@ def test_outage_blocks_task_and_recovery_resumes_same_workflow(outage):
     logs = compose(ORCHESTRATOR_COMPOSE, "logs", "--since", since, "worker")
     assert f"SERVICE DOWN: {SERVICE}" in logs
 
-    # The same outage as the dashboard sees it.
     listed = api("GET", "/workflows").json()["workflows"]
     assert any(w["workflow_id"] == wf and w["status"] == "running" for w in listed)
 
@@ -131,17 +110,15 @@ def test_outage_blocks_task_and_recovery_resumes_same_workflow(outage):
 
     assert wf in api("GET", f"/workflows/{wf}/logs").text
 
-    # --- recovery ----------------------------------------------------------
+    # --- recovery 
     start_service()
     response = api("POST", f"/orchestrator/health/services/{SERVICE}/recover")
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["status"] == "HEALTHY"
-    # 0 is possible if a retry was in flight at that instant; the task then
-    # runs on that retry or the next one, so the outcome below is the same.
     assert body["resumed_tasks"] in (0, 1)
 
-    # --- after -------------------------------------------------------------
+    # --- after 
     outcome = wait_for(lambda: finished(wf), timeout=60, what=f"{wf} to finish")
     assert outcome == "completed", workflow(wf)
 
@@ -162,13 +139,7 @@ def test_outage_blocks_task_and_recovery_resumes_same_workflow(outage):
 
 
 def test_service_back_within_seconds_costs_seconds_not_a_minute(outage):
-    """A service that is only briefly unavailable - e.g. still starting after
-    ``docker compose up`` - must not cost a full retry and reset cycle.
-
-    Before backoff (fixed 30 s retry, 60 s reset, threshold 1) this took
-    60-90 s. Now retries start at 2 s and the circuit only opens after three
-    failures, so the workflow finishes seconds after the service is back,
-    without anyone calling /recover.
+    """A service that is only briefly unavailable must not cost a full retry and reset cycle.
     """
     wf = submit()
     wait_for(
@@ -179,7 +150,7 @@ def test_service_back_within_seconds_costs_seconds_not_a_minute(outage):
 
     time.sleep(2)                 # the service stays down a little longer
     back_at = time.monotonic()
-    start_service()               # no /recover call
+    start_service()               
 
     outcome = wait_for(lambda: finished(wf), timeout=30, what=f"{wf} to finish")
     elapsed = time.monotonic() - back_at

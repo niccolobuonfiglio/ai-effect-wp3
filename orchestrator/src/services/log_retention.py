@@ -1,20 +1,4 @@
 """Retention for the shared logs directory.
-
-Every orchestrator process writes its own log and alert files into one shared
-volume, named after the container hostname (``worker-<hostname>.log``,
-``alerts-worker-<hostname>.jsonl``, …). A container gets a new hostname each
-time it is recreated, and the old files are never rotated or deleted again,
-because rotation only applies to files a running process writes. Without
-cleanup the directory would grow with every restart.
-
-Two mechanisms keep it bounded:
-
-* **Pruning.** At startup each process deletes per-process files, and rotated
-  copies, that nobody has written to for longer than the retention period
-  (``LOG_RETENTION_DAYS``, default 7, the same as the rotation backups).
-* **Keep-alive.** A live process may be idle and write nothing for days, so each
-  process refreshes the modification time of its own files every hour. Only
-  files of processes that are gone can therefore look stale.
 """
 
 import os
@@ -25,14 +9,11 @@ from pathlib import Path
 DEFAULT_RETENTION_DAYS = 7.0
 KEEPALIVE_SECONDS = 3600.0
 
-# Files that belong to one process, plus rotated copies (``<name>.<date>``).
-# The API's current ``orchestrator.log`` is not listed: its name never changes
-# and its own handler manages it; only its rotated copies are.
 PRUNABLE_PATTERNS = (
     "worker-*.log*",
     "alerts-*.jsonl*",
     "orchestrator.log.*",
-    "worker_daemon.log*",  # names used before per-process files
+    "worker_daemon.log*",  
     "alerts.jsonl*",
 )
 
@@ -71,15 +52,6 @@ def prune_stale_files(
     now: float | None = None,
 ) -> list[Path]:
     """Delete per-process files not written to for ``max_age_days``.
-
-    Args:
-        log_dir: The shared logs directory.
-        max_age_days: Retention period; defaults to :func:`retention_days`.
-        keep: File names never deleted (the calling process's own files).
-        now: Current time, for tests.
-
-    Returns:
-        The deleted paths.
     """
     directory = Path(log_dir)
     if not directory.is_dir():

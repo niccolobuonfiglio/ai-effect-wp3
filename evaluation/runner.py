@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
 """Fault-injection and workload scenarios, run the same way on OLD and NEW.
-
-Every trial is a black-box experiment against the live stacks: the runner
-only uses the public HTTP API, Docker Compose and the use-case service logs,
-so the same code measures both orchestrator versions. Version-specific
-behaviour is limited to the *operator model* (what a human would do to
-recover), which is fixed per version and documented in PROTOCOL.md:
-
-* OLD has no health API and no way to resume a failed workflow, so the
-  operator restarts the service and resubmits the whole workflow.
-* NEW: the operator restarts the service and calls ``/recover`` once.
-
-One JSON line per trial is appended to ``<out>/trials.jsonl``.
-
-Usage:
-    python evaluation/runner.py --version new --scenario outage --reps 10 \
-        --use-case file_based --out evaluation/results/2026-09-25
 """
 
 import argparse
@@ -44,9 +28,7 @@ TERMINAL = ("completed", "failed")
 EXECUTE_LINE = re.compile(r"Execute: method=(\w+), task=(\w+)")
 
 
-# ----------------------------------------------------------------------
 # small helpers
-# ----------------------------------------------------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -96,9 +78,7 @@ def parse_ts(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
-# ----------------------------------------------------------------------
 # the system under test
-# ----------------------------------------------------------------------
 class Stack:
     def __init__(self, version: Version, use_case: UseCase, payload_override=None, args=None):
         self.version = version
@@ -111,13 +91,13 @@ class Stack:
         if payload_override:
             self.payload = payload_override(self.payload, use_case, args)
 
-    # --- version check -------------------------------------------------
+    # --- version check 
     def detect_version(self) -> str:
         """404 on the health API means OLD; anything else means NEW."""
         code = api("GET", "/orchestrator/health/services").status_code
         return "old" if code == 404 else "new"
 
-    # --- orchestrator ---------------------------------------------------
+    # --- orchestrator 
     def orch(self, *args: str, check=True) -> str:
         return compose(
             self.version.compose_file, *args, project=self.version.project, check=check
@@ -148,13 +128,10 @@ class Stack:
             raise RuntimeError(f"expected {n} running workers, found {self.running_workers()}")
 
     def restart_workers(self) -> None:
-        # "start", not "up": the same containers come back with the settings
-        # they were created with (e.g. LEASE_SECONDS=20). "up" would re-apply
-        # this process's environment and silently reset them to the defaults.
         self.orch("kill", "worker")
         self.orch("start", "worker")
 
-    # --- use case --------------------------------------------------------
+    # --- use case 
     def uc_compose(self, *args: str, check=True) -> str:
         return compose(self.uc.compose_file, *args, check=check)
 
@@ -228,7 +205,7 @@ class Stack:
         logs = self.uc_compose("logs", "--no-log-prefix", "--since", since_iso, *names)
         return Counter(m.group(1) for m in EXECUTE_LINE.finditer(logs))
 
-    # --- workflows -------------------------------------------------------
+    # --- workflows 
     def submit(self) -> str:
         r = api("POST", "/workflows", json=self.payload)
         r.raise_for_status()
@@ -267,7 +244,6 @@ class Stack:
     def task_status(self, wf: str, service: str):
         return self.tasks(wf).get(service, {}).get("status")
 
-    # --- NEW-only observability -----------------------------------------
     def health(self, service: str) -> dict | None:
         r = api("GET", f"/orchestrator/health/services/{service}")
         return r.json() if r.status_code == 200 else None
@@ -338,9 +314,7 @@ def _mib(text: str) -> float:
     return float(m.group(1)) * units.get(m.group(2), 1) if m else 0.0
 
 
-# ----------------------------------------------------------------------
 # operator model
-# ----------------------------------------------------------------------
 def operator_recover(stack: Stack, wf: str, service: str, rec: dict, limit: float) -> str | None:
     """After the service is back: bring the logical job to completion.
 
@@ -348,8 +322,6 @@ def operator_recover(stack: Stack, wf: str, service: str, rec: dict, limit: floa
     OLD, where recovery means resubmitting), and records actions and outcome.
     """
     def before_recovery():
-        # The F2 rule (PROTOCOL.md 9.3): identical for both versions, not an
-        # operator action. Empty for every use case but Germany.
         if stack.uc.recreate_before_recovery:
             stack.recreate(stack.uc.recreate_before_recovery)
             rec["f2_recreates"] = rec.get("f2_recreates", 0) + 1
@@ -383,9 +355,7 @@ def operator_recover(stack: Stack, wf: str, service: str, rec: dict, limit: floa
     return current
 
 
-# ----------------------------------------------------------------------
 # scenarios
-# ----------------------------------------------------------------------
 def sc_nominal(stack: Stack, rec: dict, args) -> None:
     """No fault: one workflow, end-to-end latency (RQ6 overhead)."""
     t0 = time.monotonic()
@@ -425,10 +395,10 @@ def sc_burst(stack: Stack, rec: dict, args) -> None:
     )
     rec["job_completed"] = rec["completed_workflows"] == k
     _record_failures(stack, rec, wfs)
-    # V-A4: after the burst, idle workers should not sit in a blocking BRPOP
+    # after the burst, idle workers should not sit in a blocking BRPOP
     time.sleep(3)
     rec["brpop_clients_after"] = stack.brpop_clients()
-    # V-A4, second half: a workflow submitted afterwards must still run
+    # a workflow submitted afterwards must still run
     t1 = time.monotonic()
     late = stack.submit()
     final, _ = wait_for(lambda: stack.finished(late), args.timeout)
@@ -607,9 +577,7 @@ def sc_concurrent_outage(stack: Stack, rec: dict, args) -> None:
     _alerts(stack, rec, target, t_fault)
 
 
-# ----------------------------------------------------------------------
-# Amendment 4: scaling and data size (PROTOCOL.md 11)
-# ----------------------------------------------------------------------
+# Scaling and data size 
 def sc_scale(stack: Stack, rec: dict, args) -> None:
     """RQ10: K workflows submitted at once, on the W workers set by --workers.
 
@@ -679,13 +647,6 @@ def _single_workflow(stack: Stack, rec: dict, args) -> str | None:
 
 
 def sc_inline_size(stack: Stack, rec: dict, args) -> None:
-    """RQ11a: one workflow whose initial inline input is --size decoded bytes.
-
-    The input is valid (its checksum matches) and the pipeline ignores
-    everything in it but ``num_records`` = 10, so the output must still equal
-    the reference. NEW refuses inline data above MAX_INLINE_BYTES (64 KiB by
-    default) by design; OLD has no limit. --size 0 submits no inline input.
-    """
     rec["inline_bytes"] = args.size
     wf = _single_workflow(stack, rec, args)
     if wf:
@@ -693,13 +654,6 @@ def sc_inline_size(stack: Stack, rec: dict, args) -> None:
 
 
 def sc_data_size(stack: Stack, rec: dict, args) -> None:
-    """RQ11b: one workflow that makes the pipeline generate --records records.
-
-    The orchestrator passes file references, not data, so the files' size
-    should change only the services' work. There is no fixed reference for
-    sizes other than 10 records, so the output files' hashes are recorded and
-    compared across trials and versions instead (analyze.py).
-    """
     rec["records"] = args.records
     wf = _single_workflow(stack, rec, args)
     if wf and rec["job_completed"]:
@@ -741,17 +695,6 @@ def with_records(payload: dict, uc: UseCase, args) -> dict:
 
 
 def check_job_outputs(stack: Stack, rec: dict) -> None:
-    """RQ9 (PROTOCOL.md, Amendment 3): did each completed job produce the reference output?
-
-    Only jobs whose carrier workflow completed are checked: a job that did not
-    complete has no output to compare. ``silent_divergences`` counts completed
-    jobs whose files differ from the reference or are missing - a success
-    that is wrong. Each check also keeps the orchestrator's own record of how
-    the job got there (``history``: claims, reclaims, deferrals, retries,
-    clean) and its own consistency check (``verified``, from
-    ``/workflows/{id}/verify``); OLD has neither, so both are None there
-    (PROTOCOL.md 10.6 and 10.7).
-    """
     reference = stack.uc.output_reference
     if not reference or "carriers" not in rec:
         return
@@ -810,9 +753,7 @@ def _alerts(stack: Stack, rec: dict, target: str, t_fault: float):
     rec["first_alert_seconds"] = down[0] - t_fault if down else None
 
 
-# ----------------------------------------------------------------------
-# RQ8: data-exchange contracts (PROTOCOL.md, Amendment 1)
-# ----------------------------------------------------------------------
+# Data-exchange contracts 
 def _submit_and_observe(stack: Stack, rec: dict, args) -> None:
     """Submit; if accepted, follow the workflow until the client can see it fail.
 
@@ -909,7 +850,6 @@ SCENARIOS = {
 }
 
 
-# The swept parameters of each Amendment 4 scenario, as (record key, argument)
 SWEEPS = {
     "scale": (("workflows", "workflows"), ("workers_requested", "workers")),
     "inline-size": (("inline_bytes", "size"),),
@@ -917,9 +857,7 @@ SWEEPS = {
 }
 
 
-# ----------------------------------------------------------------------
 # main
-# ----------------------------------------------------------------------
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", choices=VERSIONS, required=True)

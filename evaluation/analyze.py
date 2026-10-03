@@ -1,37 +1,4 @@
 #!/usr/bin/env python3
-"""Turn the raw evaluation outputs into thesis tables, figures and tests.
-
-    python evaluation/analyze.py evaluation/results/<run-id>
-
-Reads whatever exists in the run folder:
-    trials.jsonl            runner.py         (layer 3: fault injection, overhead)
-    t33.csv                 run_t33.sh        (layer 1: independent T3.3 suites)
-    suites/<cell>/...       run_own_suites.sh (layer 2: own suites, differential)
-
-Writes <run>/thesis/: LaTeX tables (booktabs), PDF figures and summary.json
-with every number that appears in a table.
-
-Statistics (see PROTOCOL.md, "Analysis"):
-  binary outcomes     Fisher's exact test, two-sided
-  continuous          Mann-Whitney U (two-sided), Cliff's delta,
-                      95% bootstrap CI of the difference in medians
-  overhead (nominal)  TOST equivalence on log latency, margin +/-5 %; plus the
-                      attribution arm (NEW with its submission checks off,
-                      PROTOCOL.md 8.4)
-  output equivalence  completed jobs whose output files equal the reference,
-                      with an exact (Clopper-Pearson) 95% CI (PROTOCOL.md,
-                      Amendment 3)
-  latency dispersion  EXPLORATORY, not pre-registered: percentiles, IQR, SD and
-                      CV of nominal latency per use case, Brown-Forsythe and
-                      Fligner-Killeen tests of equal spread, ECDF figure
-  sweeps              Amendment 4 (PROTOCOL.md 11), per point of each sweep:
-                      scaling (K workflows x W workers: throughput, latency
-                      percentiles, NEW/OLD throughput ratio), inline size and
-                      data size (latency, refusals, cross-version output hashes);
-                      Mann-Whitney U and Cliff's delta per point
-Metrics that OLD cannot produce at all are reported as "n/s" (not supported),
-never as 0.
-"""
 
 import csv
 import json
@@ -46,19 +13,14 @@ from scipy import stats
 
 RNG = np.random.default_rng(20260925)
 MARGIN = 0.05  # equivalence margin for overhead
-# Amendment 4 (PROTOCOL.md 11): analysed per point of their sweep, never pooled
 SWEEP_SCENARIOS = ("scale", "inline-size", "data-size")
 VERSIONS = ("old", "new")
-# Reference palette slots 1 and 2 (validated adjacent pair); OLD also hatched,
-# so the two versions stay distinguishable in greyscale print.
 COLOR = {"old": "#eb6834", "new": "#2a78d6"}
 HATCH = {"old": "////", "new": ""}
 INK, MUTED, GRID = "#1f1f1e", "#6b6a64", "#e4e3dd"
 
 
-# ----------------------------------------------------------------------
 # statistics
-# ----------------------------------------------------------------------
 def cliffs_delta(a, b) -> float:
     """P(a > b) - P(a < b); |d| < .147 negligible, < .33 small, < .474 medium."""
     a, b = np.asarray(a), np.asarray(b)
@@ -136,9 +98,7 @@ def _iqr(x):
     return tuple(float(v) for v in np.percentile(x, [25, 75])) if len(x) else None
 
 
-# ----------------------------------------------------------------------
 # layer 3: trials
-# ----------------------------------------------------------------------
 def load_trials(run: Path) -> list[dict]:
     path = run / "trials.jsonl"
     if not path.exists():
@@ -171,7 +131,7 @@ def analyse_trials(trials: list[dict]) -> dict:
                 sum(bool(t.get("job_completed")) for t in valid["new"]), len(valid["new"]),
             ),
         }
-        if any("refused" in t for t in valid["old"] + valid["new"]):  # RQ8
+        if any("refused" in t for t in valid["old"] + valid["new"]):  
             r["refused"] = compare_binary(
                 sum(bool(t.get("refused")) for t in valid["old"]), len(valid["old"]),
                 sum(bool(t.get("refused")) for t in valid["new"]), len(valid["new"]),
@@ -190,7 +150,6 @@ def analyse_trials(trials: list[dict]) -> dict:
         down = [t.get("alerts", {}).get("SERVICE_DOWN", 0) for t in valid["new"] if "alerts" in t]
         if down:
             r["service_down_alerts_new"] = {"median": _med(down), "max": max(down)}
-        # PROTOCOL.md 10.8: alerts about workflows (NEW only), expected zero
         if any("workflow_alerts" in t for t in valid["new"]):
             raised = Counter()
             for t in valid["new"]:
@@ -217,7 +176,7 @@ def analyse_overhead(trials: list[dict]) -> dict:
     old, new, off = e2e("old", "default"), e2e("new", "default"), e2e("new", "checks-off")
     if not off:
         return {}
-    cost = compare_continuous(off, new)  # "old" slot = checks off, "new" slot = default
+    cost = compare_continuous(off, new) 
     return {
         "a_old_vs_new_default": tost_log(old, new),
         "b_old_vs_new_checks_off": tost_log(old, off),
@@ -254,16 +213,11 @@ def describe_spread(x) -> dict:
 
 def analyse_dispersion(trials: list[dict]) -> dict:
     """Exploratory, not pre-registered: is nominal latency equally spread on OLD and NEW?
-
-    Per use case, never pooled. Brown-Forsythe (Levene centred on the median)
-    and Fligner-Killeen both test equal spread and are robust to non-normal
-    data; Fligner is the more robust to outliers. The checks-off arm is
-    described but not tested.
     """
     lat = nominal_latencies(trials)
     result = {}
     for uc in sorted({k[0] for k in lat}):
-        order = lambda k: (VERSIONS.index(k[1]), k[2] != "default", k[2])  # OLD, NEW, NEW variants
+        order = lambda k: (VERSIONS.index(k[1]), k[2] != "default", k[2])  
         cells = {f"{v}/{var}": describe_spread(lat[(u, v, var)])
                  for (u, v, var) in sorted(lat, key=order) if u == uc and len(lat[(u, v, var)]) > 1}
         old, new = lat.get((uc, "old", "default"), []), lat.get((uc, "new", "default"), [])
@@ -382,12 +336,7 @@ def exact_ci(k: int, n: int) -> tuple[float, float] | None:
     return (float(ci.low), float(ci.high))
 
 
-# Pooled for RQ9 (PROTOCOL.md 10.4): the scenarios with a fault that a job is
-# expected to survive.
 FAULT_SCENARIOS = ("outage", "short-outage", "concurrent-outage", "worker-death")
-# Per cell: the verdicts, then (NEW only, PROTOCOL.md 10.6) how many checked
-# jobs carry the orchestrator's history, how many were not clean or had a task
-# reclaimed, and how many of those were still equivalent.
 EQUIVALENCE_COUNTS = ("jobs", "equivalent", "divergent", "missing", "with_history",
                       "not_clean", "not_clean_equivalent", "reclaimed", "reclaimed_equivalent",
                       "verified", "not_verified")
@@ -395,10 +344,6 @@ EQUIVALENCE_COUNTS = ("jobs", "equivalent", "divergent", "missing", "with_histor
 
 def history_inconsistent(trials: list[dict]) -> list[dict]:
     """Trials where the services executed more often than NEW handed tasks out.
-
-    PROTOCOL.md 10.6: every execution needs a claim, so the services' count
-    must not exceed the orchestrator's. Only trials whose every carrier was
-    checked are compared, so both counts cover the same workflows.
     """
     bad = []
     for t in trials:
@@ -416,13 +361,7 @@ def history_inconsistent(trials: list[dict]) -> list[dict]:
 
 
 def analyse_equivalence(trials: list[dict]) -> dict:
-    """RQ9 (PROTOCOL.md, Amendment 3): are completed jobs output-equivalent?
-
-    Counted per job, not per trial (a burst trial has 11 jobs). Per cell
-    (scenario, use case, version), then pooled per use case over
-    FAULT_SCENARIOS. Nominal also checks the
-    reference: a fault-free job that diverges makes the reference invalid, and
-    the result is then reported but not interpreted.
+    """Are completed jobs output-equivalent?
     """
     cells: dict[tuple, dict] = defaultdict(lambda: dict.fromkeys(EQUIVALENCE_COUNTS, 0))
     for t in trials:
@@ -434,10 +373,8 @@ def analyse_equivalence(trials: list[dict]) -> dict:
         for o in t["outputs"]:
             c["jobs"] += 1
             c[o["verdict"]] += 1
-            # PROTOCOL.md 10.7: the orchestrator's own consistency check (NEW only)
             if o.get("verified") is not None:
                 c["verified" if o["verified"] else "not_verified"] += 1
-            # PROTOCOL.md 10.6: the orchestrator's own record (NEW only)
             history = o.get("history")
             if history is None:
                 continue
@@ -469,9 +406,7 @@ def analyse_equivalence(trials: list[dict]) -> dict:
     return result
 
 
-# ----------------------------------------------------------------------
 # layer 1: Task 3.3
-# ----------------------------------------------------------------------
 def analyse_t33(run: Path) -> dict:
     path = run / "t33.csv"
     if not path.exists():
@@ -504,9 +439,7 @@ def _norm(verdict: str | None) -> str:
     return v
 
 
-# ----------------------------------------------------------------------
 # layer 2: own suites
-# ----------------------------------------------------------------------
 def analyse_suites(run: Path) -> dict:
     base = run / "suites"
     if not base.exists():
@@ -526,7 +459,7 @@ def analyse_suites(run: Path) -> dict:
                 for s in suites for c in s.iter("testcase")
                 if c.find("failure") is not None or c.find("error") is not None
             ]
-            if cell.name.startswith("diff-"):  # per-test outcome, for the RQ4/RQ8 table
+            if cell.name.startswith("diff-"):  
                 r["cases"] = {
                     c.get("name"): "fail" if (c.find("failure") is not None or c.find("error") is not None)
                     else "pass"
@@ -548,9 +481,7 @@ def analyse_suites(run: Path) -> dict:
     return out
 
 
-# ----------------------------------------------------------------------
 # output: LaTeX
-# ----------------------------------------------------------------------
 def fmt(x, digits=1):
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "--"
@@ -774,9 +705,7 @@ def write_tables(out: Path, summary: dict) -> None:
         (out / "table_suites.tex").write_text("\n".join(lines) + "\n")
 
 
-# ----------------------------------------------------------------------
 # output: figures
-# ----------------------------------------------------------------------
 def write_figures(out: Path, trials: list[dict]) -> None:
     if not trials:
         return
@@ -797,11 +726,11 @@ def write_figures(out: Path, trials: list[dict]) -> None:
         if not t.get("warmup") and "error" not in t and t["scenario"] not in SWEEP_SCENARIOS:
             by[f"{t['scenario']}\n{t['use_case']}"][t["version"]].append(t)
     names = sorted(by)
-    if not names:  # a run with only the Amendment 4 sweeps
+    if not names:  
         write_sweep_figures(out, trials, plt)
         return
 
-    # 1. completion rate per scenario (magnitude -> bars, shared zero baseline)
+    # 1. completion rate per scenario
     fig, ax = plt.subplots(figsize=(6.3, 2.6))
     x = np.arange(len(names))
     w = 0.38
@@ -822,7 +751,7 @@ def write_figures(out: Path, trials: list[dict]) -> None:
     fig.savefig(out / "fig_completion.pdf")
     plt.close(fig)
 
-    # 2. distributions: recovery time and nominal latency (strip + median tick)
+    # 2. distributions
     for key, label, fname in (("recovery_seconds", "time from service restored to job completed [s]", "fig_recovery.pdf"),
                               ("e2e_seconds", "end-to-end latency, no fault [s]", "fig_latency.pdf")):
         rows = [n for n in names if any(values(by[n][v], key) for v in VERSIONS)]
@@ -854,8 +783,7 @@ def write_figures(out: Path, trials: list[dict]) -> None:
         fig.savefig(out / fname)
         plt.close(fig)
 
-    # 3. exploratory: ECDF of nominal latency per use case (each its own x axis,
-    # since the use cases' latencies differ by an order of magnitude)
+    # 3. exploratory
     lat = nominal_latencies(trials)
     ucs = sorted({k[0] for k in lat})
     if ucs:
@@ -879,7 +807,7 @@ def write_figures(out: Path, trials: list[dict]) -> None:
 
 
 def _sweep_series(ax, xs_by_version: dict, x_of, y_of, log_x=True):
-    """Every trial as a point, the median per x as a line (OLD dashed)."""
+    """Every trial as a point, the median per x as a line."""
     for v in VERSIONS:
         pts = [(x_of(t), y_of(t)) for t in xs_by_version.get(v, []) if y_of(t) is not None]
         if not pts:
@@ -896,8 +824,8 @@ def _sweep_series(ax, xs_by_version: dict, x_of, y_of, log_x=True):
 
 
 def write_sweep_figures(out: Path, trials: list[dict], plt) -> None:
-    """Amendment 4 (PROTOCOL.md 11): one curve per version along each sweep."""
-    import matplotlib.ticker  # noqa: F401  (matplotlib is imported by write_figures)
+    """One curve per version along each sweep."""
+    import matplotlib.ticker  
     import matplotlib
     sweep = defaultdict(lambda: {"old": [], "new": []})
     for t in trials:
@@ -966,7 +894,6 @@ def _bytes_label(n: int) -> str:
     return f"{n} B"
 
 
-# ----------------------------------------------------------------------
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__)

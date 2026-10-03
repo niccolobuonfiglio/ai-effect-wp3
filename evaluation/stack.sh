@@ -5,11 +5,7 @@
 #   evaluation/stack.sh down                 stop both
 #   evaluation/stack.sh which                print the live version
 #
-# Both stacks bind port 18000, so only one runs at a time. OLD uses the compose
-# project "orch-old" so that it never overwrites NEW's containers and images.
-# Each switch removes the previous Redis container: every block of trials
-# starts from an empty state. Environment variables such as LEASE_SECONDS or
-# ORCHESTRATOR_API_KEY are passed through to docker compose.
+# Both stacks bind port 18000, so only one runs at a time. 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

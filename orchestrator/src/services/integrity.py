@@ -1,11 +1,4 @@
 """Integrity checks on data references.
-
-A reference may carry ``checksum`` ("algorithm:hex") and ``size_bytes`` for the
-data it points to. The orchestrator never fetches that data - it routes
-references, not payloads - so it can only check what it already holds: inline
-payloads. For every other protocol the two fields travel with the reference
-unchanged, to the service that reads the data and can check it
-(``use-cases/common/integrity.py`` does this for files).
 """
 
 import hashlib
@@ -35,13 +28,7 @@ def compute_checksum(data: bytes, algorithm: str = DEFAULT_ALGORITHM) -> str:
 
 
 def verify_bytes(data: bytes, checksum: str | None, size_bytes: int | None) -> bool:
-    """Check ``data`` against a stated checksum and size.
-
-    Returns True if something was checked, False if there was nothing to check
-    (no checksum or size, or a checksum algorithm this Python does not have).
-
-    Raises:
-        IntegrityError: The size or the checksum does not match.
+    """Check data against a stated checksum and size.
     """
     checked = False
     if size_bytes is not None:
@@ -55,7 +42,6 @@ def verify_bytes(data: bytes, checksum: str | None, size_bytes: int | None) -> b
         algorithm, expected = checksum.split(":", 1)
         if is_supported(algorithm):
             actual = hashlib.new(algorithm.lower(), data).hexdigest()
-            # Constant-time for the same reason as key checks; hex is case-insensitive
             if not hmac.compare_digest(actual, expected.strip().lower()):
                 raise IntegrityError(
                     f"checksum mismatch: reference states {algorithm}:{expected[:12]}..., "
@@ -67,12 +53,6 @@ def verify_bytes(data: bytes, checksum: str | None, size_bytes: int | None) -> b
 
 def verify_reference(reference: DataReference) -> bool:
     """Verify a reference whose data the orchestrator holds (inline).
-
-    Returns True if the reference was verified, False if it was passed through
-    unchecked: another protocol, or no checksum and size to check against.
-
-    Raises:
-        IntegrityError: An inline payload does not match its checksum or size.
     """
     if reference.protocol != Protocol.INLINE:
         return False

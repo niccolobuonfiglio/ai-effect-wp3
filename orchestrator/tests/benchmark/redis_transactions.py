@@ -1,26 +1,4 @@
 """Micro-benchmark of the orchestrator's Redis transactions.
-
-Every state transition is one ``WATCH``/``MULTI``/``EXEC`` transaction
-(docs/SCHEDULING.md section 11). This script measures what that costs and how
-often a transaction has to be retried because another worker changed a watched
-key first:
-
-* **cost**: latency and number of Redis commands of each transition, run by a
-  single client, for workflows of several sizes;
-* **fan-in**: all predecessors of a join complete at the same instant;
-* **claim race**: several workers claim from one queue;
-* **workers**: several workers drive many workflows to completion the way the
-  worker daemon does, without the service calls in between - the most Redis
-  contention the orchestrator can produce for that number of workers.
-
-The contention scenarios also check their outcome (a join queued once with all
-its inputs, every task claimed once, every workflow completed), so a retry that
-lost an update fails the run instead of going unnoticed.
-
-Run it with ``./run-benchmark-redis.sh`` (see ``--help``). By default it starts
-a throwaway Redis with the production persistence settings; ``--persistence``
-selects others to compare. Workers are threads, each with its own connection;
-they spend their time waiting for Redis, so they contend like processes do.
 """
 
 import argparse
@@ -51,13 +29,11 @@ from services.task_queue import RedisTaskQueue
 from services.workflow_engine import WorkflowEngine
 
 REDIS_IMAGE = "redis:7-alpine"
-# Redis command per persistence mode; "everysec" is what docker-compose.yml runs.
 PERSISTENCE = {
     "none": None,  # image defaults: snapshots only
     "everysec": "redis-server --appendonly yes --appendfsync everysec",
     "always": "redis-server --appendonly yes --appendfsync always",
 }
-# How the transactions of services/ are named in the report.
 TRANSACTION_LABELS = {"take": "claim", "move": "release/reclaim"}
 THREAD_TIMEOUT = 120
 
@@ -70,9 +46,7 @@ class InvariantViolated(AssertionError):
     """A contention scenario ended in a state the transactions must prevent."""
 
 
-# ----------------------------------------------------------------------
 # counting transactions and their retries
-# ----------------------------------------------------------------------
 class TransactionStats:
     """Attempts per transaction, by name, from any number of threads."""
 
@@ -102,10 +76,7 @@ class TransactionStats:
 
 
 def count_transactions(client: Redis, stats: TransactionStats) -> Redis:
-    """Make ``client.transaction`` report its attempts to ``stats``.
-
-    redis-py calls the transaction body again after every ``WatchError``, at
-    once and without limit, so the calls of the body are the attempts.
+    """Make ``client.transaction`` report its attempts to stats.
     """
     transaction = client.transaction
 
@@ -127,9 +98,7 @@ def count_transactions(client: Redis, stats: TransactionStats) -> Redis:
     return client
 
 
-# ----------------------------------------------------------------------
 # workflows and workers
-# ----------------------------------------------------------------------
 def _graph_node(name: str) -> GraphNode:
     node = Node(
         container_name=name,
@@ -254,9 +223,7 @@ def check(condition: bool, message: str) -> None:
         raise InvariantViolated(message)
 
 
-# ----------------------------------------------------------------------
 # statistics
-# ----------------------------------------------------------------------
 def percentile(samples: list[float], fraction: float) -> float:
     ordered = sorted(samples)
     return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
@@ -282,9 +249,7 @@ def commands_processed(client: Redis) -> int | None:
     return sum(v["calls"] for k, v in stats.items() if k != "cmdstat_info")
 
 
-# ----------------------------------------------------------------------
 # cost of each transition, without contention
-# ----------------------------------------------------------------------
 def lifecycle(engine: WorkflowEngine, workflow_id: str, size: int, measure) -> None:
     """One chain workflow through every transition.
 
@@ -326,8 +291,6 @@ def transition_cost(connect: Connect, size: int, rounds: int) -> dict[str, dict]
             before = commands_processed(worker.client)
             result = call()
             after = commands_processed(worker.client)
-            # the last call with a label wins, e.g. "complete" of the task
-            # before the last one, which has a dependent to hand over to
             commands[label] = None if before is None else after - before
             return result
 
@@ -355,10 +318,7 @@ def round_trip(connect: Connect, rounds: int) -> dict:
     finally:
         client.close()
 
-
-# ----------------------------------------------------------------------
 # retries under contention
-# ----------------------------------------------------------------------
 def fan_in_contention(connect: Connect, width: int, rounds: int) -> dict:
     """All ``width`` predecessors of a join complete at the same instant."""
     stats = TransactionStats()
@@ -435,12 +395,7 @@ def claim_race(connect: Connect, workers: int, tasks: int, rounds: int) -> dict:
 
 
 def worker_pool(connect: Connect, workers: int, workflows: int, size: int) -> dict:
-    """``workers`` workers run ``workflows`` chain workflows to completion.
-
-    Each loops as the worker daemon does - over the running workflows:
-    release what is due, claim, complete - but the service call between claim
-    and complete takes no time, so the workers meet in Redis as often as they
-    possibly can.
+    """workers workers run workflows chain workflows to completion.
     """
     stats = TransactionStats()
     setup = rig(connect)
@@ -487,9 +442,7 @@ def worker_pool(connect: Connect, workers: int, workflows: int, size: int) -> di
     }
 
 
-# ----------------------------------------------------------------------
 # the whole benchmark
-# ----------------------------------------------------------------------
 @dataclass
 class Settings:
     rounds: int = 200

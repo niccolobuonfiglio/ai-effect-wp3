@@ -143,7 +143,6 @@ class TestFailureAccumulation:
         fail(breaker, 5)
         health = breaker.get_health(SERVICE)
 
-        # Count keeps climbing but the circuit only opens once.
         assert health.failure_count == 5
         assert health.circuit_state == STATE_OPEN
 
@@ -168,7 +167,6 @@ class TestHalfOpenProbe:
         breaker = CircuitBreaker(redis_client, failure_threshold=1, reset_timeout=60.0)
         breaker.record_failure(SERVICE, BASE_URL, "down")
 
-        # Jump past the reset window without sleeping.
         raw = json.loads(redis_client.hget(REGISTRY_KEY, SERVICE))
         raw["opened_ts"] -= 61
         redis_client.hset(REGISTRY_KEY, SERVICE, json.dumps(raw))
@@ -192,7 +190,6 @@ class TestHalfOpenProbe:
         raw["state"] = STATE_HALF_OPEN
         redis_client.hset(REGISTRY_KEY, SERVICE, json.dumps(raw))
 
-        # One failure re-opens even though the threshold is 5.
         breaker.record_failure(SERVICE, BASE_URL, "still down")
 
         assert breaker.get_health(SERVICE).circuit_state == STATE_OPEN
@@ -548,13 +545,13 @@ class TestProbeBackoff:
         self.open_circuit(backoff_breaker)
         clock["now"] += 5
         backoff_breaker.allow(SERVICE)
-        backoff_breaker.record_failure(SERVICE, BASE_URL, "still refused")  # streak 2
+        backoff_breaker.record_failure(SERVICE, BASE_URL, "still refused")  
 
         clock["now"] += 10
         assert backoff_breaker.allow(SERVICE) is True
         backoff_breaker.record_success(SERVICE, BASE_URL)
 
-        self.open_circuit(backoff_breaker)                                  # streak 1 again
+        self.open_circuit(backoff_breaker)                                  
         clock["now"] += 5
         assert backoff_breaker.allow(SERVICE) is True
 
@@ -562,7 +559,7 @@ class TestProbeBackoff:
         self.open_circuit(backoff_breaker)
         clock["now"] += 5
         backoff_breaker.allow(SERVICE)
-        backoff_breaker.record_failure(SERVICE, BASE_URL, "still refused")  # streak 2
+        backoff_breaker.record_failure(SERVICE, BASE_URL, "still refused")  
 
         backoff_breaker.reset(SERVICE)
         self.open_circuit(backoff_breaker)
@@ -620,7 +617,7 @@ class TestAlertDeduplication:
     def test_one_alert_per_outage(self, breaker, clock, caplog):
         with caplog.at_level(logging.ERROR, logger=ALERTS_LOGGER):
             breaker.record_failure(SERVICE, BASE_URL, "refused")   # goes down
-            self.fail_probe_cycle(breaker, clock, 5)               # 5 failed probes
+            self.fail_probe_cycle(breaker, clock, 5)              
 
         assert len(self.downs(caplog)) == 1
 

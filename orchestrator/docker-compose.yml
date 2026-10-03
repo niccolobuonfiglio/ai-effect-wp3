@@ -2,8 +2,7 @@ services:
   redis:
     restart: unless-stopped
     image: redis:7-alpine
-    # All workflow state lives here: append-only file (fsync every second)
-    # on a named volume, so a restart or `docker compose down` keeps it.
+    # All workflow state lives here
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis_data:/data
@@ -55,8 +54,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      # Shared by API and workers: each process writes its own log and alert
-      # files, and the dashboard (served by the API) reads them all.
+      # Shared by API and workers
       - orchestrator_logs:/app/src/logs
 
   worker:
@@ -102,8 +100,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      # Shared by API and workers: each process writes its own log and alert
-      # files, and the dashboard (served by the API) reads them all.
+      # Shared by API and workers
       - orchestrator_logs:/app/src/logs
 
 volumes:

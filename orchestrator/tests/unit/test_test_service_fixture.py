@@ -1,7 +1,4 @@
 """Tests for the test-service helpers themselves.
-
-The readiness check must reject a *different* server on the port; before this,
-a use-case container publishing the same port silently answered the tests.
 """
 
 import sys
@@ -12,7 +9,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "fixtures"))
-from test_service import (  # noqa: E402
+from test_service import (  
     ControlServiceRunner,
     TEST_SERVICE_MARKER,
     free_port,
@@ -24,7 +21,7 @@ from test_service import (  # noqa: E402
 class _ForeignHandler(BaseHTTPRequestHandler):
     """Stands in for another service: answers /health without the marker."""
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):  
         body = b'{"status": "ok"}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -64,9 +61,6 @@ def test_readiness_rejects_a_foreign_server(foreign_server):
     with pytest.raises(RuntimeError, match="different server"):
         wait_until_ready(f"http://127.0.0.1:{port}", timeout=2)
 
-
-# The runner's server thread fails to bind the taken port; that failure is the
-# scenario under test, so its thread-exception warning is expected here.
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_runner_on_a_taken_port_fails_loudly(foreign_server):
     runner = ControlServiceRunner(port=foreign_server.server_address[1])

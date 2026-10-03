@@ -38,21 +38,14 @@ class WorkerDaemon:
 
         self.state_store = RedisStateStore(redis_client)
         task_queue = RedisTaskQueue(redis_client)
-        # A task whose worker dies keeps its lease until this many seconds have
-        # passed; another worker then re-runs it. It must comfortably exceed
-        # the poll interval, since polling renews the lease.
         self.lease_seconds = float(os.environ.get("LEASE_SECONDS", "300"))
         self.engine = WorkflowEngine(
             self.state_store, task_queue, redis_client, lease_seconds=self.lease_seconds
         )
 
-        # TLS verification for https service endpoints; a CA bundle path is
-        # also accepted for private certificates.
         self.verify = self._tls_verify(os.environ.get("SERVICE_TLS_VERIFY", "true"))
         self.control_client = ControlClient(verify=self.verify)
 
-        # Shared circuit breaker: state lives in Redis, so every worker
-        # replica and the API observe the same service health.
         self.breaker = CircuitBreaker(
             redis_client,
             failure_threshold=int(os.environ.get("CIRCUIT_FAILURE_THRESHOLD", "3")),
@@ -69,15 +62,14 @@ class WorkerDaemon:
         )
         # 0 (the default) keeps a blocked task waiting for as long as it takes.
         self.blocked_max_age = float(os.environ.get("BLOCKED_TASK_MAX_AGE", "0"))
-        # 0 lets a task run for as long as its service keeps reporting it.
         self.task_max_runtime = float(os.environ.get("TASK_MAX_RUNTIME", "3600"))
         self.policy = DataPolicy.from_env()
         self.secrets = SecretBox.from_env()
-        # Fail running workflows that nothing can move on (docs/STALLS.md).
+        # Fail running workflows that nothing can move on.
         self.stall_detection = os.environ.get(
             "STALL_DETECTION", "true"
         ).strip().lower() not in ("0", "false", "no", "off")
-        # Check every workflow this worker completes (docs/VERIFICATION.md).
+        # Check every workflow this worker completes.
         verify = os.environ.get("VERIFY_ON_COMPLETION", "true").strip().lower()
         self.verifier = (
             WorkflowVerifier(self.engine)
@@ -154,8 +146,6 @@ class WorkerDaemon:
     def run(self) -> None:
         """Main daemon loop."""
         logger.info("Worker daemon started, polling for tasks...")
-        # Workflows written before the running index existed are not in it;
-        # rebuilding is idempotent, so every replica may do it on start.
         try:
             found = self.state_store.rebuild_running_index()
             logger.info(f"Running-workflow index rebuilt: {found} running")
@@ -193,9 +183,6 @@ class WorkerDaemon:
 
 
 def main() -> int:
-    # Logging with file rotation. The API and all worker replicas share one
-    # logs volume, so each replica writes its own files; the dashboard merges
-    # them.
     host = os.environ.get("HOSTNAME", "worker")
     configure_logging(
         log_dir="logs",

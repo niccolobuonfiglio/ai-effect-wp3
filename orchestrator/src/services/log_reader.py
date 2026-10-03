@@ -65,9 +65,7 @@ class LogReader:
         self._tail_bytes = tail_bytes
         self._max_age_days = max_age_days
 
-    # ------------------------------------------------------------------
     # files
-    # ------------------------------------------------------------------
     def directory(self) -> Path | None:
         """The logs directory in use, or None if none exists."""
         candidates = (
@@ -98,17 +96,12 @@ class LogReader:
             return []
         lines = data.decode("utf-8", errors="replace").splitlines()
         if start > 0 and lines:
-            lines = lines[1:]  # first line was cut in the middle
+            lines = lines[1:]  
         return lines
 
-    # ------------------------------------------------------------------
     # logs
-    # ------------------------------------------------------------------
     def _records(self) -> list[tuple[str, str]]:
-        """All log records from the current ``*.log`` files as (sort key, text).
-
-        A record is a timestamped line plus any following lines without a
-        timestamp (e.g. a traceback), so merging files keeps them together.
+        """All log records from the current *.log files as (sort key, text).
         """
         directory = self.directory()
         if directory is None:
@@ -130,7 +123,7 @@ class LogReader:
             if current is not None:
                 records.append((key, "\n".join(current)))
 
-        records.sort(key=lambda r: r[0])  # stable: same-time lines keep file order
+        records.sort(key=lambda r: r[0])  
         return records
 
     def workflow_log(self, workflow_id: str, lines: int = 200) -> tuple[list[str], bool]:
@@ -149,9 +142,7 @@ class LogReader:
         chosen = (matching or records)[-lines:]
         return [sanitize_error(text, LINE_CHARS) for text in chosen], bool(matching)
 
-    # ------------------------------------------------------------------
     # alerts
-    # ------------------------------------------------------------------
     def alerts(self, limit: int = 50) -> list[dict]:
         """Newest alerts from every current ``alerts*.jsonl`` file."""
         limit = clamp(limit)

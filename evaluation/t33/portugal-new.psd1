@@ -1,7 +1,5 @@
 # Portugal node, new orchestrator. TefServicesRoot must point to the external
 # TEF checkout (commit 7ba677f7f0a93b5ed6126e43a0b7b0e30f59d6b3 in the T3.3 closure run).
-# The use-case overlay is taken from OLD for both versions: NEW's copy differs
-# since its initial commit, and only the orchestrator may vary.
 @{
     RepositoryRoot        = '/home/niccolo/University/Thesis/ai-effect-wp3'
     TefServicesRoot       = '/home/niccolo/University/Thesis/tef-services'

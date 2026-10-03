@@ -1,22 +1,4 @@
 """Redis persistence, against the live stacks.
-
-All orchestrator state lives in Redis, so these tests take Redis away the hard way
-and check that accepted work is still there afterwards:
-
-* Redis runs with the append-only file on the named volume,
-* a workflow interrupted by a Redis crash (SIGKILL) is still known, keeps
-  its completed tasks, and completes once Redis is back,
-* a task that was leased when Redis crashed keeps its lease and is reclaimed,
-* finished workflows survive the Redis container being removed and recreated.
-
-API and workers keep running throughout: they must ride out the outage and
-reconnect by themselves. Redis is always started again, even when an assertion
-fails.
-
-Every write is given FSYNC_WINDOW seconds before Redis is killed, because
-appendfsync everysec may lose the last second.
-
-Settings (environment): see live.py.
 """
 
 import json
@@ -52,18 +34,14 @@ from tests.system.live import (
 )
 
 REDIS_SERVICE = "redis"
-# Longer than the one second `appendfsync everysec` may hold a write back.
 FSYNC_WINDOW = 2.0
-# Short enough that a reclaim happens within a test.
 LEASE = 5.0
 
 BLOCKED = f"{SERVICE}:AnalyzeData"
 COMPLETED_BEFORE_OUTAGE = ("input_provider1:GetConfiguration", "data_generator1:GenerateData")
 
 
-# ----------------------------------------------------------------------
 # helpers
-# ----------------------------------------------------------------------
 def docker(*args: str) -> str:
     result = subprocess.run(["docker", *args], capture_output=True, text=True, check=True)
     return result.stdout.strip()
@@ -77,7 +55,7 @@ def redis_container() -> str:
 def redis_answers(client: redis.Redis) -> bool:
     try:
         return bool(client.ping())
-    except redis.RedisError:  # refused, or still loading the append-only file
+    except redis.RedisError:  
         return False
 
 
@@ -112,8 +90,6 @@ def crash_redis(client: redis.Redis) -> None:
     """Kill Redis and start the same container again."""
     time.sleep(FSYNC_WINDOW)
     kill_redis()
-    # Docker treats `docker kill` as a manual stop, so `restart:
-    # unless-stopped` does not bring the container back.
     start_redis(client)
 
 
@@ -125,9 +101,7 @@ def running_services() -> list[str]:
     return sorted(names.split())
 
 
-# ----------------------------------------------------------------------
 # fixtures
-# ----------------------------------------------------------------------
 @pytest.fixture(scope="module", autouse=True)
 def live_stack():
     """Fail fast, with a clear message, if the stacks are not up."""
@@ -173,9 +147,7 @@ def workers_stopped():
         compose(ORCHESTRATOR_COMPOSE, "start", "worker")
 
 
-# ----------------------------------------------------------------------
 # tests
-# ----------------------------------------------------------------------
 def test_redis_runs_with_append_only_file_on_a_named_volume(client):
     """The configuration every other test here depends on (PERSISTENCE.md section 2)."""
     assert client.config_get("appendonly") == {"appendonly": "yes"}
@@ -185,8 +157,6 @@ def test_redis_runs_with_append_only_file_on_a_named_volume(client):
     assert persistence["aof_enabled"] == 1
     assert persistence["aof_last_write_status"] == "ok"
 
-    # An anonymous volume (the image default) belongs to one container and is
-    # lost when that container is recreated; its name is a bare hash.
     (data,) = [
         m
         for m in json.loads(docker("inspect", "-f", "{{json .Mounts}}", redis_container()))
@@ -198,11 +168,6 @@ def test_redis_runs_with_append_only_file_on_a_named_volume(client):
 
 def test_workflow_interrupted_by_a_redis_crash_completes(client, outage):
     """Redis dies under a half-done workflow; the same workflow then completes.
-
-    The workflow is held mid-way by a service outage, so at the moment of the
-    crash Redis holds every kind of state: completed tasks with their outputs,
-    a blocked task with its retry schedule, a pending one with its
-    dependencies, the running index and an open circuit.
     """
     wf = submit()
     wait_for(
@@ -222,33 +187,25 @@ def test_workflow_interrupted_by_a_redis_crash_completes(client, outage):
 
     crash_redis(client)
 
-    # --- what came back ----------------------------------------------------
-    # API and workers lived through the outage and reconnected by themselves.
     assert running_services() == services_before
     assert workflow(wf).get("status") == "running", f"{wf} after the crash: {workflow(wf)}"
     assert wf in client.smembers(RUNNING_WORKFLOWS_KEY)
 
     restored = tasks(wf)
     assert set(restored) == EXPECTED_TASKS
-    # Whole documents, not only the status: the output references handed to
-    # the next task are part of what must survive.
     for key, task in completed_before.items():
         assert restored[key] == task, f"{key} changed across the crash"
     assert restored["report_generator1:GenerateReport"]["status"] == "pending"
-    # The blocked task is retried in the background, so it may be looked at
-    # mid-retry; with the service still down it settles on blocked again.
     wait_for(
         lambda: tasks(wf)[BLOCKED]["status"] == "blocked",
         timeout=60,
         what=f"{BLOCKED} to be blocked again",
     )
-    # The circuit breaker did not forget the outage.
     assert service_health(SERVICE)["status"] == "UNHEALTHY"
-    # What came back is consistent, not only present.
     report = verification(wf)
     assert report["verified"], problems(report)
 
-    # --- the workflow goes on ------------------------------------------------
+    # --- the workflow goes on 
     start_service()
     response = api("POST", f"/orchestrator/health/services/{SERVICE}/recover")
     assert response.status_code == 200, response.text
@@ -264,10 +221,6 @@ def test_workflow_interrupted_by_a_redis_crash_completes(client, outage):
 
 def test_task_leased_during_a_redis_crash_is_reclaimed(client, workers_stopped, engine):
     """A task in flight when Redis dies keeps its lease and is re-run.
-
-    The test process plays the worker holding the task, as in
-    ``test_scheduling.py``; the lease it took must come back with Redis, or no
-    worker would ever pick the task up again.
     """
     wf = submit()
     claimed = wait_for(
@@ -294,9 +247,6 @@ def test_task_leased_during_a_redis_crash_is_reclaimed(client, workers_stopped, 
 
 def test_finished_workflows_survive_redis_being_recreated(client):
     """Kill Redis, remove its container, create a new one: the history stays.
-
-    This is what ``docker compose down`` / ``up`` does to Redis. With the
-    image's anonymous volume the new container started empty.
     """
     wf = submit()
     assert wait_for(lambda: finished(wf), timeout=60, what=f"{wf} to finish") == "completed"
@@ -311,9 +261,7 @@ def test_finished_workflows_survive_redis_being_recreated(client):
     assert redis_container() != old_container
     assert workflow(wf) == workflow_before
     assert tasks(wf) == tasks_before
-    # Nothing else was lost either; workers may have added keys since.
     assert client.dbsize() >= keys_before
 
-    # ...and the orchestrator carries on with the recreated Redis.
     again = submit()
     assert wait_for(lambda: finished(again), timeout=60, what=f"{again} to finish") == "completed"

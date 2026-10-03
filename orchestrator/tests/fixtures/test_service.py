@@ -1,8 +1,4 @@
 """Test service implementing control interface for integration tests.
-
-Also holds the helpers every in-process test service uses (here and in
-``tests/e2e``): a free port per run, and a readiness check that confirms the
-answer comes from the test service itself.
 """
 
 import socket
@@ -15,9 +11,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
-# Returned by every test service's /health. A readiness check that only waits
-# for *some* answer would accept a different server already bound to the port
-# (e.g. a use-case container), and the tests would then run against it.
 TEST_SERVICE_MARKER = "orchestrator-test-service"
 
 
@@ -189,10 +182,7 @@ class ControlServiceRunner:
     def __init__(self, host: str = "127.0.0.1", port: int | None = None):
         """Args:
             host: Interface to bind.
-            port: Fixed port, or None to pick a free one. A fixed port can
-                collide with a running use case (the file-based pipeline
-                publishes 18081-18084), and the readiness check would then be
-                answered by that container instead of this test service.
+            port: Fixed port, or None to pick a free one.
         """
         self.host = host
         self.port = port if port is not None else free_port(host)

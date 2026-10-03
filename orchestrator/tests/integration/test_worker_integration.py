@@ -66,7 +66,6 @@ def endpoints(test_service):
     """Endpoints pointing to test service."""
     # Parse host:port from base_url
     url = test_service.base_url
-    # http://127.0.0.1:<port> -> 127.0.0.1, <port>
     host_port = url.replace("http://", "")
     host, port = host_port.split(":")
 
@@ -204,15 +203,12 @@ class TestWorkerHandlesLongRunning:
         engine.initialize_workflow("wf-long", graph)
         engine.start_workflow("wf-long")
 
-        # Process the task (will poll)
+        # Process the task 
         result = worker.process_task("wf-long", timeout=1)
 
         assert result is True
         assert engine.is_workflow_complete("wf-long")
 
-        # Verify polling actually happened by checking task progress reached 100
-        # The test service increments progress by 50 each get_status call
-        # Progress 100 means get_status was called at least twice
         import httpx
         task_id = "svc-" + list(engine._state_store._redis.keys("task:wf-long:*"))[0].decode().split(":")[-1]
         resp = httpx.get(f"{test_service.base_url}/tasks/{task_id}")

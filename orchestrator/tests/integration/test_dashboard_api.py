@@ -1,7 +1,4 @@
 """Integration tests for the dashboard routes and page.
-
-The whole API app, with the real blueprint/dockerinfo parsers, engine, breaker
-and registry on fakeredis, and a temporary logs directory.
 """
 
 import json

@@ -1,17 +1,4 @@
 """Registry of services known to the orchestrator.
-
-Sits between the parsed ``dockerinfo.json`` endpoints and the circuit breaker.
-It owns two concerns the breaker deliberately does not:
-
-* **Endpoint resolution** - which ``base_url`` a container name maps to, and
-  which workflows referenced it. Workers ask the registry, not the raw
-  ``endpoints:{workflow_id}`` hash.
-* **Aggregation** - overall status and per-status counts across every known
-  service, for the ops dashboard.
-
-Health state itself (failure counts, circuit state) remains the circuit
-breaker's responsibility; the registry delegates to it so there is exactly one
-source of truth.
 """
 
 import json
@@ -95,13 +82,6 @@ class ServiceRegistry:
         breaker: CircuitBreaker,
         engine: "WorkflowEngine | None" = None,
     ):
-        """
-        Args:
-            redis_client: Shared Redis connection.
-            breaker: Circuit breaker holding per-service health.
-            engine: Workflow engine used to resume tasks blocked on a service
-                after manual recovery. Without it, recovery only resets health.
-        """
         if redis_client is None:
             raise ValueError("redis_client is required")
         if breaker is None:
@@ -111,9 +91,7 @@ class ServiceRegistry:
         self._breaker = breaker
         self._engine = engine
 
-    # ------------------------------------------------------------------
     # internals
-    # ------------------------------------------------------------------
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -136,9 +114,7 @@ class ServiceRegistry:
     def _base_url(address: str, port: int) -> str:
         return f"http://{address}:{port}"
 
-    # ------------------------------------------------------------------
     # registration
-    # ------------------------------------------------------------------
     def register(
         self,
         service_name: str,
@@ -158,7 +134,6 @@ class ServiceRegistry:
         workflow_ids: list[str] = list(data.get("workflow_ids", []))
         if workflow_id and workflow_id not in workflow_ids:
             workflow_ids.append(workflow_id)
-            # Keep only the most recent N so the record cannot grow unbounded.
             workflow_ids = workflow_ids[-self.MAX_WORKFLOW_IDS :]
 
         record = {
@@ -172,8 +147,6 @@ class ServiceRegistry:
         }
         self._save(service_name, record)
 
-        # Mirror into the breaker so the service appears in health listings
-        # before any task has run against it.
         self._breaker.register(service_name, base_url)
 
         logger.debug(
@@ -200,9 +173,7 @@ class ServiceRegistry:
             for name, endpoint in sorted(endpoints.items())
         ]
 
-    # ------------------------------------------------------------------
     # lookup
-    # ------------------------------------------------------------------
     def get(self, service_name: str) -> RegisteredService | None:
         """Return the registered service, or None if unknown."""
         if not service_name or not service_name.strip():
@@ -241,9 +212,7 @@ class ServiceRegistry:
     def is_registered(self, service_name: str) -> bool:
         return self.get(service_name) is not None
 
-    # ------------------------------------------------------------------
     # health
-    # ------------------------------------------------------------------
     def get_health(self, service_name: str) -> ServiceHealth | None:
         """Health of a single service, or None if unknown to both stores."""
         if not service_name or not service_name.strip():
@@ -253,8 +222,6 @@ class ServiceRegistry:
         if health is not None:
             return health
 
-        # Registered but never exercised: report it as healthy rather than
-        # hiding it from the dashboard.
         service = self.get(service_name)
         if service is None:
             return None
@@ -263,8 +230,6 @@ class ServiceRegistry:
 
     def get_summary(self) -> RegistrySummary:
         """Aggregate health across every known service."""
-        # Union of both stores: a service may be registered but not yet
-        # exercised, or exercised under a name registered by another replica.
         health_by_name = {h.service_name: h for h in self._breaker.get_all_health()}
 
         for service in self.list_services():
@@ -304,8 +269,6 @@ class ServiceRegistry:
         if self._breaker.reset(service_name):
             return True
 
-        # Known to the registry but never exercised - nothing to reset, but
-        # treat it as a valid target so operators don't get a spurious 404.
         service = self.get(service_name)
         if service is None:
             return False
@@ -314,8 +277,6 @@ class ServiceRegistry:
 
     def resume_blocked_tasks(self, service_name: str) -> int:
         """Re-queue tasks blocked on a service in every workflow that used it.
-
-        Returns the number of tasks re-queued.
         """
         if not service_name or not service_name.strip():
             raise ValueError("service_name is required")

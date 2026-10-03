@@ -1,9 +1,4 @@
 """Tests for the worker daemon, the process that runs in production.
-
-The daemon is glue: it finds running workflows, loads their endpoints and
-services key from Redis, builds a Worker and loops. These tests cover that glue
-against fakeredis, plus one run of a real workflow through the real engine with
-only the HTTP client faked.
 """
 
 import json
@@ -94,16 +89,14 @@ def store_endpoints(redis_client, workflow_id, endpoints: dict) -> None:
     )
 
 
-# ----------------------------------------------------------------------
 # configuration
-# ----------------------------------------------------------------------
 class TestConfiguration:
     def test_defaults(self, daemon):
         assert daemon.verify is True
         assert daemon.blocked_retry_delay == 30.0
         assert daemon.blocked_retry_initial == 2.0
-        assert daemon.blocked_max_age == 0.0          # no limit unless configured
-        assert daemon.task_max_runtime == 3600.0      # a task may not hang forever
+        assert daemon.blocked_max_age == 0.0          
+        assert daemon.task_max_runtime == 3600.0      
         assert daemon.lease_seconds == 300.0
         assert daemon.breaker._alert_repeat == 900.0
         assert daemon.breaker._initial_reset_timeout == 5.0
@@ -170,9 +163,7 @@ class TestConfiguration:
         assert daemon.control_client._verify is False
 
 
-# ----------------------------------------------------------------------
 # endpoints
-# ----------------------------------------------------------------------
 class TestLoadEndpoints:
     def test_no_endpoints(self, daemon):
         assert daemon.load_endpoints("wf-none") == {}
@@ -199,9 +190,7 @@ class TestLoadEndpoints:
         assert daemon.load_endpoints("wf-old")["svc"].base_url == "http://svc:8080"
 
 
-# ----------------------------------------------------------------------
 # workflow discovery
-# ----------------------------------------------------------------------
 class TestGetRunningWorkflows:
     def test_only_running_workflows(self, daemon):
         store = daemon.state_store
@@ -286,9 +275,7 @@ class TestRebuildRunningIndex:
         assert daemon.get_running_workflows() == ["wf-old"]
 
 
-# ----------------------------------------------------------------------
 # services key
-# ----------------------------------------------------------------------
 class TestLoadServicesKey:
     def test_missing_key(self, daemon):
         assert daemon.load_services_key("wf-1") is None
@@ -321,9 +308,7 @@ class TestLoadServicesKey:
         )
 
 
-# ----------------------------------------------------------------------
 # processing one workflow
-# ----------------------------------------------------------------------
 class TestProcessWorkflow:
     def test_skips_workflow_without_endpoints(self, daemon):
         with patch.object(worker_daemon, "Worker") as worker_cls:
@@ -358,9 +343,7 @@ class TestProcessWorkflow:
         assert client._headers == {"Authorization": "Bearer svc-key"}
 
 
-# ----------------------------------------------------------------------
 # main loop
-# ----------------------------------------------------------------------
 class TestRunLoop:
     def stop_after(self, daemon, sleeps: int):
         """time.sleep replacement that stops the daemon after N sleeps."""
@@ -438,9 +421,7 @@ class TestMain:
             assert worker_daemon.main() == 1
 
 
-# ----------------------------------------------------------------------
 # a real workflow through the daemon
-# ----------------------------------------------------------------------
 class TestDaemonDrivesRealWorkflow:
     """Real engine, queue, state store and breaker on fakeredis; only HTTP is faked."""
 

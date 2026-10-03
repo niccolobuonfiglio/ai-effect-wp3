@@ -1,11 +1,4 @@
 """Workflow engine for orchestrating task execution.
-
-Each state transition is one Redis transaction: the keys it decides on are
-watched, its reads happen before ``MULTI`` and all its writes - task and
-workflow documents, queue, leases, dependency sets - are applied together by
-``EXEC``. A worker that dies mid-transition therefore leaves either the old or
-the new state, never a mix, and a transition that raced with another one is
-retried on the updated state.
 """
 
 import hashlib
@@ -26,9 +19,7 @@ from services.task_queue import DEFAULT_LEASE_SECONDS, RedisTaskQueue, Writer
 logger = logging.getLogger(__name__)
 
 INITIAL_INPUTS = "initial"
-# Metadata key naming the node that produced an input ref
 SOURCE_NODE_KEY = "source_node"
-# How often claim_task looks at an empty queue while waiting for a task
 CLAIM_POLL_SECONDS = 0.1
 
 
@@ -124,13 +115,11 @@ class WorkflowEngine:
                 store.write_task(tasks[node_key], pipe)
                 pipe.hset(self.graph_key(workflow_id), node_key, task_id)
 
-                # Track dependencies (tasks this task waits for)
                 for dep in graph_node.dependencies:
                     pipe.sadd(
                         self.deps_key(workflow_id, task_id), tasks[dep.key].task_id
                     )
 
-                # Track dependents (tasks waiting for this task)
                 for next_node in graph_node.next_nodes:
                     pipe.sadd(
                         self.dependents_key(workflow_id, task_id),
@@ -146,13 +135,6 @@ class WorkflowEngine:
         initial_inputs: list[DataReference] | None = None,
     ) -> None:
         """Start workflow execution by enqueueing initial tasks.
-
-        The RUNNING status and the queued start tasks are written together, so
-        a workflow is never running with nothing queued.
-
-        Args:
-            workflow_id: The workflow ID.
-            initial_inputs: Optional list of DataReferences to pass to start nodes.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -193,13 +175,6 @@ class WorkflowEngine:
 
     def claim_task(self, workflow_id: str, timeout: float = 0) -> TaskState | None:
         """Claim next available task for execution.
-
-        Waits up to ``timeout`` seconds for one (0 returns at once). Taking the
-        task off the queue, leasing it and marking it RUNNING is one
-        transaction, so a worker that dies while claiming leaves the task
-        queued, and one that dies later leaves it leased and reclaimable.
-        The inputs its predecessors stored separately are gathered into
-        ``input_refs`` at this point.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -237,8 +212,6 @@ class WorkflowEngine:
                 workflow_id, self._lease_seconds, on_claim=mark_running
             )
         except TaskNotFoundError as e:
-            # Queued, but its state is gone (e.g. the workflow was deleted
-            # meanwhile): drop it so it does not block the queue.
             logger.warning(
                 "Dropping queued task %s of workflow %s: no task state",
                 e.task_id,
@@ -263,14 +236,6 @@ class WorkflowEngine:
         output_refs: list[DataReference] | None = None,
     ) -> TaskState:
         """Mark task as completed and enqueue ready dependents.
-
-        The completion, the hand-over of outputs, the dependency updates, the
-        enqueueing of dependents that became ready and - for the last task -
-        the workflow's completion are one transaction. It watches the
-        dependents' dependency sets and queue guards and the other tasks'
-        states, so when two predecessors of a join finish together one of them
-        retries and sees the other's completion: the join is queued exactly
-        once and the workflow is completed exactly once.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -293,8 +258,6 @@ class WorkflowEngine:
             if watched:
                 pipe.watch(*watched)
 
-            # A dependent is ready once this task is its last dependency, and
-            # is queued unless its guard has already fired.
             ready = [
                 dep_id
                 for dep_id in dependents
@@ -321,9 +284,6 @@ class WorkflowEngine:
             queue.release_lease(workflow_id, task_id, client=pipe)
             queue.unschedule(workflow_id, task_id, client=pipe)
             for dep_id in dependents:
-                # Pass output refs to dependent task as input, under this
-                # task's own field so that two predecessors finishing at the
-                # same moment cannot overwrite each other.
                 if payload is not None:
                     queue.add_inputs(workflow_id, dep_id, task_id, payload, client=pipe)
                 pipe.srem(self.deps_key(workflow_id, dep_id), task_id)
@@ -334,7 +294,6 @@ class WorkflowEngine:
                 store.write_workflow(
                     store.with_workflow_status(workflow, WorkflowStatus.COMPLETED), pipe
                 )
-                # No task will call a service again: the credentials go too.
                 pipe.delete(services_key_name(workflow_id))
             return completed
 
@@ -348,11 +307,6 @@ class WorkflowEngine:
 
     def _inputs_payload(self, source_node: str, refs: list[DataReference]) -> str:
         """Serialize refs handed to a dependent, each tagged with its producer.
-
-        ``source_node`` (``container:operation``, or ``initial`` for the
-        workflow's own inputs) is written to ``metadata["source_node"]``, so a
-        service with several predecessors can tell its inputs apart instead
-        of relying on their order.
         """
         return json.dumps([
             ref.model_dump(mode="json")
@@ -411,10 +365,7 @@ class WorkflowEngine:
     def defer_task(
         self, workflow_id: str, task_id: str, reason: str, delay: float
     ) -> TaskState:
-        """Mark a task BLOCKED and re-queue it after ``delay`` seconds.
-
-        Unlike ``fail_task`` the workflow keeps running, so it can continue once
-        the blocking service is healthy again.
+        """Mark a task BLOCKED and re-queue it after delay seconds.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -446,9 +397,6 @@ class WorkflowEngine:
 
     def record_blocked_attempt(self, workflow_id: str, task_id: str) -> int:
         """Count a deferral of this task and return the count (1 for the first).
-
-        The worker uses it to grow the retry delay; the count is cleared when
-        the task completes or fails.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -466,10 +414,6 @@ class WorkflowEngine:
 
     def release_due_tasks(self, workflow_id: str) -> int:
         """Re-queue tasks that are due to run again.
-
-        Two kinds: blocked tasks whose retry delay has elapsed, and tasks whose
-        lease expired because the worker holding them died. Each goes back to
-        PENDING in the same transaction that queues it.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -496,8 +440,6 @@ class WorkflowEngine:
 
     def _back_to_pending(self, workflow_id: str, counter: str | None = None):
         """Queue hook that resets a task to PENDING as it is re-queued.
-
-        ``counter`` names the history field to add one to, e.g. ``reclaims``.
         """
         store = self._state_store
 
@@ -516,7 +458,6 @@ class WorkflowEngine:
 
     def resume_blocked_tasks(self, workflow_id: str, service_name: str) -> int:
         """Immediately re-queue tasks of a running workflow blocked on a service.
-
         Returns the number of tasks re-queued.
         """
         if not workflow_id:
@@ -541,9 +482,6 @@ class WorkflowEngine:
 
     def retry_task(self, workflow_id: str, task_id: str) -> TaskState:
         """Put a failed task back on the queue, keeping everything else.
-
-        Raises ``NotFailedError`` if the task did not fail; completed tasks are
-        never re-run this way.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -577,9 +515,6 @@ class WorkflowEngine:
 
     def resume_workflow(self, workflow_id: str) -> list[str]:
         """Re-queue every failed task of a failed workflow.
-
-        Completed tasks keep their results, so the workflow continues where it
-        stopped. Returns the task ids that were re-queued.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -623,9 +558,6 @@ class WorkflowEngine:
         self, pipe, workflow_id: str, task: TaskState
     ) -> tuple[TaskState, Writer]:
         """Reset one failed task and queue it if its dependencies are met.
-
-        Reads through ``pipe`` (before ``MULTI``) and returns the task's new
-        state and a writer that applies the reset inside the transaction.
         """
         store, queue = self._state_store, self._task_queue
         task_id = task.task_id
@@ -647,18 +579,6 @@ class WorkflowEngine:
 
     def fail_if_stalled(self, workflow_id: str) -> list[str] | None:
         """Fail a running workflow that can no longer make progress.
-
-        A workflow is stalled when it is ``running`` but nothing is queued,
-        parked or leased: no worker will ever pick anything up. Every
-        transition is atomic, so this is never a passing moment; the one way
-        the engine reaches it is an operator retrying some, but not all, of
-        several failed tasks (docs/STALLS.md). The workflow is then failed,
-        which is what its status should have said, so ``resume`` applies.
-
-        Returns None if the workflow is not stalled. Otherwise returns the
-        failed tasks that hold it; the workflow is then ``failed``. An empty
-        list means a stall with no failed task, which a consistent state
-        cannot have (``/verify`` will say what is wrong); nothing is changed.
         """
         if not workflow_id:
             raise ValueError("workflow_id is required")
@@ -669,7 +589,6 @@ class WorkflowEngine:
             queue.delayed_key(workflow_id),
             queue.processing_key(workflow_id),
         )
-        # Cheap test first: a workflow with anything scheduled is not stalled.
         if self._redis.exists(*scheduled):
             return None
 

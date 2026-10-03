@@ -12,7 +12,6 @@ from services.log_retention import prune_stale_files, start_keepalive
 
 ALERTS_LOGGER = "orchestrator.alerts"
 
-# Attributes every LogRecord has; anything else was passed via ``extra``.
 _RESERVED_ATTRS = frozenset(
     vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()
 ) | {"message", "asctime", "taskName"}
@@ -25,9 +24,6 @@ def get_alerts_logger() -> logging.Logger:
 
 class JsonFormatter(logging.Formatter):
     """Formats each record as a single-line JSON object.
-
-    Standard fields (timestamp, level, logger, message) are always present;
-    any fields passed through ``extra=`` are merged in at the top level.
     """
 
     def format(self, record: logging.LogRecord) -> str:
@@ -42,8 +38,6 @@ class JsonFormatter(logging.Formatter):
         for key, value in vars(record).items():
             if key in _RESERVED_ATTRS or key.startswith("_"):
                 continue
-            # extra fields may override the record timestamp, e.g. an alert's
-            # own event time
             payload[key] = value
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
@@ -91,24 +85,6 @@ def configure_logging(
     manage_retention: bool = True,
 ) -> logging.Logger:
     """Configure root logger with console and rotating file handlers.
-
-    Args:
-        log_dir: Directory for log files.
-        log_file: Log file name.
-        level: Logging level.
-        max_bytes: Max file size before rotation.
-        backup_count: Number of backup files to keep.
-        console: Whether to also log to console.
-        log_format: "text" or "json"; defaults to the LOG_FORMAT env var,
-            then "text".
-        alerts_file: File in ``log_dir`` receiving only alert records, always
-            as JSON lines. None disables it.
-        manage_retention: Delete files of processes that are gone (untouched
-            for ``LOG_RETENTION_DAYS``) and keep this process's own files
-            fresh; see ``services.log_retention``.
-
-    Returns:
-        Configured root logger.
     """
     os.makedirs(log_dir, exist_ok=True)
 
@@ -148,8 +124,6 @@ def configure_logging(
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 
-    # Dedicated JSON-lines alert stream for TEF monitoring. Alerts still
-    # propagate to the root handlers above.
     alerts_logger = get_alerts_logger()
     for handler in alerts_logger.handlers:
         handler.close()
@@ -166,8 +140,6 @@ def configure_logging(
         alerts_handler.setFormatter(JsonFormatter())
         alerts_logger.addHandler(alerts_handler)
 
-    # The logs directory is shared by all processes and each writes its own
-    # files, so files of recreated containers would otherwise pile up.
     if manage_retention:
         own = [name for name in (log_file, alerts_file) if name]
         prune_stale_files(log_dir, keep=set(own))

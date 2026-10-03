@@ -260,7 +260,6 @@ class TestStartWorkflow:
         engine.initialize_workflow("wf-1", graph)
         engine.start_workflow("wf-1")
 
-        # Only first node should be enqueued
         assert task_queue.queue_length("wf-1") == 1
 
     def test_empty_workflow_id_raises(self, engine):
@@ -297,7 +296,6 @@ class TestStartWorkflow:
         )
         engine.start_workflow("wf-1", initial_inputs=[initial_input])
 
-        # Both start nodes should receive the initial inputs
         task1 = engine.claim_task("wf-1", timeout=1)
         task2 = engine.claim_task("wf-1", timeout=1)
 
@@ -391,7 +389,6 @@ class TestCompleteTask:
         engine.initialize_workflow("wf-1", graph)
         engine.start_workflow("wf-1")
 
-        # Complete task A with output
         task_a = engine.claim_task("wf-1", timeout=1)
         output_ref = DataReference(
             protocol=Protocol.S3,
@@ -400,7 +397,6 @@ class TestCompleteTask:
         )
         engine.complete_task("wf-1", task_a.task_id, output_refs=[output_ref])
 
-        # Task B should receive A's output as input
         task_b = engine.claim_task("wf-1", timeout=1)
         assert len(task_b.input_refs) == 1
         assert task_b.input_refs[0].uri == "s3://bucket/a-output.json"
@@ -411,7 +407,6 @@ class TestCompleteTask:
         engine.initialize_workflow("wf-1", graph)
         engine.start_workflow("wf-1")
 
-        # Complete A and B with different outputs
         task_a = engine.claim_task("wf-1", timeout=1)
         task_b = engine.claim_task("wf-1", timeout=1)
 
@@ -425,7 +420,6 @@ class TestCompleteTask:
         engine.complete_task("wf-1", task_a.task_id, output_refs=[output_a])
         engine.complete_task("wf-1", task_b.task_id, output_refs=[output_b])
 
-        # Task C should have both A and B outputs as inputs
         task_c = engine.claim_task("wf-1", timeout=1)
         assert len(task_c.input_refs) == 2
         uris = {ref.uri for ref in task_c.input_refs}
@@ -476,7 +470,6 @@ class TestCompleteTask:
         task_a = engine.claim_task("wf-1", timeout=1)
         engine.complete_task("wf-1", task_a.task_id)
 
-        # Task B should now be enqueued
         assert task_queue.queue_length("wf-1") == 1
         task_b = engine.claim_task("wf-1", timeout=1)
         assert task_b.node_key == "service-b:Process"
@@ -487,16 +480,12 @@ class TestCompleteTask:
         engine.initialize_workflow("wf-1", graph)
         engine.start_workflow("wf-1")
 
-        # Claim and complete task A
         task_a = engine.claim_task("wf-1", timeout=1)
         engine.complete_task("wf-1", task_a.task_id)
 
-        # Task C should not be enqueued yet (waiting for B)
-        # Only task B should be in queue
         task_b = engine.claim_task("wf-1", timeout=1)
         assert task_b is not None
 
-        # After completing B, C should be enqueued
         engine.complete_task("wf-1", task_b.task_id)
         task_c = engine.claim_task("wf-1", timeout=1)
         assert task_c.node_key == "service-c:Process"
@@ -660,12 +649,10 @@ class TestFanOutWorkflow:
         engine.initialize_workflow("wf-fanout", graph)
         engine.start_workflow("wf-fanout")
 
-        # Execute A
         task_a = engine.claim_task("wf-fanout", timeout=1)
         assert task_a.node_key == "service-a:Process"
         engine.complete_task("wf-fanout", task_a.task_id)
 
-        # Both B and C should be enqueued
         assert task_queue.queue_length("wf-fanout") == 2
 
 
@@ -678,14 +665,12 @@ class TestFanInWorkflow:
         engine.initialize_workflow("wf-fanin", graph)
         engine.start_workflow("wf-fanin")
 
-        # Execute A and B (parallel start nodes)
         task1 = engine.claim_task("wf-fanin", timeout=1)
         task2 = engine.claim_task("wf-fanin", timeout=1)
 
         engine.complete_task("wf-fanin", task1.task_id)
         engine.complete_task("wf-fanin", task2.task_id)
 
-        # C should now be ready
         task_c = engine.claim_task("wf-fanin", timeout=1)
         assert task_c.node_key == "service-c:Process"
         engine.complete_task("wf-fanin", task_c.task_id)
@@ -751,7 +736,6 @@ class TestBlockedTasks:
         assert state_store.get_task(wf, remaining[0]).node_key.startswith("service-b:")
 
     def test_resume_does_not_match_name_prefix(self, engine):
-        # "service-a" must not resume tasks of a service called "service-ab"
         graph = ExecutionGraph()
         node = create_graph_node("service-ab")
         graph.add_node(node)
@@ -966,8 +950,6 @@ class TestConcurrentFanIn:
         task_a = engine.claim_task("wf-1", timeout=1)
         task_b = engine.claim_task("wf-1", timeout=1)
 
-        # B finishes entirely while A is between its own steps: A's later write
-        # must not drop B's inputs.
         engine.complete_task(
             "wf-1",
             task_b.task_id,
@@ -1481,7 +1463,7 @@ class TestStallDetection:
         """A lost queue entry: the state is damaged, so nothing is changed."""
         engine.initialize_workflow("wf-1", create_single_node_graph())
         engine.start_workflow("wf-1")
-        task_queue.dequeue_task("wf-1")  # the entry is gone, the task still pending
+        task_queue.dequeue_task("wf-1")  
 
         assert engine.fail_if_stalled("wf-1") == []
         assert engine.get_workflow_status("wf-1").status == WorkflowStatus.RUNNING

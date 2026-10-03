@@ -1,16 +1,4 @@
 """Shared helpers for the system tests.
-
-They all talk to the same two live stacks - the orchestrator from
-``orchestrator/`` and the ``file_based_energy_pipeline`` use case - so the
-addresses, the compose files and the small API wrappers live here instead of
-being repeated in every module.
-
-Settings (environment):
-    ORCHESTRATOR_URL      default http://localhost:18000
-    ORCHESTRATOR_API_KEY  sent as bearer token when set
-    SERVICE_API_KEY       submitted with each workflow when set, so the
-                          orchestrator can call services that require it
-    REDIS_URL             default redis://localhost:16379/0
 """
 
 import json
@@ -29,19 +17,13 @@ USE_CASE_COMPOSE = USE_CASE / "docker-compose.yml"
 
 API = os.environ.get("ORCHESTRATOR_URL", "http://localhost:18000").rstrip("/")
 API_KEY = os.environ.get("ORCHESTRATOR_API_KEY") or None
-# docker compose passes the same variable to the pipeline services, which then
-# refuse calls without it.
 SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY") or None
-# The orchestrator's Redis, published by docker-compose.yml.
 REDIS_URL = os.environ.get("SYSTEM_TEST_REDIS_URL", "redis://localhost:16379/0")
 
-# The service taken down in outage tests, as the orchestrator and as Docker
-# Compose name it.
 SERVICE = "data_analyzer1"
 COMPOSE_SERVICE = "data-analyzer"
 SERVICE_HEALTH_URL = "http://localhost:18083/health"
 
-# Every service of the pipeline: orchestrator name -> host health URL.
 PIPELINE = {
     "input_provider1": "http://localhost:18081/health",
     "data_generator1": "http://localhost:18082/health",
@@ -156,12 +138,8 @@ def require_live_stack() -> None:
     missing = {"input-provider", "data-generator", "data-analyzer", "report-generator"} - set(running)
     assert not missing, f"use-case services not running: {sorted(missing)}"
 
-    # A container can be "running" before its server accepts connections. A
-    # workflow submitted in that window fails its first call, which opens the
-    # circuit for up to a minute and slows every later test.
     for name, url in PIPELINE.items():
         wait_for(lambda url=url: answers(url), timeout=60, what=f"{name} to answer")
 
-    # Start from a clean breaker: circuits opened by earlier runs live in Redis.
     for name in PIPELINE:
         api("POST", f"/orchestrator/health/services/{name}/recover")

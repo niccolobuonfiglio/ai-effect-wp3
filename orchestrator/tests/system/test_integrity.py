@@ -1,14 +1,4 @@
 """Data integrity across the pipeline, against the live stacks.
-
-The file-based services state the checksum and size of every file they write,
-the orchestrator hands both on unchanged, and the next service checks the file
-before reading it. These tests show that chain on the real pipeline:
-
-* every output reference carries a checksum and a size,
-* a file changed between two tasks is refused by the service that reads it,
-  and the workflow fails instead of producing a report from altered data.
-
-Settings (environment): see ``live.py``.
 """
 
 import pytest
@@ -46,7 +36,6 @@ def test_every_output_carries_checksum_and_size():
         assert output["checksum"].startswith("sha256:"), node_key
         assert output["size_bytes"] > 0, node_key
 
-    # ...and the next task received them unchanged
     produced = tasks(wf)["data_generator1:GenerateData"]["output_refs"][0]
     (received,) = tasks(wf)["data_analyzer1:AnalyzeData"]["input_refs"]
     assert received["checksum"] == produced["checksum"]
@@ -58,15 +47,11 @@ def test_file_changed_between_tasks_is_refused():
     compose(USE_CASE_COMPOSE, "stop", COMPOSE_SERVICE)
     try:
         wf = submit()
-        # The generator has written its file; the analyzer cannot run yet
         wait_for(
             lambda: tasks(wf)[blocked]["status"] == "blocked",
             timeout=60,
             what=f"{blocked} to be blocked",
         )
-        # The file the generator wrote for this workflow (one folder per
-        # workflow). Alter one value without changing its size, so only the
-        # checksum can notice: 120.5 -> 999.9 on the first data row
         generated = tasks(wf)["data_generator1:GenerateData"]["output_refs"][0]["uri"]
         compose(
             USE_CASE_COMPOSE, "exec", "-T", "data-generator",

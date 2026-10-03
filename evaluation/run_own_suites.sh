@@ -1,22 +1,9 @@
 #!/bin/bash
 # Layer 2 of the evaluation: own test suites, crossed with both code versions.
 #
-#   evaluation/run_own_suites.sh <out-dir> [levels]     levels default: "unit integration"
-#
-#   cell               tests from   code under test   answers
-#   old-on-old         OLD          OLD               baseline suite size, pass rate, coverage
-#   new-on-new         NEW          NEW               same for NEW
-#   old-on-new         OLD          NEW               RQ7 non-regression: does NEW keep OLD's contract?
-#   diff-on-old        differential OLD               should FAIL: the defects exist in OLD
-#   diff-on-new        differential NEW               should PASS: the defects are fixed
-#
-# Every cell runs with the same interpreter (orchestrator/.venv), so the only
-# difference between cells is the code. Results: <out>/suites/<cell>/junit.xml,
-# coverage.json and pytest.log. Integration tests need Docker (testcontainers).
+#   evaluation/run_own_suites.sh <out-dir> [levels]     
 set -uo pipefail
 
-# Both versions read these at import time; a key left in the shell turns every
-# test that expects an open API into a 401.
 unset ORCHESTRATOR_API_KEY SERVICE_API_KEY ORCHESTRATOR_SECRET
 
 OUT="${1:?usage: run_own_suites.sh <out-dir> [levels]}"
@@ -26,9 +13,7 @@ NEW_ROOT="${EVAL_NEW_ROOT:-$(cd "$HERE/.." && pwd)}"
 OLD_ROOT="${EVAL_OLD_ROOT:-$(cd "$NEW_ROOT/.." && pwd)/oldCode/ai-effect-wp3}"
 PY="${EVAL_PYTHON:-$NEW_ROOT/orchestrator/.venv/bin/python}"
 WORK="$OUT/suites/work"
-# OLD's integration tests start their test service on fixed ports 18081/18082
-# (NEW picks free ports). If a use-case stack holds them, OLD's tests talk to
-# the wrong service and fail for reasons unrelated to the code.
+
 busy=$(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -oE ':(1808[1-4])$' | sort -u | tr '\n' ' ')
 if [ -n "$busy" ]; then
     echo "ports in use:$busy - stop the use-case stacks first, e.g." >&2
@@ -40,8 +25,6 @@ mkdir -p "$WORK"
 OUT="$(cd "$OUT" && pwd)"
 WORK="$(cd "$WORK" && pwd)"
 
-# A throwaway tree: tests from one version, src (symlinked) from the other.
-# The suites' conftest puts ../src on sys.path, so this is all it takes.
 tree() {  # name tests_root src_root
     local dir="$WORK/$1"
     rm -rf "$dir" && mkdir -p "$dir"

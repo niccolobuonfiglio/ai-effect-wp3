@@ -1,26 +1,4 @@
 """Verification of a workflow's state in Redis, at runtime.
-
-The engine promises a set of properties after every transition (see
-docs/PROPERTY_TESTING.md, where the same properties are checked on generated
-step sequences). This module checks them on a real workflow, on demand
-(``GET /workflows/{id}/verify``) and when a workflow completes. It catches
-what no single transition can: state damaged afterwards, for example writes
-lost when Redis crashed inside its one-second fsync window, or a key edited by
-hand.
-
-All keys of the workflow are read in one ``MULTI``/``EXEC`` block, so the
-checks see one consistent moment even while workers are writing.
-
-Checks (docs/VERIFICATION.md):
-
-* ``status``        the workflow's status agrees with its tasks and the running index
-* ``placement``     every task is in exactly the one place its status implies
-* ``dependencies``  each task waits exactly for its predecessors that have not completed
-* ``handover``      each completed predecessor's outputs were handed to its dependents unchanged
-* ``inputs``        each claimed task received exactly what was handed to it
-* ``bookkeeping``   retry counts exist only for tasks that can still be deferred
-* ``history``       each task's counters add up (claims cover deferrals and reclaims)
-* ``cleanup``       a completed workflow left no scheduling state and no services key
 """
 
 import json
@@ -47,9 +25,9 @@ class Snapshot:
 
     workflow: WorkflowState
     tasks: dict[str, TaskState]  # task id -> state
-    predecessors: dict[str, set[str]]  # task id -> its predecessors' task ids
-    waiting_for: dict[str, set[str]]  # task id -> its dependency set
-    handed: dict[str, dict[str, list[dict]]]  # task id -> producer -> refs handed to it
+    predecessors: dict[str, set[str]]  
+    waiting_for: dict[str, set[str]]  
+    handed: dict[str, dict[str, list[dict]]]  
     queue: list[str]
     parked: set[str]
     leased: set[str]
@@ -57,7 +35,7 @@ class Snapshot:
     blocked_since: set[str]
     in_running_index: bool
     has_services_key: bool
-    leftovers: list[str] = field(default_factory=list)  # scheduling keys that exist
+    leftovers: list[str] = field(default_factory=list)  
 
 
 @dataclass
@@ -81,9 +59,7 @@ class WorkflowVerifier:
         self._queue = engine.task_queue
         self._redis = engine.redis
 
-    # ------------------------------------------------------------------
     # reading
-    # ------------------------------------------------------------------
     def snapshot(self, workflow_id: str) -> Snapshot:
         """Read every key of the workflow in one transaction.
 
@@ -150,9 +126,7 @@ class WorkflowVerifier:
         return check(self.snapshot(workflow_id))
 
 
-# ----------------------------------------------------------------------
 # the checks: pure functions of a snapshot
-# ----------------------------------------------------------------------
 def check(snap: Snapshot) -> list[CheckResult]:
     """Every check, in the order of CHECKS, with the problems each found."""
     return [
@@ -272,10 +246,6 @@ def _bookkeeping(snap: Snapshot):
 
 def _history(snap: Snapshot):
     """Every claim ends in a deferral, a reclaim, a failure or the completion,
-    or is still running; failures from a running task are at most the retries
-    (plus the current failure). So, per task:
-
-        0 <= claims - deferrals - reclaims - [running or completed] <= retries + [failed]
     """
     for t, task in snap.tasks.items():
         open_claim = int(task.status in (TaskStatus.RUNNING, TaskStatus.COMPLETED))

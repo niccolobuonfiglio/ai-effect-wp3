@@ -1,45 +1,4 @@
 """Property-based test of the workflow engine as a state machine.
-
-Hypothesis generates a workflow with a random dependency graph and then a
-random sequence of the things that happen to it in production: workers claim,
-complete, fail and defer tasks, leases expire, polls re-queue what is due, an
-operator recovers a service, retries a task or resumes the workflow. Beside
-the engine runs a small model of what each task's status must be. After every
-step the state in Redis is compared with the model and checked against the
-properties the engine promises (docs/PROPERTY_TESTING.md lists them):
-
-* every task is in exactly one place - waiting for its dependencies, queued
-  once, parked for a retry, or leased - and a finished task is in none;
-* the workflow is in the running index exactly while it is running, completed
-  exactly when all its tasks are, and keeps its services key until then;
-* a task receives one labelled input per predecessor that produced one;
-* a second workflow's keys are never touched (compared when the run ends).
-
-Three kinds of step go beyond calling the engine in sequence:
-
-* **crash**: a write of the transition raises, as when the worker dies
-  mid-transition; Redis must then be exactly as it was before;
-* **race**: a second worker's transition runs between another one's reads and
-  its ``EXEC``; the result must be that of running the two one after the other;
-* **nothing to do**: in every state, the calls that have nothing to act on -
-  claiming from an empty queue, polling with nothing due, retrying or resuming
-  something that did not fail - must say so and change nothing.
-
-When a run ends, the workflow is driven to completion from wherever the
-sequence left it, so every reachable state is also shown not to be a dead end.
-
-Every step acts as the rightful holder of the task: a worker that completes a
-task *after* its lease was given to another worker (at-least-once execution,
-docs/SCHEDULING.md section 4) is not generated.
-
-This module runs on fakeredis. The same machine runs on a real Redis in
-``tests/integration/test_engine_state_machine_redis.py``, which is stricter
-about races: fakeredis aborts a transaction in cases where Redis would let it
-through.
-
-``ENGINE_FUZZ_EXAMPLES`` sets the number of generated sequences (default 50).
-A failure prints the steps of a failing sequence, shortened as far as
-Hypothesis manages within its time limit (up to five minutes).
 """
 
 import os
@@ -76,32 +35,25 @@ from services.workflow_engine import (
 )
 from tests.unit.test_workflow_engine import create_graph_node
 
-# One id is a prefix of the other, so a key pattern that is too wide would show.
 WF = "wf-1"
 BYSTANDER = "wf-10"
 
 MAX_TASKS = 6
-# A deferred task is either due at the next poll or not for a long time.
 DUE_NOW, NOT_DUE = 0, 3600
 
 PENDING, RUNNING, BLOCKED = TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED
 COMPLETED, FAILED = TaskStatus.COMPLETED, TaskStatus.FAILED
 
-# For each task, which of the earlier tasks it depends on: always acyclic.
 dependency_graphs = st.integers(1, MAX_TASKS).flatmap(
     lambda size: st.tuples(
         *(st.frozensets(st.integers(0, max(0, i - 1)), max_size=i) for i in range(size))
     )
 )
-# Two completions at once are the race with the most to get wrong.
 outcomes = st.sampled_from(["complete", "complete", "complete", "fail"])
 
 
 def dies_at(*writes: str):
     """Mostly no crash; otherwise the write at which the worker dies.
-
-    ``writes`` are methods of the state store (``write_*``) or the task queue
-    that the transition calls between ``MULTI`` and ``EXEC``.
     """
     return st.sampled_from([None, None, None, *writes])
 
@@ -158,9 +110,7 @@ class EngineMachine(RuleBasedStateMachine):
         """A new connection to this run's own, empty database."""
         return fakeredis.FakeRedis(server=self._server, decode_responses=True)
 
-    # ------------------------------------------------------------------
     # reading Redis and the model
-    # ------------------------------------------------------------------
     def snapshot(self, workflow_id: str = WF, index: bool = True) -> dict:
         """Every key of a workflow and its content, and the running index."""
         keys = sorted(
@@ -211,18 +161,10 @@ class EngineMachine(RuleBasedStateMachine):
     def held(self) -> list[str]:
         return [t for t in self.having(RUNNING) if not self.tasks[t].lease_expired]
 
-    # ------------------------------------------------------------------
     # crash injection
-    # ------------------------------------------------------------------
     @contextmanager
     def transition(self, crash: str | None, one_per_task: tuple[str, ...] | None = None):
         """Run an engine call that may die at the write named ``crash``.
-
-        The body calls the engine and then updates the model, so a crash skips
-        the model update. Redis must then hold what it held before. A call
-        that makes one transaction per task (``one_per_task``) may have moved
-        some of those tasks; each must be either where it was or fully moved.
-        A transition that never reaches the write simply succeeds.
         """
         if crash is None:
             yield
@@ -243,9 +185,7 @@ class EngineMachine(RuleBasedStateMachine):
                 if status == PENDING:
                     self._requeued(task_id)
 
-    # ------------------------------------------------------------------
     # model updates
-    # ------------------------------------------------------------------
     def _claimed(self, claimed: TaskState | None) -> None:
         queued = self.queued()
         if not queued:
@@ -292,13 +232,10 @@ class EngineMachine(RuleBasedStateMachine):
         self.tasks[task_id].retries += 1
         self.workflow = WorkflowStatus.RUNNING
 
-    # ------------------------------------------------------------------
     # submission
-    # ------------------------------------------------------------------
     @initialize(dependencies=dependency_graphs, initial_inputs=st.booleans())
     def submit(self, dependencies, initial_inputs):
         graph = ExecutionGraph()
-        # svc-1, svc-10, svc-100, ...: each name is a prefix of the next
         nodes = [create_graph_node("svc-1" + "0" * i) for i in range(len(dependencies))]
         for node, before in zip(nodes, dependencies):
             for i in before:
@@ -327,9 +264,7 @@ class EngineMachine(RuleBasedStateMachine):
         self.initial_inputs = initial_inputs
         self.bystander = self.snapshot(BYSTANDER, index=False)
 
-    # ------------------------------------------------------------------
     # what workers do
-    # ------------------------------------------------------------------
     @precondition(lambda self: self.queued())
     @rule(crash=dies_at("write_task", "lease"))
     def claim(self, crash):
@@ -371,7 +306,6 @@ class EngineMachine(RuleBasedStateMachine):
         """The task's service is unavailable: count the attempt, then park it."""
         task_id = data.draw(st.sampled_from(self.having(RUNNING)))
         task = self.tasks[task_id]
-        # As the worker does; these two are not part of the transition.
         assert self.engine.record_blocked_attempt(WF, task_id) == task.attempts + 1
         task.attempts += 1
         assert self.engine.blocked_age(WF, task_id) >= 0
@@ -407,9 +341,7 @@ class EngineMachine(RuleBasedStateMachine):
             for task_id in due:
                 self._requeued(task_id)
 
-    # ------------------------------------------------------------------
     # what operators do
-    # ------------------------------------------------------------------
     @precondition(lambda self: self.having(BLOCKED))
     @rule(data=st.data(), crash=dies_at("write_task", "enqueue_task"))
     def recover_service(self, data, crash):
@@ -474,9 +406,7 @@ class EngineMachine(RuleBasedStateMachine):
                 self.workflow = WorkflowStatus.FAILED
                 event("a stalled workflow was failed")
 
-    # ------------------------------------------------------------------
     # two workers at the same moment
-    # ------------------------------------------------------------------
     @contextmanager
     def meanwhile(self, other_worker):
         """Run ``other_worker`` between the next transition's reads and its EXEC."""
@@ -498,8 +428,6 @@ class EngineMachine(RuleBasedStateMachine):
     def two_tasks_finish_at_once(self, data, first, second, produce):
         """One worker's completion or failure lands inside another's."""
         pairs = list(permutations(self.having(RUNNING), 2))
-        # Two predecessors of the same task, when there are any: their
-        # completions decide together whether that task is queued.
         feeding_one_task = [
             (a, b)
             for a, b in pairs
@@ -519,9 +447,7 @@ class EngineMachine(RuleBasedStateMachine):
             self._claimed(self.engine.claim_task(WF))
         event("two workers claimed at once")
 
-    # ------------------------------------------------------------------
     # properties
-    # ------------------------------------------------------------------
     @invariant()
     def redis_matches_the_model_and_is_consistent(self):
         if self.workflow is None:  # not submitted yet
@@ -546,7 +472,6 @@ class EngineMachine(RuleBasedStateMachine):
                 p for p in task.predecessors if states[p].status != COMPLETED
             }, where
 
-            # Exactly one place: (times queued, parked, leased).
             place = (queue.count(task_id), task_id in delayed, task_id in leased)
             expected = {
                 PENDING: (0 if waiting_for else 1, False, False),
@@ -557,13 +482,10 @@ class EngineMachine(RuleBasedStateMachine):
             }[state.status]
             assert place == expected, f"{where}: queued/parked/leased is {place}"
 
-            # Retry bookkeeping is kept while the task may be deferred again
-            # and dropped when it ends.
             assert int(attempts.get(task_id, 0)) == task.attempts, where
             assert (task_id in blocked_since) == (task.attempts > 0), where
 
             assert (state.error is not None) == (state.status in (BLOCKED, FAILED)), where
-            # The history counts each transition once, crashes and races included.
             history = (state.claims, state.reclaims, state.deferrals, state.retries)
             modelled = (task.claims, task.reclaims, task.deferrals, task.retries)
             assert history == modelled, f"{where}: history {history}, the model expects {modelled}"
@@ -601,8 +523,6 @@ class EngineMachine(RuleBasedStateMachine):
             assert self.engine.claim_task(WF) is None
         if not self.due():
             assert self.engine.release_due_tasks(WF) == 0
-        # Recovering a service resumes nothing unless a task is blocked on it
-        # and the workflow is running.
         resumable = BLOCKED if self.workflow == WorkflowStatus.RUNNING else None
         for task_id, task in self.tasks.items():
             if task.status != resumable:
@@ -617,11 +537,6 @@ class EngineMachine(RuleBasedStateMachine):
 
     @invariant()
     def the_runtime_verifier_finds_nothing_wrong(self):
-        """docs/VERIFICATION.md: no false alarm in any reachable state.
-
-        The verifier checks the same properties from Redis alone, without the
-        model, so this is also a check that it needs nothing the model knows.
-        """
         if self.workflow is None:
             return
         for workflow_id in (WF, BYSTANDER):
@@ -633,20 +548,12 @@ class EngineMachine(RuleBasedStateMachine):
     @invariant()
     def a_running_workflow_has_something_to_wait_for(self):
         """Running means that a task is queued, parked or leased.
-
-        One exception: after two tasks failed and an operator retried only
-        one, the workflow is running with nothing scheduled and the other task
-        failed (found by this test, docs/PROPERTY_TESTING.md section 7). The
-        transitions still allow it; the watchdog step then fails the workflow
-        (docs/STALLS.md), and its rule checks that it does.
         """
         if self.workflow != WorkflowStatus.RUNNING:
             return
         assert self.queued() or self.having(RUNNING, BLOCKED, FAILED)
 
-    # ------------------------------------------------------------------
     # every reachable state can still be completed
-    # ------------------------------------------------------------------
     def teardown(self):
         if self.workflow is None:
             return
@@ -673,11 +580,8 @@ class EngineMachine(RuleBasedStateMachine):
 
         assert self.workflow == WorkflowStatus.COMPLETED, "the workflow could not be completed"
         self.redis_matches_the_model_and_is_consistent()
-        # Checked once, here, because reading a whole workflow back after
-        # every step would dominate the run time.
         untouched = self.snapshot(BYSTANDER, index=False) == self.bystander
         assert untouched, "the other workflow changed"
-        # Nothing of the scheduling is left behind.
         for key in (
             self.queue.queue_key(WF),
             self.queue.delayed_key(WF),

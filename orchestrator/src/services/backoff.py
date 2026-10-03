@@ -1,9 +1,4 @@
 """Exponential backoff shared by task retries and the circuit breaker.
-
-A fixed delay makes a short blip as expensive as a real outage: a service that
-is back after two seconds still costs the full retry and reset delay. Starting
-small and doubling up to a cap keeps short interruptions cheap, while a long
-outage still settles at the gentle, capped rate.
 """
 
 # 2**62 is far beyond any cap in seconds; stop growing the exponent there.

@@ -1,8 +1,4 @@
 """The Redis benchmark itself, run small on fakeredis.
-
-The numbers mean nothing here; what is checked is that every scenario runs,
-that its outcome checks hold, and that retries are counted - so the benchmark
-keeps working as the engine changes.
 """
 
 import fakeredis
@@ -42,7 +38,6 @@ def test_every_scenario_runs_and_leaves_the_database_empty(connect):
 
     # one completion per predecessor, one claim per task, in every round
     assert [row["transactions"] for row in report["fan_in"]] == [2, 4]
-    # a claim on the emptied queue ends each worker's loop
     assert [row["transactions"] for row in report["claim_race"]] == [6 + 1, 6 + 3]
     for row in report["worker_pool"]:
         assert row["tasks"] == 3 * SMALL.chain_size

@@ -1,8 +1,4 @@
 """The workflow verifier: quiet on healthy workflows, loud on damaged ones.
-
-Healthy states come from the real engine. Damage is done by editing one key
-afterwards, the way a lost write or a hand edit would; each check must name
-the damage it is responsible for, and only the checks concerned may fail.
 """
 
 import json
@@ -58,9 +54,7 @@ def run_to_completion(engine, graph, redis_client=None):
         engine.complete_task("wf-1", task.task_id, [ref(task.task_id)])
 
 
-# ----------------------------------------------------------------------
 # healthy workflows pass every check
-# ----------------------------------------------------------------------
 class TestHealthyWorkflows:
     def test_all_checks_are_reported(self, engine, verifier):
         engine.initialize_workflow("wf-1", create_single_node_graph())
@@ -120,9 +114,7 @@ class TestHealthyWorkflows:
         assert {k: redis_client.dump(k) for k in redis_client.keys("*")} == before
 
 
-# ----------------------------------------------------------------------
 # each kind of damage is named by its check
-# ----------------------------------------------------------------------
 class TestDamageIsFound:
     @pytest.fixture
     def done(self, engine, redis_client):
@@ -178,7 +170,7 @@ class TestDamageIsFound:
         redis_client.hset(key, done[0], json.dumps(payload))
         problems = failing(verifier)
         assert "differ from what it produced" in problems["handover"][0]
-        assert "inputs" in problems  # what the task received no longer matches either
+        assert "inputs" in problems  
 
     def test_handover_lost(self, engine, verifier, redis_client, done):
         redis_client.hdel(engine.task_queue.inputs_key("wf-1", done[2]), done[1])

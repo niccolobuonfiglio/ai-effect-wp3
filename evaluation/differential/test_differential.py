@@ -1,26 +1,8 @@
 """Differential tests: the same behavioural checks, run on OLD and on NEW.
 
-Each test states a property that the orchestrator *should* have, using only
+Each test states a property that the orchestrator should have, using only
 the API that both versions share (WorkflowEngine, RedisTaskQueue, Worker, and
 the REST API built by OrchestratorAPI).
-Run on NEW they should pass. Run on OLD they should fail, which shows the test
-detects a real defect of the original code and does not merely exercise
-new code. Which source tree is tested is decided by PYTHONPATH (see
-run_own_suites.sh).
-
-Where NEW added an optional constructor argument (a lease, a runtime limit),
-it is passed only if the constructor accepts it, so OLD runs with its own
-defaults, as it does in production.
-
-Environment:
-    DIFF_REDIS_URL  a real Redis to use instead of fakeredis (the fan-in race
-                    shows up more readily with real network round trips)
-    DIFF_TRIALS     repetitions of the fan-in race (default 300)
-    DIFF_JITTER_MS  random delay of 0..N ms before every Redis command
-                    (default 2). Jitter injection widens the race window the
-                    way network latency and scheduling noise do in production;
-                    without it the window is too narrow to hit in a test.
-    DIFF_OUT        directory for measured rates (differential.json)
 """
 
 import base64
@@ -57,9 +39,7 @@ JITTER = float(os.environ.get("DIFF_JITTER_MS", "2")) / 1000
 HANG = 5.0  # seconds after which a call is considered to hang
 
 
-# ----------------------------------------------------------------------
 # helpers
-# ----------------------------------------------------------------------
 def accepts(cls, name: str) -> bool:
     return name in inspect.signature(cls.__init__).parameters
 
@@ -176,9 +156,7 @@ def record(name: str, value) -> None:
     path.write_text(json.dumps(data, indent=2))
 
 
-# ----------------------------------------------------------------------
-# RQ4: concurrency
-# ----------------------------------------------------------------------
+# Concurrency
 def test_fan_in_race_loses_no_input_and_queues_join_once():
     """Two predecessors finishing together: the join gets both inputs, once.
 
@@ -233,9 +211,7 @@ def test_fan_in_race_loses_no_input_and_queues_join_once():
     )
 
 
-# ----------------------------------------------------------------------
-# RQ1/RQ4: liveness
-# ----------------------------------------------------------------------
+# Liveness
 def test_claim_on_empty_queue_does_not_block_the_worker():
     """The daemon polls with timeout=0; an empty queue must return at once.
 
@@ -311,9 +287,7 @@ def test_service_that_never_finishes_does_not_hold_a_worker_forever():
     assert tasks[0].status == TaskStatus.FAILED
 
 
-# ----------------------------------------------------------------------
-# RQ8: data-exchange contracts (PROTOCOL.md, Amendment 1)
-# ----------------------------------------------------------------------
+# Data-exchange contracts 
 def chain_graph() -> ExecutionGraph:
     """A -> B."""
     graph = ExecutionGraph()

@@ -22,14 +22,12 @@ class TaskStatus(str, Enum):
 
     PENDING = "pending"
     RUNNING = "running"
-    # Waiting for an unhealthy service; re-queued automatically after a delay
-    # or immediately when the service is manually recovered.
+    # Waiting for an unhealthy service.
     BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
 
 
-# A task's history (TaskState), shown per task and added up per workflow
 HISTORY_COUNTERS = ("claims", "reclaims", "deferrals", "retries")
 
 
@@ -55,19 +53,14 @@ class TaskState(BaseModel):
     input_refs: list[DataReference] = []
     output_refs: list[DataReference] = []
     error: str | None = None
-    # How the task got where it is (docs/SCHEDULING.md section 12). Counted
-    # in the same transaction as the transition, and never reset.
-    claims: int = 0  # times a worker took it
-    reclaims: int = 0  # times it was taken back from a worker whose lease expired
-    deferrals: int = 0  # times it was parked because its service was unavailable
-    retries: int = 0  # times an operator re-queued it after it failed
+    claims: int = 0  
+    reclaims: int = 0  
+    deferrals: int = 0  
+    retries: int = 0  
 
 
 def history_totals(tasks) -> dict:
     """The tasks' histories added up, and whether the workflow ran clean.
-
-    Clean means one claim per task and nothing else: nothing was deferred,
-    taken back from a worker or retried.
     """
     tasks = list(tasks)
     totals = {c: sum(getattr(t, c) for t in tasks) for c in HISTORY_COUNTERS}

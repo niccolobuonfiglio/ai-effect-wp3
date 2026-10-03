@@ -129,9 +129,7 @@ class CircuitBreaker:
         self._degraded_threshold = degraded_threshold
         self._alert_repeat = alert_repeat_seconds
 
-    # ------------------------------------------------------------------
     # internals
-    # ------------------------------------------------------------------
     def _load(self, service_name: str) -> dict:
         raw = self._redis.hget(REGISTRY_KEY, service_name)
         if raw is None:
@@ -189,9 +187,7 @@ class CircuitBreaker:
             },
         )
 
-    # ------------------------------------------------------------------
     # public API
-    # ------------------------------------------------------------------
     def register(self, service_name: str, base_url: str) -> None:
         """Register a service so it appears in health listings before any call."""
         if not service_name or not service_name.strip():
@@ -301,9 +297,6 @@ class CircuitBreaker:
             if streak == 1:
                 data["down_since"] = now  # start of this outage
 
-            # One alert when the service goes down, then at most one reminder
-            # per alert_repeat_seconds while it stays down: a long outage would
-            # otherwise emit one alert per failed probe.
             last_alert = float(data.get("last_alert_ts", 0))
             reminder_due = bool(self._alert_repeat) and (
                 opened_ts - last_alert >= self._alert_repeat
@@ -415,9 +408,7 @@ class CircuitBreaker:
             raise ValueError("service_name is required")
         return bool(self._redis.hdel(REGISTRY_KEY, service_name))
 
-    # ------------------------------------------------------------------
     # mapping
-    # ------------------------------------------------------------------
     def _to_health(self, name: str, data: dict) -> ServiceHealth:
         count = int(data.get("failure_count", 0))
         state = data.get("state", STATE_CLOSED)

@@ -46,37 +46,6 @@ class Worker:
         stall_alert_repeat: float = 900.0,
     ):
         """Initialize worker with dependencies.
-
-        Args:
-            engine: Workflow engine for claiming and completing tasks.
-            client: HTTP client for service control endpoints.
-            endpoints: Mapping of container name to service endpoint.
-            poll_interval: Seconds between status polls for running tasks.
-            breaker: Optional circuit breaker tracking per-service health.
-                When set, tasks for unavailable services are parked (BLOCKED)
-                instead of failing the workflow.
-            blocked_retry_delay: Longest wait before a BLOCKED task is
-                re-queued.
-            blocked_retry_initial: Wait before the first retry; it doubles on
-                each further deferral, up to ``blocked_retry_delay``. None
-                means no backoff: every wait is ``blocked_retry_delay``.
-            blocked_max_age: Fail a task that has been blocked for longer than
-                this many seconds, instead of retrying it forever. None or 0
-                means no limit.
-            task_max_runtime: Fail a task whose service keeps reporting
-                "running" for longer than this many seconds. None or 0 means
-                no limit. The service answered, so this does not count against
-                the circuit breaker.
-            policy: Limits on the data references a service may return.
-            verifier: When set, a workflow this worker completes is checked
-                against the engine's properties, and a failed check raises a
-                WORKFLOW_VERIFICATION_FAILED alert (docs/VERIFICATION.md).
-            stall_detection: When a poll finds nothing to claim, check whether
-                the workflow is stalled - running with nothing queued, parked
-                or leased - and fail it with a WORKFLOW_STALLED alert
-                (docs/STALLS.md).
-            stall_alert_repeat: Seconds before the alert for a stall that
-                cannot be resolved is repeated.
         """
         if engine is None:
             raise ValueError("engine is required")
@@ -117,8 +86,6 @@ class Worker:
         if not workflow_id or not workflow_id.strip():
             raise ValueError("workflow_id is required")
 
-        # Tasks parked on an unhealthy service become claimable again once
-        # their retry delay has elapsed.
         self._engine.release_due_tasks(workflow_id)
 
         # Claim task from queue
@@ -135,9 +102,6 @@ class Worker:
             endpoint = self._get_endpoint(container_name)
             base_url = endpoint.base_url
 
-            # Circuit breaker gate: skip the call entirely if the service is
-            # known to be down, until an operator recovers it or the reset
-            # timeout allows a probe.
             if self._breaker is not None:
                 self._breaker.register(container_name, base_url)
                 if not self._breaker.allow(container_name):
@@ -170,9 +134,7 @@ class Worker:
                     return True
                 raise
 
-            # Handle response. A failure reported by the service proves it is
-            # reachable, so it fails the task but does not count against the
-            # breaker (e.g. a crashed downstream dependency of the service).
+            # Handle response
             if response.status == "failed":
                 error = response.error or "Service returned failed status"
                 self._engine.fail_task(workflow_id, task.task_id, error)
@@ -186,8 +148,6 @@ class Worker:
                         base_url, response.task_id, workflow_id, task.task_id
                     )
                 except ControlClientError as e:
-                    # The service went away mid-task; its task state is likely
-                    # lost, so the task is re-executed once it is back.
                     if self._handle_unavailable(
                         workflow_id, task.task_id, container_name, base_url, e
                     ):
@@ -199,8 +159,6 @@ class Worker:
                 )
                 return True
 
-            # A service that returns a huge inline payload would put that data
-            # into Redis and the API; reject it instead.
             try:
                 self._policy.check_all(output_refs)
             except DataPolicyError as e:
@@ -212,9 +170,6 @@ class Worker:
                 )
                 return True
 
-            # An inline payload that does not match the checksum or size its
-            # own reference states was corrupted or mislabelled on the way;
-            # passing it on would hand bad data to the next task.
             try:
                 verify_all(output_refs)
             except IntegrityError as e:
@@ -226,7 +181,6 @@ class Worker:
                 )
                 return True
 
-            # Successful round trip - close the circuit if it was open
             self._record_success(container_name, base_url)
 
             # Complete task with outputs
@@ -249,19 +203,13 @@ class Worker:
         while not self._engine.is_workflow_complete(workflow_id):
             processed = self.process_task(workflow_id, timeout)
             if not processed:
-                # Queue empty but workflow not complete - wait a bit
+                # Queue empty but workflow not complete, wait a bit
                 if timeout > 0:
                     continue
                 break
 
     def _check_stalled(self, workflow_id: str) -> None:
         """Fail a workflow that nothing can move on any more, and say so.
-
-        Runs only when this poll found nothing to claim, so a workflow with
-        work in it costs one ``EXISTS``. A stall held by failed tasks fails
-        the workflow (``resume`` then applies). One without failed tasks
-        means the state is damaged; it is only reported, at most once per
-        ``stall_alert_repeat`` seconds across all workers.
         """
         if not self._stall_detection:
             return
@@ -305,11 +253,6 @@ class Worker:
 
     def _verify_if_completed(self, workflow_id: str) -> None:
         """Check a workflow this worker just completed; alert if it fails.
-
-        The workflow is already completed when this runs, so a client sees
-        the result without waiting for it. A problem here never fails the
-        task or stops the worker: the work is done, and the alert says the
-        state that records it is not what it should be.
         """
         if self._verifier is None:
             return
@@ -353,10 +296,6 @@ class Worker:
         error: ControlClientError,
     ) -> bool:
         """Handle a client error; return True if the task was deferred.
-
-        Only transient errors (unreachable, timeout, 5xx) say something about
-        service availability: they count against the breaker and, when a
-        breaker is configured, park the task. Other errors are left to fail it.
         """
         if not error.transient or self._breaker is None:
             return False
@@ -381,12 +320,6 @@ class Worker:
         self, workflow_id: str, task_id: str, container_name: str, cause: str
     ) -> None:
         """Park a task until its service is healthy, keeping the workflow alive.
-
-        ``cause`` says why the task cannot run now; the advice to the operator
-        is added here, so a task that gives up does not claim it will be
-        retried. A task blocked for longer than ``blocked_max_age`` fails
-        instead, so a workflow waiting on a service that never returns does not
-        stay ``running`` forever.
         """
         attempt = int(self._engine.record_blocked_attempt(workflow_id, task_id))
         age = float(self._engine.blocked_age(workflow_id, task_id))
@@ -465,10 +398,6 @@ class Worker:
         task_id: str,
     ) -> list[DataReference]:
         """Poll service status until complete, or until the task times out.
-
-        Each poll also renews the task's lease, so a task that legitimately
-        runs for a long time is not reclaimed by another worker, while a task
-        whose service never finishes is failed after ``task_max_runtime``.
         """
         started = time.time()
         while True:

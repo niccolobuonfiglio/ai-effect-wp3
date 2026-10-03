@@ -1,9 +1,4 @@
 """State transitions are all-or-nothing and do not lose concurrent updates.
-
-A worker "dies" mid-transition by raising from a step that runs before
-``EXEC``; nothing of the transition may then be visible. A concurrent writer is
-simulated by writing to a watched key between a transaction's reads and its
-``EXEC``; the transaction must retry and keep both changes.
 """
 
 from unittest.mock import patch
@@ -69,7 +64,6 @@ class TestCrashLeavesOldState:
         assert queue.peek_queue("wf-1") == [task_id]
         assert queue.leased_tasks("wf-1") == []
         assert store.get_task("wf-1", task_id).status == TaskStatus.PENDING
-        # ...and a healthy worker then claims it normally
         assert engine.claim_task("wf-1").task_id == task_id
 
     def test_crash_while_completing(self, engine, store, queue):
@@ -85,8 +79,6 @@ class TestCrashLeavesOldState:
         assert store.get_task("wf-1", task.task_id).status == TaskStatus.RUNNING
         assert queue.leased_tasks("wf-1") == [task.task_id]
         assert queue.queue_length("wf-1") == 0
-        # Retrying the completion (e.g. after the lease is reclaimed and the
-        # task re-run) moves the workflow on exactly once.
         engine.complete_task("wf-1", task.task_id, output_refs=[ref("a")])
         assert queue.queue_length("wf-1") == 1
 
@@ -148,7 +140,6 @@ class TestCrashLeavesOldState:
 
         assert queue.leased_tasks("wf-1") == [task.task_id]
         assert queue.queue_length("wf-1") == 0
-        # the next poll reclaims it
         assert engine.release_due_tasks("wf-1") == 1
         assert queue.peek_queue("wf-1") == [task.task_id]
         assert store.get_task("wf-1", task.task_id).status == TaskStatus.PENDING

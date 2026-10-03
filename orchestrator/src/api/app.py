@@ -22,7 +22,6 @@ def _verify_orchestrator_key(
     api_key = os.environ.get("ORCHESTRATOR_API_KEY")
     if not api_key:
         return
-    # Constant-time comparison, so response timing does not reveal the key
     if not credentials or not hmac.compare_digest(
         credentials.credentials.encode("utf-8"), api_key.encode("utf-8")
     ):
@@ -62,13 +61,10 @@ from services.state_store import WorkflowNotFoundError, TaskNotFoundError
 from services.workflow_catalog import WorkflowCatalog
 from services.workflow_engine import WorkflowEngine
 
-# The dashboard page served at /ui (a single static HTML file).
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
-# Seconds to wait for each service when checking credentials at submission
 SERVICE_AUTH_CHECK_TIMEOUT = 3.0
 
-# What to do with a blueprint connection whose message types do not match
 TYPE_CHECK_MODES = ("strict", "warn", "off")
 
 logger = logging.getLogger(__name__)
@@ -93,16 +89,6 @@ class OrchestratorAPI:
         type_check: str | None = None,
     ):
         """Initialize API with dependencies.
-
-        ``service_auth_check`` asks every service, when a workflow is
-        submitted, whether it accepts the workflow's services API key. None
-        reads SERVICE_AUTH_CHECK (default on).
-
-        ``type_check`` decides what happens to a blueprint connection whose
-        source outputs a different message than its target takes: ``strict``
-        refuses the workflow, ``warn`` accepts it and reports the mismatch,
-        ``off`` skips the check. None reads BLUEPRINT_TYPE_CHECK (default
-        ``warn``).
         """
         if engine is None:
             raise ValueError("engine is required")
@@ -143,11 +129,6 @@ class OrchestratorAPI:
         self, endpoints: dict, services_api_key: str | None
     ) -> None:
         """Refuse a workflow whose services would reject its credentials.
-
-        Without this the mistake only shows when the first task runs, as a
-        failed workflow. Services that cannot be reached are let through: an
-        outage is the circuit breaker's business and may be over by the time
-        their task runs.
         """
         names = list(endpoints or {})
         if not self._service_auth_check or not names:
@@ -213,8 +194,6 @@ class OrchestratorAPI:
 
     def _check_message_types(self, graph) -> list[str]:
         """Apply the type check mode; return the warnings to report.
-
-        Raises HTTPException(400) in strict mode when a connection mismatches.
         """
         if self._type_check == "off":
             return []
@@ -233,7 +212,7 @@ class OrchestratorAPI:
         return [f"Incompatible connection: {m}" for m in mismatches]
 
     def _parse_inputs(self, raw: list[dict]) -> list[DataReference] | None:
-        """Validate the workflow's initial inputs, or raise HTTPException(400)."""
+        """Validate the workflow's initial inputs or raise HTTPException(400)."""
         if not raw:
             return None
         try:
@@ -269,7 +248,6 @@ class OrchestratorAPI:
             except BlueprintParseError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid blueprint: {e}")
 
-            # Do connected operations exchange the same message type?
             warnings = self._check_message_types(graph)
 
             # Parse dockerinfo
@@ -281,13 +259,11 @@ class OrchestratorAPI:
             # Initial inputs for start nodes: policy and integrity
             initial_inputs = self._parse_inputs(request.inputs)
 
-            # Before anything is stored: would the services accept the key?
             self._check_service_access(endpoints, request.services_api_key)
 
             # Generate workflow ID
             workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
 
-            # Store services API key for worker to use when calling services
             if request.services_api_key:
                 self._redis.set(
                     services_key_name(workflow_id),
@@ -303,14 +279,10 @@ class OrchestratorAPI:
             if endpoints_data:
                 self._redis.hset(endpoints_key, mapping=endpoints_data)
 
-            # Register services so they show up in the health dashboard
-            # before any task has run against them.
             self._registry.register_all(endpoints, workflow_id=workflow_id)
 
             # Initialize and start workflow
             self._engine.initialize_workflow(workflow_id, graph)
-            # Record it for the dashboard: the list view and, since the engine
-            # keeps no blueprint, the graph view.
             self._catalog.register(workflow_id, request.blueprint)
             self._engine.start_workflow(workflow_id, initial_inputs)
 
@@ -391,11 +363,9 @@ class OrchestratorAPI:
             # Delete workflow state
             self._engine._state_store.delete_workflow(workflow_id)
 
-            # Delete endpoints and the services API key
             self._redis.delete(f"endpoints:{workflow_id}")
             self._redis.delete(services_key_name(workflow_id))
 
-            # Remove it from the dashboard's catalog
             self._catalog.forget(workflow_id)
 
             # Clear queue
@@ -408,7 +378,6 @@ class OrchestratorAPI:
             """Health check endpoint."""
             return HealthResponse(status="ok")
 
-        # Service health awareness & manual recovery routes
         app.include_router(
             create_health_router(
                 self._registry,
@@ -416,7 +385,6 @@ class OrchestratorAPI:
             )
         )
 
-        # Resume a failed workflow / retry a failed task
         app.include_router(
             create_workflow_router(
                 self._engine,
@@ -424,7 +392,6 @@ class OrchestratorAPI:
             )
         )
 
-        # Dashboard data routes (list, graph, logs, alerts)
         app.include_router(
             create_dashboard_router(
                 self._engine,
@@ -435,8 +402,6 @@ class OrchestratorAPI:
             )
         )
 
-        # Dashboard page. It holds no data itself; every call it makes goes
-        # through the routes above and needs the API key when one is set.
         if UI_DIR.is_dir():
             app.mount("/ui", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
 

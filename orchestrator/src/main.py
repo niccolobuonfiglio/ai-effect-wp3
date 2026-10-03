@@ -48,8 +48,7 @@ def create_app() -> "uvicorn.ASGIApplication":
     redis_client = get_redis_client()
     state_store = RedisStateStore(redis_client)
     task_queue = RedisTaskQueue(redis_client)
-    # The API never claims tasks, so it needs no lease setting: leases are a
-    # worker concern (see docs/SCHEDULING.md).
+    # The API never claims tasks, so it needs no lease setting
     engine = WorkflowEngine(state_store, task_queue, redis_client)
     blueprint_parser = BlueprintParser()
     dockerinfo_parser = DockerInfoParser()
@@ -90,7 +89,6 @@ def main() -> int:
     args = parser.parse_args()
 
     # Configure logging with file rotation
-    # Shares the logs volume with the workers; see worker_daemon.main().
     configure_logging(
         log_dir="logs",
         log_file="orchestrator.log",

@@ -3,9 +3,6 @@
 #
 #   evaluation/env_snapshot.sh evaluation/results/<run-id>
 #
-# Captures everything that has to be identical (or at least known) for the
-# OLD/NEW comparison to be valid: both commits and whether their trees are
-# clean, image digests, tool versions, host hardware and fixture hashes.
 set -euo pipefail
 
 OUT="${1:?usage: env_snapshot.sh <out-dir>}"
@@ -22,13 +19,13 @@ repo() {  # path -> {"path","commit","dirty"}
     jq -n --arg p "$1" --arg c "$head" --argjson d "$dirty" '{path:$p, commit:$c, modified_files:$d}'
 }
 
-images() {  # every local image with its content digest
+images() {  
     docker images --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
         | grep -E 'orch|file_based|germany|portugal|dutch|villas|redis|hai|tef' \
         | jq -R 'split(" ") | {(.[0]): .[1]}' | jq -s 'add // {}'
 }
 
-fixtures() {  # sha256 of the workload inputs
+fixtures() {  
     find "$NEW_ROOT/use-cases/file_based_energy_pipeline/export" \
          "$NEW_ROOT/use-cases/germany-node/export" \
          "$NEW_ROOT/use-cases/germany-node/data" -maxdepth 1 -type f 2>/dev/null \

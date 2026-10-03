@@ -2,7 +2,7 @@
 
 Everything that must be identical for both versions lives here, so that the
 only thing that changes between a pair of trials is the orchestrator code.
-Paths can be overridden with environment variables (see PROTOCOL.md).
+Paths can be overridden with environment variables.
 """
 
 import os
@@ -49,18 +49,15 @@ class UseCase:
     services: dict[str, tuple[str, str | None]]
     # the service taken down in outage scenarios
     outage_target: str
-    # a task that runs long enough to be interrupted mid-flight (V-A2)
+    # a task that runs long enough to be interrupted mid-flight 
     long_task: str | None = None
-    # compose services recreated before every trial (use-case defects, e.g. F2)
+    # compose services recreated before every trial 
     recreate_before_trial: tuple[str, ...] = field(default_factory=tuple)
     # compose services recreated before every recovery action of the operator
-    # (OLD resubmission, NEW /recover); the F2 rule of PROTOCOL.md 9.3
     recreate_before_recovery: tuple[str, ...] = field(default_factory=tuple)
     # can several workflows run at the same time?
     concurrent: bool = True
-    # Output-equivalence oracle (PROTOCOL.md, Amendment 3): file -> sha256 of
-    # the output every completed job must reproduce, under the folder the
-    # services write each workflow's files to. Empty: no oracle.
+    # Output-equivalence oracle 
     output_reference: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -87,9 +84,6 @@ USE_CASES = {
             "report_generator1": ("report-generator", "http://localhost:18084/health"),
         },
         outage_target="data_analyzer1",
-        # Fixed on 2026-10-03, before the measurements: the 1 562 workflows on
-        # disk that produced a report (2026-09-26 to 09-30, both versions,
-        # earlier campaigns and tests) all have exactly these three files.
         output_reference={
             "raw_energy.csv": "sha256:3e58cf09a96f1149f136d3d090bc546da89dfb716cf57e3a1d52530b5ef2e62b",
             "analyzed_energy.csv": "sha256:030cd7c9c3c47b0e1a8fca67ed597789d0a132df837f2e547eedd11a0ff69a21",
@@ -106,15 +100,12 @@ USE_CASES = {
         },
         outage_target="output_formatter1",
         long_task="villas_chronics1",
-        # villas-node segfaults on its second restart (RUN_ANALYSIS F2)
+        # villas-node segfaults on its second restart 
         recreate_before_trial=("villas-node",),
         recreate_before_recovery=("villas-node",),
         concurrent=False,
     ),
-    # Services pass data over gRPC from in-memory caches: a restart erases a
-    # service's output, and concurrent workflows would overwrite each other's
-    # data (PROTOCOL.md 9.1). The target has not produced its output yet when
-    # it goes down, so the resume does not depend on a lost cache.
+
     "protobuf": UseCase(
         name="protobuf",
         folder=NEW_ROOT / "use-cases" / "protobuf_based_energy_pipeline",

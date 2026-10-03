@@ -1,8 +1,4 @@
 """Integration tests for the service health API.
-
-Exercises the mounted health router end to end through the FastAPI stack:
-real routing, dependency injection, response-model validation and status codes,
-against a Redis-backed registry and circuit breaker.
 """
 
 import os
@@ -271,30 +267,23 @@ class TestOperatorWorkflow:
     def test_end_to_end_recovery(self, client, registry, breaker):
         registry.register_all({"databroker": DATABROKER, "predictor": PREDICTOR})
 
-        # Everything healthy at first.
         assert client.get(BASE).json()["overall_status"] == "HEALTHY"
 
-        # One service starts failing and trips the breaker.
         kill(breaker, "predictor", "http://predictor:8080", error="conn refused")
 
-        # Operator sees it on the dashboard...
         dash = client.get(BASE).json()
         assert dash["overall_status"] == "UNHEALTHY"
         down = [s for s in dash["services"] if s["status"] == "UNHEALTHY"]
         assert [s["service_name"] for s in down] == ["predictor"]
 
-        # ...drills into the failure detail...
         detail = client.get(f"{BASE}/predictor").json()
         assert detail["last_error"] == "conn refused"
 
-        # ...checks where it is supposed to be running...
         endpoint = client.get(f"{BASE}/predictor/endpoint").json()
         assert endpoint["base_url"] == "http://predictor:8080"
 
-        # ...restarts it out of band, then tells the orchestrator to resume.
         assert client.post(f"{BASE}/predictor/recover").status_code == 200
 
-        # Fleet is clean and workers are unblocked.
         assert client.get(BASE).json()["overall_status"] == "HEALTHY"
         assert breaker.allow("predictor") is True
 

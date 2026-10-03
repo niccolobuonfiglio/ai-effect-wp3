@@ -1,9 +1,4 @@
-"""Checks of the Amendment 4 instruments (PROTOCOL.md 11).
-
-The inline-size sweep is only meaningful if each input is exactly the size it
-claims, carries a correct checksum and leaves the pipeline's output unchanged;
-the data-size sweep only if the input provider honours ``num_records`` and
-behaves as before without it.
+"""
 Run with any pytest: ``python -m pytest evaluation/test_sweeps.py``.
 """
 
@@ -54,7 +49,6 @@ def test_records_input_asks_for_that_many_records():
     assert json.loads(decoded(ref)) == {"num_records": 1000, "output_format": "csv"}
 
 
-# --- the input provider (use case), with its service framework stubbed ---------
 @pytest.fixture(scope="module")
 def provider():
     common = types.ModuleType("common")
@@ -77,7 +71,6 @@ def configured(provider, inputs) -> dict:
 
 
 def test_provider_without_input_is_unchanged(provider):
-    # The exact bytes the reference output of PROTOCOL.md 10.2 was produced from
     assert configured(provider, []) == {"num_records": 10, "output_format": "csv"}
 
 

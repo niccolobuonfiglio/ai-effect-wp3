@@ -3,20 +3,7 @@
 #
 #   evaluation/run_t33.sh <german|portugal|dutch> <old|new> <out-dir> [script-number ...]
 #   evaluation/run_t33.sh prepare-dutch
-#
-# For each run it
-#   1. switches the live orchestrator (stack.sh) and exports COMPOSE_PROJECT_NAME
-#      so that the suite's own "docker compose up" targets the same project;
-#   2. installs evaluation/t33/<node>-<version>.psd1 as the node's
-#      Test-Settings.psd1 (ExpectedCommit HEAD -> the checked-out commit), and
-#      restores the original afterwards;
-#   3. runs the node's scripts in START-HERE.md order with pwsh, one log each;
-#   4. appends node, version, script, verdict and message (from the script's
-#      final "RESULT:" line) to <out>/t33.csv.
-#
-# The test scripts themselves are never edited. Local portability patches in
-# the test repository are recorded (git diff) into <out>/t33-harness.diff, since
-# they apply to both versions alike and have to be reported.
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,9 +12,6 @@ T33_ROOT="${EVAL_T33_ROOT:-$(cd "$NEW_ROOT/.." && pwd)/ai-effect-task3-3-tests}"
 DUTCH_FORK="${EVAL_DUTCH_FORK:-https://github.com/paulban/ai-effect-wp3.git}"
 DUTCH_COMMIT=22fbb6eca71265a61bc1f0cee16b6d03f372d554
 
-# Non-interactive scripts, in START-HERE.md order, with the documented arguments.
-# Excluded: dutch 51 (manual expert UX review) and portugal 32 (only run when
-# 31 shows a compatible sidecar interface).
 declare -A SCRIPTS=(
   [german]="00-Preflight-And-Dependency-Check.ps1
 01-Start-Core-And-Germany-Services.ps1
@@ -72,9 +56,6 @@ declare -A SCRIPTS=(
 )
 
 prepare_dutch() {
-    # OLD: the fork at the commit the suite pins. NEW: the same fork with its
-    # orchestrator/ replaced by NEW's tracked files, committed locally so the
-    # suite's commit check has something to verify.
     local work="$HOME/t33-work"
     mkdir -p "$work"
     if [ ! -d "$work/dutch-old/.git" ]; then
@@ -90,10 +71,6 @@ prepare_dutch() {
     git -C "$work/dutch-new" rm -r --quiet orchestrator
     git -C "$NEW_ROOT" archive HEAD orchestrator | tar -x -C "$work/dutch-new"
 
-    # Keep the fork's deployment settings, so that only the orchestrator code
-    # differs between the two trees: the Dutch suite waits for a container
-    # named exactly "orchestrator-api", and the fork binds its ports to
-    # localhost. The change is saved for the thesis to report.
     local compose="$work/dutch-new/orchestrator/docker-compose.yml"
     cp "$compose" "$work/compose.orig"
     sed -i -e 's/^  api:$/  api:\n    container_name: orchestrator-api/' \
@@ -106,8 +83,7 @@ prepare_dutch() {
     git -C "$work/dutch-new" -c user.name=evaluation -c user.email=evaluation@localhost \
         commit --quiet -m "evaluation: orchestrator replaced by NEW $(git -C "$NEW_ROOT" rev-parse --short HEAD)"
 
-    # What the fork changed in its own orchestrator is lost in dutch-new; keep
-    # the diff so the thesis can report it as a confound.
+
     git -C "$work/dutch-old" diff --stat "$DUTCH_COMMIT" "$(git -C "$work/dutch-new" rev-parse HEAD)" -- orchestrator \
         >"$work/dutch-orchestrator-swap.stat" 2>/dev/null || true
     echo "prepared $work/dutch-old ($DUTCH_COMMIT) and $work/dutch-new ($(git -C "$work/dutch-new" rev-parse HEAD))"
@@ -125,15 +101,13 @@ shift 3
 ONLY=("$@")
 [ -n "${SCRIPTS[$NODE]:-}" ] || { echo "unknown node $NODE" >&2; exit 1; }
 
-# The runbooks create these keys before any script; without the HAI secret the
-# Dutch HAI stack refuses to start and scripts 30-36 give no result.
+
 for key in ORCHESTRATOR_API_KEY SERVICE_API_KEY; do
     [ -n "${!key:-}" ] || { echo "export $key first (see the node's START-HERE.md)" >&2; exit 1; }
 done
 if [ "$NODE" = dutch ]; then
     [ -n "${HAI_SESSION_TOKEN_SECRET:-}" ] || {
         echo "export HAI_SESSION_TOKEN_SECRET first (dutch-node/START-HERE.md)" >&2; exit 1; }
-    # The runbook's fixed HAI settings (START-HERE.md), unless already exported
     export NODE_PUBLIC_BASE_URL="${NODE_PUBLIC_BASE_URL:-http://localhost:8443}"
     export HAI_PUBLIC_BASE_URL="${HAI_PUBLIC_BASE_URL:-http://localhost:8443}"
     export HAI_PROXY_HOST_PORT="${HAI_PROXY_HOST_PORT:-8443}"
@@ -151,7 +125,7 @@ CSV="$OUT/t33.csv"
 git -C "$T33_ROOT" diff >"$OUT/t33-harness.diff"
 git -C "$T33_ROOT" rev-parse HEAD >"$OUT/t33-commit.txt"
 
-# --- settings ------------------------------------------------------------
+# --- settings 
 repo_root=$(sed -n "s/^ *RepositoryRoot *= *'\(.*\)'.*/\1/p" "$TEMPLATE")
 commit=$(git -C "$repo_root" rev-parse HEAD) || { echo "not a git repo: $repo_root" >&2; exit 1; }
 SETTINGS="$NODE_DIR/Test-Settings.psd1"
@@ -168,13 +142,7 @@ sed "s/ExpectedCommit\( *\)= *'HEAD'/ExpectedCommit\1= '$commit'/" "$TEMPLATE" >
 cp "$SETTINGS" "$OUT/t33-logs/$NODE-$VERSION/Test-Settings.psd1"
 mkdir -p "$(sed -n "s/^ *EvidenceRoot *= *'\(.*\)'.*/\1/p" "$TEMPLATE")"
 
-# --- stack ---------------------------------------------------------------
-# The suites find the orchestrator by container name ("orchestrator-api",
-# "orchestrator-redis"), so every version must run as compose project
-# "orchestrator", as in the official closure runs. Both trees then share the
-# image names orchestrator-api/-worker, so the images are always rebuilt from
-# the tree under test first, and NEW's images are rebuilt again afterwards: a
-# stale OLD image must never be taken for NEW.
+# --- stack 
 if [ -n "$(git -C "$repo_root" status --porcelain)" ]; then
     echo "$repo_root is not clean; the T3.3 suites will refuse to run. Commit first:" >&2
     git -C "$repo_root" status --short >&2
@@ -200,14 +168,10 @@ case "$NODE-$VERSION" in
 esac
 echo "live: $live (project orchestrator, built from $repo_root @ ${commit:0:7})"
 
-# Script 50 only inspects the service keys left in Redis. On a fresh stack
-# there are none and it passes without testing anything, so, as in the
-# official closure run, one workflow carrying a service key is run first.
-# Same payload and procedure on both versions.
 prime_service_key() {  # log
     local api="${ORCHESTRATOR_URL:-http://localhost:18000}" export="$repo_root/use-cases/germany-node/export"
     local payload wf status="" t
-    # VILLASnode crashes on its second restart (use-case defect F2), and
+    # VILLASnode crashes on its second restart, and
     # script 01 has just restarted it: start from a fresh container.
     docker compose -f "$repo_root/use-cases/germany-node/docker-compose.yml" \
         up -d --force-recreate villas-node >/dev/null 2>&1
@@ -227,7 +191,7 @@ prime_service_key() {  # log
     echo "primed script 50 with workflow $wf (final status: $status)" | tee "$1"
 }
 
-# --- scripts -------------------------------------------------------------
+# --- scripts 
 while IFS= read -r line; do
     [ -z "$line" ] && continue
     script="${line%% *}"
@@ -244,16 +208,11 @@ while IFS= read -r line; do
     started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     t0=$(date +%s)
     echo "=== $NODE $VERSION $script ${args[*]}"
-    # </dev/null: the script list is this loop's stdin, and a script (or a
-    # command it runs) that reads stdin would swallow the remaining lines.
     (cd "$NODE_DIR" && NO_COLOR=1 pwsh -NoLogo -NoProfile -File "./$script" "${args[@]}" </dev/null) 2>&1 \
         | sed 's/\x1b\[[0-9;]*m//g' >"$log"
     code=${PIPESTATUS[0]}
     secs=$(( $(date +%s) - t0 ))
     result=$(grep -a 'RESULT:' "$log" | tail -n 1 | sed 's/.*RESULT:[[:space:]]*//')
-    # Verdicts are an upper-case label, then " - " (German, Portugal) or an em
-    # dash (Dutch) and a message. Some Dutch lines have no label at all
-    # ("RESULT: recorded."); they are kept whole, labelled UNLABELLED.
     if [ -z "$result" ]; then
         verdict="NO RESULT"
         message="$(grep -av '^\s*$' "$log" | tail -n 1)"

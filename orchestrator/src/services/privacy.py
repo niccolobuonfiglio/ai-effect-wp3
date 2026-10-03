@@ -1,19 +1,4 @@
 """Limits on what data the orchestrator stores, forwards and logs.
-
-The orchestrator is a control plane: it should hold references to data, not the
-data itself, and it should not spread whatever a service happens to put into an
-error message. This module centralises three rules:
-
-* **Inline payloads** - ``protocol: "inline"`` carries base64 data inside the
-  reference, so it ends up in Redis and in API responses. Their size is capped
-  and they can be forbidden entirely.
-* **Masking** - inline payloads are replaced by a short placeholder in API
-  responses; workers keep using the stored value.
-* **Error sanitising** - error text stored on tasks, in service health and in
-  alerts is truncated and stripped of obvious personal identifiers.
-
-None of this can stop a service from producing sensitive data; it limits how
-far that data travels through the orchestrator.
 """
 
 import os
@@ -27,16 +12,8 @@ DEFAULT_MAX_ERROR_CHARS = 500
 REDACTED = "[redacted]"
 TRUNCATED = " ... [truncated]"
 
-# Conservative patterns: identifiers that are personal data in almost any
-# context, plus long opaque blobs that are usually payload rather than message.
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-# Only standalone runs of digits: a long number inside an identifier (a
-# workflow id such as wf-578150909e59, task_91277dc9, a hostname) is not a
-# personal identifier, and redacting it would make logs unreadable.
 _LONG_DIGITS = re.compile(r"(?<![\w-])\d{9,}(?![\w-])")
-# A blob is a long base64-looking token that mixes cases and digits. The
-# lookaheads keep ordinary text out: a long file path or a repeated word is
-# lower case only, so it stays readable in the error message.
 _BLOB = re.compile(
     r"(?<![A-Za-z0-9+/=])"
     r"(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*\d)"
@@ -51,10 +28,6 @@ class DataPolicyError(Exception):
 
 def sanitize_error(text: str | None, max_chars: int | None = None) -> str | None:
     """Redact identifiers in an error message and cap its length.
-
-    Args:
-        text: The raw error text, or None.
-        max_chars: Maximum length; defaults to ``MAX_ERROR_CHARS`` or 500.
     """
     if text is None:
         return None
@@ -92,11 +65,6 @@ def _bool_env(name: str, default: bool) -> bool:
 
 class DataPolicy:
     """Decides which references may pass and how they are shown.
-
-    Args:
-        allow_inline: False rejects every inline reference.
-        max_inline_bytes: Largest inline payload accepted, in decoded bytes.
-        max_error_chars: Length cap applied by :meth:`sanitize`.
     """
 
     def __init__(
@@ -123,9 +91,7 @@ class DataPolicy:
             max_error_chars=_int_env("MAX_ERROR_CHARS", DEFAULT_MAX_ERROR_CHARS),
         )
 
-    # ------------------------------------------------------------------
     # references
-    # ------------------------------------------------------------------
     @staticmethod
     def inline_size(reference: DataReference) -> int:
         """Decoded size of an inline payload, 0 for any other protocol."""
@@ -134,7 +100,6 @@ class DataPolicy:
         try:
             return len(reference.get_inline_data())
         except Exception:
-            # The reference model already validated the base64; be defensive.
             return len(reference.uri)
 
     def check(self, reference: DataReference) -> None:
@@ -164,17 +129,12 @@ class DataPolicy:
 
     def masked_uri(self, reference: DataReference) -> str:
         """URI safe to show in an API response.
-
-        Inline payloads become a placeholder; every other protocol keeps its
-        URI, which is a location rather than the data.
         """
         if reference.protocol != Protocol.INLINE:
             return reference.uri
         return f"<inline data, {self.inline_size(reference)} bytes>"
 
-    # ------------------------------------------------------------------
     # errors
-    # ------------------------------------------------------------------
     def sanitize(self, text: str | None) -> str | None:
         """Sanitise error text with this policy's length cap."""
         return sanitize_error(text, self.max_error_chars)

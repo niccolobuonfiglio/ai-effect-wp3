@@ -26,7 +26,7 @@ from services.worker import Worker
 from services.workflow_engine import WorkflowEngine
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "fixtures"))
-from test_service import free_port, health_body, wait_until_ready  # noqa: E402
+from test_service import free_port, health_body, wait_until_ready  
 
 
 # Inline service implementations for testing
@@ -264,7 +264,6 @@ class TestEnergyPipelineE2E:
         self, api_client, orchestrator_components, services, redis_client
     ):
         """Test full pipeline: input -> generate -> analyze -> report."""
-        # Blueprint matching the file_based_energy_pipeline structure
         blueprint = {
             "name": "File Based Energy Pipeline",
             "pipeline_id": "test-pipeline",
