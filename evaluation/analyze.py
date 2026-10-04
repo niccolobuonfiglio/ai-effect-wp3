@@ -14,6 +14,7 @@ from scipy import stats
 RNG = np.random.default_rng(20260925)
 MARGIN = 0.05  # equivalence margin for overhead
 SWEEP_SCENARIOS = ("scale", "inline-size", "data-size")
+COST_SCENARIOS = ("service-delay", "hung-submit", "running-cost")  # Amendment 5, PROTOCOL.md 12
 VERSIONS = ("old", "new")
 COLOR = {"old": "#eb6834", "new": "#2a78d6"}
 HATCH = {"old": "////", "new": ""}
@@ -117,7 +118,7 @@ def analyse_trials(trials: list[dict]) -> dict:
         # checks-off arm is analysed separately (analyse_overhead), and so are
         # the sweeps, whose points must not be pooled (analyse_sweeps).
         if (not t.get("warmup") and t.get("variant", "default") == "default"
-                and t["scenario"] not in SWEEP_SCENARIOS):
+                and t["scenario"] not in SWEEP_SCENARIOS + COST_SCENARIOS):
             groups[(t["scenario"], t["use_case"])][t["version"]].append(t)
 
     result = {}
@@ -326,6 +327,176 @@ def analyse_sweeps(trials: list[dict]) -> dict:
 
         result[scenario][name] = r
     return {k: v for k, v in result.items() if v}
+
+
+def arm(t: dict) -> str:
+    variant = t.get("variant", "default")
+    return t["version"] if variant == "default" else f"{t['version']}/{variant}"
+
+
+def _arm_order(name: str) -> tuple:
+    return (VERSIONS.index(name.split("/")[0]), "/" in name, name)
+
+
+def _role(container: str) -> str:
+    return container.rsplit("-", 2)[-2]  # <project>-<service>-<n>
+
+
+def _slope(xs, ys) -> dict | None:
+    """Least-squares slope with a 95 % CI."""
+    if len(set(xs)) < 2:
+        return None
+    fit = stats.linregress(xs, ys)
+    t = stats.t.ppf(0.975, len(xs) - 2)
+    return {"slope": float(fit.slope), "ci95": (float(fit.slope - t * fit.stderr), float(fit.slope + t * fit.stderr)),
+            "intercept": float(fit.intercept), "n": len(xs)}
+
+
+def window_rates(w: dict) -> dict:
+    """Per-minute rates of one measured window, total and per role."""
+    per_min = 60 / w["seconds"]
+    cpu_by_role = Counter()
+    for name, sec in w["cpu_seconds"].items():
+        cpu_by_role[_role(name)] += sec
+    mem_by_role = Counter()
+    for name, b in w["memory_bytes"].items():
+        if b is not None:
+            mem_by_role[_role(name)] += b / 2**20
+    return {
+        "cpu_s_per_min": sum(cpu_by_role.values()) * per_min,
+        "cpu_s_per_min_by_role": {r: v * per_min for r, v in cpu_by_role.items()},
+        "redis_cmds_per_min": w["redis_commands"] * per_min,
+        "service_requests_per_min": sum(w["service_requests"].values()) * per_min,
+        "memory_mib": sum(mem_by_role.values()),
+        "memory_mib_by_role": dict(mem_by_role),
+    }
+
+
+def per_workflow_cost(t: dict) -> dict | None:
+    """The trickle window's consumption beyond the idle rate, divided by its workflows."""
+    idle, busy = t.get("idle"), t.get("trickle")
+    if not idle or not busy or not busy["workflows"]:
+        return None
+    scale = busy["seconds"] / idle["seconds"]
+    cpu = sum(busy["cpu_seconds"].values()) - sum(idle["cpu_seconds"].values()) * scale
+    cmds = busy["redis_commands"] - idle["redis_commands"] * scale
+    reqs = sum(busy["service_requests"].values()) - sum(idle["service_requests"].values()) * scale
+    n = busy["workflows"]
+    return {"cpu_ms": 1000 * cpu / n, "redis_commands": cmds / n, "service_requests": reqs / n,
+            "service_requests_by_kind": {k: v / n for k, v in busy["service_requests"].items()}}
+
+
+def analyse_costs(trials: list[dict]) -> dict:
+    """Amendment 5 (PROTOCOL.md 12): per point and arm; NEW as shipped against OLD and against its variant."""
+    rows = [t for t in trials if t["scenario"] in COST_SCENARIOS and not t.get("warmup")]
+    if not rows:
+        return {}
+    result: dict = {}
+
+    def compare(by_arm: dict, metric) -> dict:
+        out = {}
+        new = [metric(t) for t in by_arm.get("new", [])]
+        new = [x for x in new if x is not None]
+        for other in sorted(by_arm, key=_arm_order):
+            if other == "new":
+                continue
+            vals = [x for x in (metric(t) for t in by_arm[other]) if x is not None]
+            if vals and new:
+                out[f"new_vs_{other.replace('/', '_')}"] = compare_continuous(vals, new)
+        return out
+
+    def errors(ts):
+        return sum("error" in t for t in ts)
+
+    # RQ12, service delay
+    delay = defaultdict(lambda: defaultdict(list))
+    for t in rows:
+        if t["scenario"] == "service-delay":
+            delay[t.get("delay_ms")][arm(t)].append(t)
+    if delay:
+        med_submit = lambda t: _med(t["submit_latencies"]) if t.get("submit_latencies") else None
+        points = {}
+        for d in sorted(delay):
+            by = {a: [t for t in ts if "error" not in t] for a, ts in delay[d].items()}
+            points[str(d)] = {
+                "arms": {a: {
+                    "n": len(ts), "errors": errors(delay[d][a]),
+                    "completed": sum(bool(t.get("job_completed")) for t in ts),
+                    "submit_ms_median": 1000 * _med([med_submit(t) for t in ts if med_submit(t) is not None]) if ts else None,
+                    "batch_submit_s_median": _med(values(ts, "submit_seconds")),
+                    "throughput_median": _med(values(ts, "throughput_wf_per_min")),
+                    "makespan_median": _med(values(ts, "makespan_seconds")),
+                    "probe_rtt_ms_median": _med(values(ts, "probe_rtt_ms")),
+                } for a, ts in sorted(by.items(), key=lambda kv: _arm_order(kv[0]))},
+                "submit": compare(by, med_submit),
+                "throughput": compare(by, lambda t: t.get("throughput_wf_per_min")),
+            }
+        slopes = {}
+        for a in {a for d in delay for a in delay[d]}:
+            xs, ys = [], []
+            for d in delay:
+                for t in delay[d].get(a, []):
+                    if "error" not in t and med_submit(t) is not None:
+                        xs.append(d)
+                        ys.append(1000 * med_submit(t))
+            slopes[a] = _slope(xs, ys)  # ms of submission time per ms of delay
+        result["service-delay"] = {"points": points, "submit_slope": dict(sorted(slopes.items(), key=lambda kv: _arm_order(kv[0])))}
+
+    # RQ12, hung service
+    hung = defaultdict(list)
+    for t in rows:
+        if t["scenario"] == "hung-submit":
+            hung[arm(t)].append(t)
+    if hung:
+        by = {a: [t for t in ts if "error" not in t] for a, ts in hung.items()}
+        result["hung-submit"] = {
+            "arms": {a: {"n": len(ts), "errors": errors(hung[a]),
+                         "accepted": sum(bool(t.get("accepted")) for t in ts),
+                         "completed": sum(bool(t.get("job_completed")) for t in ts),
+                         "submit_s_median": _med(values(ts, "submit_seconds")),
+                         "submit_s_iqr": _iqr(values(ts, "submit_seconds"))}
+                     for a, ts in sorted(by.items(), key=lambda kv: _arm_order(kv[0]))},
+            "submit": compare(by, lambda t: t.get("submit_seconds")),
+        }
+
+    # RQ13, running cost
+    cost = defaultdict(list)
+    for t in rows:
+        if t["scenario"] == "running-cost":
+            cost[arm(t)].append(t)
+    if cost:
+        by = {a: [t for t in ts if "error" not in t and t.get("idle")] for a, ts in cost.items()}
+        idle = lambda key: (lambda t: window_rates(t["idle"])[key])
+        pw = lambda key: (lambda t: (per_workflow_cost(t) or {}).get(key))
+        arms = {}
+        for a, ts in sorted(by.items(), key=lambda kv: _arm_order(kv[0])):
+            roles = sorted({r for t in ts for r in window_rates(t["idle"])["cpu_s_per_min_by_role"]})
+            kinds = sorted({k for t in ts for k in (per_workflow_cost(t) or {}).get("service_requests_by_kind", {})})
+            arms[a] = {
+                "n": len(ts), "errors": errors(cost[a]),
+                "completed": sum(bool(t.get("job_completed")) for t in ts),
+                "idle_cpu_s_per_min": _med([idle("cpu_s_per_min")(t) for t in ts]),
+                "idle_cpu_s_per_min_by_role": {r: _med([window_rates(t["idle"])["cpu_s_per_min_by_role"].get(r, 0) for t in ts]) for r in roles},
+                "idle_redis_cmds_per_min": _med([idle("redis_cmds_per_min")(t) for t in ts]),
+                "idle_service_requests_per_min": _med([idle("service_requests_per_min")(t) for t in ts]),
+                "idle_memory_mib": _med([idle("memory_mib")(t) for t in ts]),
+                "trickle_memory_mib": _med([window_rates(t["trickle"])["memory_mib"] for t in ts]),
+                "per_workflow_cpu_ms": _med([x for x in map(pw("cpu_ms"), ts) if x is not None]),
+                "per_workflow_redis_commands": _med([x for x in map(pw("redis_commands"), ts) if x is not None]),
+                "per_workflow_service_requests": _med([x for x in map(pw("service_requests"), ts) if x is not None]),
+                "per_workflow_service_requests_by_kind": {k: _med([(per_workflow_cost(t) or {}).get("service_requests_by_kind", {}).get(k, 0) for t in ts]) for k in kinds},
+            }
+        result["running-cost"] = {
+            "arms": arms,
+            "compare": {
+                "idle_cpu_s_per_min": compare(by, idle("cpu_s_per_min")),
+                "idle_redis_cmds_per_min": compare(by, idle("redis_cmds_per_min")),
+                "per_workflow_cpu_ms": compare(by, pw("cpu_ms")),
+                "per_workflow_redis_commands": compare(by, pw("redis_commands")),
+                "per_workflow_service_requests": compare(by, pw("service_requests")),
+            },
+        }
+    return result
 
 
 def exact_ci(k: int, n: int) -> tuple[float, float] | None:
@@ -669,6 +840,69 @@ def write_tables(out: Path, summary: dict) -> None:
         lines += [r"\bottomrule", r"\end{tabular}"]
         (out / fname).write_text("\n".join(lines) + "\n")
 
+    costs = summary.get("costs", {})
+    if costs.get("service-delay") or costs.get("hung-submit"):
+        def delta(cmp: dict, key: str) -> str:
+            c = cmp.get(key)
+            return f"{fmt(c.get('cliffs_delta'), 2)} ({fmt_p(c.get('mwu_p'))})" if c else ""
+        lines = [
+            r"\begin{tabular}{llrrrrll}", r"\toprule",
+            r"delay [ms] & arm & completed & submit [ms] & batch submit [s] & thr. [wf/min]"
+            r" & $\delta$ vs OLD ($p$) & $\delta$ vs check off ($p$) \\",
+            r"\midrule",
+        ]
+        for d, r in costs.get("service-delay", {}).get("points", {}).items():
+            for i, (a, x) in enumerate(r["arms"].items()):
+                first = a == "new"
+                lines.append(
+                    f"{d if i == 0 else ''} & {tex_escape(a.upper())} & {x['completed']}/{x['n']} & "
+                    f"{fmt(x['submit_ms_median'], 1)} & {fmt(x['batch_submit_s_median'], 2)} & "
+                    f"{fmt(x['throughput_median'], 0)} & "
+                    f"{delta(r['submit'], 'new_vs_old') if first else ''} & "
+                    f"{delta(r['submit'], 'new_vs_new_auth-check-off') if first else ''} \\\\"
+                )
+            lines.append(r"\midrule")
+        hung = costs.get("hung-submit")
+        if hung:
+            for i, (a, x) in enumerate(hung["arms"].items()):
+                first = a == "new"
+                lines.append(
+                    f"{'hung' if i == 0 else ''} & {tex_escape(a.upper())} & {x['completed']}/{x['n']} & "
+                    f"{fmt(1000 * x['submit_s_median'] if x['submit_s_median'] is not None else None, 1)} & & & "
+                    f"{delta(hung['submit'], 'new_vs_old') if first else ''} & "
+                    f"{delta(hung['submit'], 'new_vs_new_auth-check-off') if first else ''} \\\\"
+                )
+            lines.append(r"\midrule")
+        for a, sl in costs.get("service-delay", {}).get("submit_slope", {}).items():
+            if sl:
+                lines.append(f"\\multicolumn{{8}}{{l}}{{slope of submit time, {tex_escape(a.upper())}: "
+                             f"{fmt(sl['slope'], 2)} ms per ms of delay (95\\,\\% CI {fmt(sl['ci95'][0], 2)} to "
+                             f"{fmt(sl['ci95'][1], 2)})}} \\\\")
+        if lines[-1] == r"\midrule":
+            lines.pop()
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        (out / "table_service_delay.tex").write_text("\n".join(lines) + "\n")
+
+    rc = costs.get("running-cost")
+    if rc:
+        metrics = (("idle_cpu_s_per_min", "idle CPU [s/min]", 2), ("idle_redis_cmds_per_min", "idle Redis commands [/min]", 0),
+                   ("idle_service_requests_per_min", "idle service requests [/min]", 1),
+                   ("idle_memory_mib", "memory, idle [MiB]", 0), ("trickle_memory_mib", "memory, trickle [MiB]", 0),
+                   ("per_workflow_cpu_ms", "CPU per workflow [ms]", 1),
+                   ("per_workflow_redis_commands", "Redis commands per workflow", 0),
+                   ("per_workflow_service_requests", "service requests per workflow", 1))
+        arms = list(rc["arms"])
+        lines = [r"\begin{tabular}{l" + "r" * len(arms) + "l}", r"\toprule",
+                 "metric & " + " & ".join(tex_escape(a.upper()) for a in arms) + r" & NEW vs OLD $\delta$ ($p$) \\",
+                 r"\midrule"]
+        for key, label, digits in metrics:
+            c = rc["compare"].get(key, {}).get("new_vs_old")
+            d = f"{fmt(c.get('cliffs_delta'), 2)} ({fmt_p(c.get('mwu_p'))})" if c else ""
+            lines.append(f"{label} & " + " & ".join(fmt(rc["arms"][a][key], digits) for a in arms) + f" & {d} \\\\")
+        lines += [r"\midrule", "trials & " + " & ".join(str(rc["arms"][a]["n"]) for a in arms) + r" & \\",
+                  r"\bottomrule", r"\end{tabular}"]
+        (out / "table_running_cost.tex").write_text("\n".join(lines) + "\n")
+
     suites_d = summary.get("suites", {})
     old_cases = suites_d.get("diff-on-old", {}).get("cases", {})
     new_cases = suites_d.get("diff-on-new", {}).get("cases", {})
@@ -723,11 +957,12 @@ def write_figures(out: Path, trials: list[dict]) -> None:
 
     by = defaultdict(lambda: {"old": [], "new": []})
     for t in trials:
-        if not t.get("warmup") and "error" not in t and t["scenario"] not in SWEEP_SCENARIOS:
+        if not t.get("warmup") and "error" not in t and t["scenario"] not in SWEEP_SCENARIOS + COST_SCENARIOS:
             by[f"{t['scenario']}\n{t['use_case']}"][t["version"]].append(t)
     names = sorted(by)
-    if not names:  
+    if not names:
         write_sweep_figures(out, trials, plt)
+        write_cost_figures(out, trials, plt)
         return
 
     # 1. completion rate per scenario
@@ -804,6 +1039,69 @@ def write_figures(out: Path, trials: list[dict]) -> None:
         plt.close(fig)
 
     write_sweep_figures(out, trials, plt)
+    write_cost_figures(out, trials, plt)
+
+
+ARM_STYLE = {"old": (COLOR["old"], "--", "D"), "new": (COLOR["new"], "-", "o")}
+
+
+def _arm_style(a: str):
+    return ARM_STYLE.get(a, (MUTED, ":", "s"))
+
+
+def write_cost_figures(out: Path, trials: list[dict], plt) -> None:
+    rows = [t for t in trials if t["scenario"] in COST_SCENARIOS and not t.get("warmup") and "error" not in t]
+    delay = [t for t in rows if t["scenario"] == "service-delay"]
+    if delay:
+        fig, axes = plt.subplots(1, 2, figsize=(6.3, 2.6))
+        by = defaultdict(list)
+        for t in delay:
+            by[arm(t)].append(t)
+        for a in sorted(by, key=_arm_order):
+            color, ls, marker = _arm_style(a)
+            for ax, y_of in ((axes[0], lambda t: 1000 * _med(t["submit_latencies"]) if t.get("submit_latencies") else None),
+                             (axes[1], lambda t: t.get("throughput_wf_per_min"))):
+                pts = [(t["delay_ms"], y_of(t)) for t in by[a] if y_of(t) is not None]
+                xs = sorted({x for x, _ in pts})
+                ax.scatter([x for x, _ in pts], [y for _, y in pts], s=10, color=color, alpha=0.5, marker=marker, linewidths=0)
+                ax.plot(xs, [float(np.median([y for x2, y in pts if x2 == x])) for x in xs], color=color,
+                        linestyle=ls, linewidth=1.5, label=a.upper())
+        axes[0].set_ylabel("time to submit one workflow [ms]")
+        axes[1].set_ylabel("throughput, 10 workflows [wf/min]")
+        for ax in axes:
+            ax.set_xlabel("delay added to every service [ms]", fontsize=7)
+            ax.set_ylim(bottom=0)
+        axes[0].legend(loc="upper left", fontsize=7)
+        fig.tight_layout()
+        fig.savefig(out / "fig_service_delay.pdf")
+        plt.close(fig)
+
+    cost = [t for t in rows if t["scenario"] == "running-cost" and t.get("idle")]
+    if cost:
+        panels = (("idle CPU [s/min]", lambda t: window_rates(t["idle"])["cpu_s_per_min"]),
+                  ("CPU per workflow [ms]", lambda t: (per_workflow_cost(t) or {}).get("cpu_ms")),
+                  ("Redis commands per workflow", lambda t: (per_workflow_cost(t) or {}).get("redis_commands")),
+                  ("service requests per workflow", lambda t: (per_workflow_cost(t) or {}).get("service_requests")))
+        by = defaultdict(list)
+        for t in cost:
+            by[arm(t)].append(t)
+        arms = sorted(by, key=_arm_order)
+        fig, axes = plt.subplots(1, len(panels), figsize=(6.3, 2.4))
+        for ax, (label, y_of) in zip(axes, panels):
+            for i, a in enumerate(arms):
+                color, _, marker = _arm_style(a)
+                ys = [y for y in map(y_of, by[a]) if y is not None]
+                if not ys:
+                    continue
+                ax.bar(i, float(np.median(ys)), 0.6, color=color, alpha=0.35, edgecolor="none")
+                ax.scatter(i + RNG.uniform(-0.15, 0.15, len(ys)), ys, s=10, color=color, marker=marker, linewidths=0, zorder=3)
+            ax.set_xticks(range(len(arms)), [a.upper().replace("/", "\n") for a in arms], fontsize=6)
+            ax.set_title(label, fontsize=7)
+            ax.set_ylim(bottom=0)
+            ax.grid(axis="x", visible=False)
+        fig.tight_layout()
+        fig.savefig(out / "fig_running_cost.pdf")
+        plt.close(fig)
 
 
 def _sweep_series(ax, xs_by_version: dict, x_of, y_of, log_x=True):
@@ -908,6 +1206,7 @@ def main() -> int:
         "overhead": analyse_overhead(raw),
         "dispersion": analyse_dispersion(raw),
         "sweeps": analyse_sweeps(raw),
+        "costs": analyse_costs(raw),
         "equivalence": analyse_equivalence(raw),
         "t33": analyse_t33(run),
         "suites": analyse_suites(run),

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -26,6 +27,11 @@ from oracle import EQUIVALENT, check_outputs, sha256_file, workflow_dir
 
 TERMINAL = ("completed", "failed")
 EXECUTE_LINE = re.compile(r"Execute: method=(\w+), task=(\w+)")
+# uvicorn access log line of a use-case service: method, path, status
+ACCESS_LINE = re.compile(r'"(GET|POST|PUT|DELETE) (\S+) HTTP/[\d.]+" (\d{3})')
+NETEM_IMAGE = "eval-netem"  # evaluation/netem/Dockerfile
+REDIS_HOST, REDIS_PORT = "localhost", int(os.environ.get("EVAL_REDIS_PORT", "16379"))  # both stacks
+CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
 
 
 # small helpers
@@ -72,6 +78,43 @@ def answers(url: str | None) -> bool:
         return httpx.get(url, timeout=2).status_code == 200
     except httpx.HTTPError:
         return False
+
+
+def cgroup_value(container_id: str, filename: str, key: str | None = None) -> int | None:
+    """A counter from a container's cgroup (v2, systemd driver), read on the host."""
+    path = CGROUP_ROOT / f"docker-{container_id}.scope" / filename
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    if key is None:
+        return int(text.split()[0])
+    for line in text.splitlines():
+        name, _, value = line.partition(" ")
+        if name == key:
+            return int(value)
+    return None
+
+
+def parse_info(text: str) -> dict[str, str]:
+    """Redis INFO output -> {field: value}."""
+    return dict(line.split(":", 1) for line in text.splitlines() if ":" in line and not line.startswith("#"))
+
+
+def redis_info(*sections: str) -> dict[str, str]:
+    """INFO over a plain socket, so that no process is started inside the containers."""
+    out: dict[str, str] = {}
+    for section in sections:
+        cmd = f"*2\r\n$4\r\nINFO\r\n${len(section)}\r\n{section}\r\n".encode()
+        with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=5) as sock:
+            sock.sendall(cmd)
+            f = sock.makefile("rb")
+            header = f.readline()  # $<length>
+            if not header.startswith(b"$"):
+                raise RuntimeError(f"unexpected INFO reply: {header[:80]!r}")
+            body = f.read(int(header[1:]))
+        out.update(parse_info(body.decode()))
+    return out
 
 
 def parse_ts(value: str) -> float:
@@ -126,6 +169,61 @@ class Stack:
         ok, _ = wait_for(lambda: self.running_workers() == n, 60, 0.5)
         if not ok:
             raise RuntimeError(f"expected {n} running workers, found {self.running_workers()}")
+
+    # --- Amendment 5 (PROTOCOL.md 12) -------------------------------------
+    def set_service_delay(self, ms: int) -> None:
+        """Delay every packet the use-case services send by ``ms`` (0 removes it).
+
+        ``tc netem`` runs in each service's network namespace from the
+        ``eval-netem`` helper image, so neither orchestrator version is
+        touched. Each new connection to a service then costs about 2·ms (the
+        handshake and the response are both delayed).
+        """
+        for name in self.uc.services:
+            cid = self.uc_compose("ps", "-q", self.uc.compose_name(name)).strip()
+            if not cid:
+                raise RuntimeError(f"{name} is not running")
+            base = ["docker", "run", "--rm", "--net", f"container:{cid}", "--cap-add", "NET_ADMIN", NETEM_IMAGE]
+            if ms > 0:
+                run(*base, "qdisc", "replace", "dev", "eth0", "root", "netem", "delay", f"{ms}ms")
+            else:
+                run(*base, "qdisc", "del", "dev", "eth0", "root", check=False)
+
+    def service_rtt_ms(self, samples: int = 5) -> float:
+        """Median time of a health request from the host to the services (manipulation check)."""
+        times = []
+        for _, url in self.uc.services.values():
+            for _ in range(samples):
+                t0 = time.monotonic()
+                answers(url)
+                times.append(1000 * (time.monotonic() - t0))
+        times.sort()
+        return times[len(times) // 2]
+
+    def orchestrator_containers(self) -> dict[str, str]:
+        """Container name -> full id, for every container of this version's stack."""
+        ids = self.orch("ps", "-q").split()
+        if not ids:
+            return {}
+        out = run("docker", "inspect", "-f", "{{.Name}} {{.Id}}", *ids)
+        return dict(line.lstrip("/").split() for line in out.splitlines() if line.strip())
+
+    def resource_snapshot(self) -> dict:
+        """Cumulative CPU and current memory of each orchestrator container, Redis counters."""
+        containers = {}
+        for name, cid in self.orchestrator_containers().items():
+            containers[name] = {"cpu_usec": cgroup_value(cid, "cpu.stat", "usage_usec"),
+                                "memory_bytes": cgroup_value(cid, "memory.current")}
+        info = redis_info("stats", "memory")
+        return {"t": time.monotonic(), "containers": containers,
+                "redis_commands": int(info.get("total_commands_processed", 0)),
+                "redis_used_memory": int(info.get("used_memory", 0))}
+
+    def service_requests(self, since_iso: str, until_iso: str) -> Counter:
+        """HTTP requests the services logged in a window, as "METHOD path status"."""
+        names = [c for c, _ in self.uc.services.values()]
+        logs = self.uc_compose("logs", "--no-log-prefix", "--since", since_iso, "--until", until_iso, *names)
+        return Counter(f"{m.group(1)} {m.group(2)} {m.group(3)}" for m in ACCESS_LINE.finditer(logs))
 
     def restart_workers(self) -> None:
         self.orch("kill", "worker")
@@ -596,6 +694,12 @@ def sc_scale(stack: Stack, rec: dict, args) -> None:
     t0 = time.monotonic()
     wfs = [stack.submit() for _ in range(k)]
     rec["submit_seconds"] = time.monotonic() - t0
+    _follow_batch(stack, rec, wfs, args, t0)
+
+
+def _follow_batch(stack: Stack, rec: dict, wfs: list[str], args, t0: float) -> None:
+    """Follow submitted workflows to the end; latency and throughput from server timestamps."""
+    k = len(wfs)
     rec["carriers"] = wfs
     pending = set(wfs)
 
@@ -619,6 +723,107 @@ def sc_scale(stack: Stack, rec: dict, args) -> None:
     else:
         rec["makespan_seconds"] = rec["throughput_wf_per_min"] = None
     _record_failures(stack, rec, wfs)
+
+
+# Amendment 5: costs of dependability (PROTOCOL.md 12)
+def sc_service_delay(stack: Stack, rec: dict, args) -> None:
+    """RQ12: K workflows submitted back to back while every service answers late.
+
+    The delay (--delay-ms, set once per run by main) applies to every request
+    to a service: the executions on both versions, and NEW's credential check
+    at submission. Each submission is timed on its own.
+    """
+    k = args.workflows
+    rec["workflows"] = rec["jobs"] = k
+    rec["probe_rtt_ms"] = stack.service_rtt_ms()
+    t0 = time.monotonic()
+    wfs, per = [], []
+    for _ in range(k):
+        r, took = stack.try_submit()
+        r.raise_for_status()
+        per.append(took)
+        wfs.append(r.json()["workflow_id"])
+    rec["submit_seconds"] = time.monotonic() - t0
+    rec["submit_latencies"] = per
+    _follow_batch(stack, rec, wfs, args, t0)
+
+
+def sc_hung_submit(stack: Stack, rec: dict, args) -> None:
+    """RQ12: one submission while a service accepts connections but does not answer.
+
+    The outage target is paused (its kernel still accepts the TCP connection,
+    its process does not reply) only for the submission, then resumed, and the
+    workflow is followed to the end.
+    """
+    svc = stack.uc.compose_name(stack.uc.outage_target)
+    stack.uc_compose("pause", svc)
+    try:
+        r, took = stack.try_submit()
+    finally:
+        stack.uc_compose("unpause", svc)
+    rec["submit_seconds"] = took
+    rec["submit_status"] = r.status_code
+    rec["accepted"] = r.status_code == 200
+    if not rec["accepted"]:
+        rec["final_status"] = f"http {r.status_code}"
+        rec["job_completed"] = False
+        return
+    wf = r.json()["workflow_id"]
+    rec["carriers"] = [wf]
+    final, _ = wait_for(lambda: stack.finished(wf), args.timeout, interval=0.05)
+    rec["final_status"] = final or "timeout"
+    rec["job_completed"] = final == "completed"
+    rec["makespan_seconds"] = stack.makespan(wf)
+
+
+def sc_running_cost(stack: Stack, rec: dict, args) -> None:
+    """RQ13: what the stack consumes idle, and per workflow under a light load.
+
+    Two consecutive windows of --window seconds: ``idle`` (nothing submitted)
+    and ``trickle`` (one workflow every --interval seconds, not polled during
+    the window). Each window records the CPU time and memory of every
+    orchestrator container (host cgroup counters, read without entering the
+    containers), the commands Redis processed, and the requests the services
+    logged.
+    """
+    rec["idle"] = _measure_window(stack, args.window, [])
+    wfs: list[str] = []
+    rec["trickle"] = _measure_window(stack, args.window, wfs, interval=args.interval)
+    final = {wf: wait_for(lambda wf=wf: stack.finished(wf), args.timeout)[0] for wf in wfs}
+    rec["carriers"] = wfs
+    rec["workflows"] = rec["jobs"] = len(wfs)
+    rec["completed_workflows"] = sum(f == "completed" for f in final.values())
+    rec["job_completed"] = rec["completed_workflows"] == len(wfs)
+    _record_failures(stack, rec, wfs)
+
+
+def _measure_window(stack: Stack, seconds: float, wfs: list[str], interval: float | None = None) -> dict:
+    since = now_iso()
+    before = stack.resource_snapshot()
+    start = time.monotonic()
+    if interval:
+        n = int(seconds // interval)
+        for i in range(n):
+            time.sleep(max(0.0, start + i * interval - time.monotonic()))
+            wfs.append(stack.submit())
+    time.sleep(max(0.0, start + seconds - time.monotonic()))
+    after = stack.resource_snapshot()
+    until = now_iso()
+    elapsed = after["t"] - before["t"]
+    cpu = {name: (after["containers"][name]["cpu_usec"] - c["cpu_usec"]) / 1e6
+           for name, c in before["containers"].items()
+           if name in after["containers"] and c["cpu_usec"] is not None
+           and after["containers"][name]["cpu_usec"] is not None}
+    return {
+        "seconds": elapsed,
+        "workflows": len(wfs),
+        "cpu_seconds": cpu,  # per container
+        "memory_bytes": {name: c["memory_bytes"] for name, c in after["containers"].items()},
+        # the snapshot's own INFO call is one command, excluded
+        "redis_commands": after["redis_commands"] - before["redis_commands"] - 1,
+        "redis_used_memory": after["redis_used_memory"],
+        "service_requests": dict(stack.service_requests(since, until)),
+    }
 
 
 def _single_workflow(stack: Stack, rec: dict, args) -> str | None:
@@ -847,6 +1052,10 @@ SCENARIOS = {
     "scale": (sc_scale, None),
     "inline-size": (sc_inline_size, with_inline_size),
     "data-size": (sc_data_size, with_records),
+    # Amendment 5 (PROTOCOL.md 12): run by campaign_costs.sh
+    "service-delay": (sc_service_delay, None),
+    "hung-submit": (sc_hung_submit, None),
+    "running-cost": (sc_running_cost, None),
 }
 
 
@@ -854,6 +1063,9 @@ SWEEPS = {
     "scale": (("workflows", "workflows"), ("workers_requested", "workers")),
     "inline-size": (("inline_bytes", "size"),),
     "data-size": (("records", "records"),),
+    "service-delay": (("delay_ms", "delay_ms"), ("workflows", "workflows")),
+    "hung-submit": (),
+    "running-cost": (("window_seconds", "window"), ("interval_seconds", "interval")),
 }
 
 
@@ -869,6 +1081,9 @@ def main() -> int:
     p.add_argument("--workers", type=int, help="scale the worker service to W replicas first (scale)")
     p.add_argument("--size", type=int, default=0, help="inline input size in decoded bytes (inline-size)")
     p.add_argument("--records", type=int, default=10, help="records the pipeline generates (data-size)")
+    p.add_argument("--delay-ms", type=int, help="delay every service's packets by this much first (service-delay)")
+    p.add_argument("--window", type=float, default=120, help="length of each measured window, s (running-cost)")
+    p.add_argument("--interval", type=float, default=10, help="seconds between workflows in the trickle (running-cost)")
     p.add_argument("--timeout", type=float, default=180, help="per-workflow wait (s)")
     p.add_argument("--observe", type=float, default=30, help="fault observation window (s)")
     p.add_argument("--down-extra", type=float, default=10, help="short-outage extra downtime (s)")
@@ -888,7 +1103,16 @@ def main() -> int:
 
     if args.workers:
         stack.set_workers(args.workers)
+    if args.delay_ms is not None:
+        stack.set_service_delay(args.delay_ms)
+    try:
+        return run_trials(stack, args, fn)
+    finally:
+        if args.delay_ms:
+            stack.set_service_delay(0)  # never leave a delay behind for the next scenario
 
+
+def run_trials(stack: Stack, args, fn) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out / "trials.jsonl"
     total = args.warmup + args.reps
