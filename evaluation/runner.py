@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import socket
@@ -29,6 +30,8 @@ TERMINAL = ("completed", "failed")
 EXECUTE_LINE = re.compile(r"Execute: method=(\w+), task=(\w+)")
 # uvicorn access log line of a use-case service: method, path, status
 ACCESS_LINE = re.compile(r'"(GET|POST|PUT|DELETE) (\S+) HTTP/[\d.]+" (\d{3})')
+# OLD worker stuck in BRPOP on a finished workflow, cut by redis-py's socket timeout
+SOCKET_TIMEOUT_LINE = "Timeout reading from socket"
 NETEM_IMAGE = "eval-netem"  # evaluation/netem/Dockerfile
 REDIS_HOST, REDIS_PORT = "localhost", int(os.environ.get("EVAL_REDIS_PORT", "16379"))  # both stacks
 CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
@@ -37,6 +40,10 @@ CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
 # small helpers
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def api(method: str, path: str, **kwargs) -> httpx.Response:
@@ -466,6 +473,48 @@ def sc_nominal(stack: Stack, rec: dict, args) -> None:
     rec["job_completed"] = final == "completed"
 
 
+def first_execute_at(log_text: str, task_id: str, not_before: float) -> float | None:
+    """Host time of the first ``Execute`` of ``task_id`` logged at or after ``not_before``.
+    """
+    for line in log_text.splitlines():
+        stamp, _, rest = line.partition(" ")
+        m = EXECUTE_LINE.search(rest)
+        if m and m.group(2) == task_id:
+            t = parse_ts(stamp)
+            if t >= not_before:
+                return t
+    return None
+
+
+def sc_pickup(stack: Stack, rec: dict, args) -> None:
+    """Diagnostic, not pre-registered (Amendment 6): where nominal latency goes.
+    """
+    if args.start_jitter:
+        rec["jitter_slept_seconds"] = random.uniform(0, args.start_jitter)
+        time.sleep(rec["jitter_slept_seconds"])
+    prev = getattr(args, "_last_submit", None)
+    submitted = time.time()
+    rec["since_previous_submit_seconds"] = submitted - prev if prev else None
+    if prev:
+        logs = stack.orch("logs", "--no-log-prefix", "--since", iso(prev), "--until", iso(submitted),
+                          "worker", check=False)
+        rec["worker_socket_timeouts_before"] = logs.count(SOCKET_TIMEOUT_LINE)
+    args._last_submit = submitted
+
+    sc_nominal(stack, rec, args)
+
+    tasks = stack.tasks(rec["carriers"][0])
+    rec["task_times"] = {n: [t["created_at"], t["updated_at"]] for n, t in tasks.items()}
+    created = min(parse_ts(t["created_at"]) for t in tasks.values())
+    node, first = min(tasks.items(), key=lambda kv: parse_ts(kv[1]["updated_at"]))
+    logs = stack.uc_compose("logs", "--timestamps", "--no-log-prefix", "--since", iso(created - 1),
+                            stack.uc.compose_name(node))
+    called = first_execute_at(logs, first["task_id"], created - 0.05)
+    if called is not None:
+        rec["pickup_seconds"] = called - created
+        rec["work_seconds"] = max(parse_ts(t["updated_at"]) for t in tasks.values()) - called
+
+
 def sc_burst(stack: Stack, rec: dict, args) -> None:
     """No fault: K workflows at once (throughput) and the idle-worker check (V-A4)."""
     if not stack.uc.concurrent:
@@ -778,13 +827,6 @@ def sc_hung_submit(stack: Stack, rec: dict, args) -> None:
 
 def sc_running_cost(stack: Stack, rec: dict, args) -> None:
     """RQ13: what the stack consumes idle, and per workflow under a light load.
-
-    Two consecutive windows of --window seconds: ``idle`` (nothing submitted)
-    and ``trickle`` (one workflow every --interval seconds, not polled during
-    the window). Each window records the CPU time and memory of every
-    orchestrator container (host cgroup counters, read without entering the
-    containers), the commands Redis processed, and the requests the services
-    logged.
     """
     rec["idle"] = _measure_window(stack, args.window, [])
     wfs: list[str] = []
@@ -1048,14 +1090,13 @@ SCENARIOS = {
     "concurrent-outage": (sc_concurrent_outage, None),
     "credential-misconfig": (sc_credential_misconfig, None),
     "corrupt-inline": (sc_corrupt_inline, corrupt_inline_input),
-    # Amendment 4 (PROTOCOL.md 11): swept by campaign_sweeps.sh
     "scale": (sc_scale, None),
     "inline-size": (sc_inline_size, with_inline_size),
     "data-size": (sc_data_size, with_records),
-    # Amendment 5 (PROTOCOL.md 12): run by campaign_costs.sh
     "service-delay": (sc_service_delay, None),
     "hung-submit": (sc_hung_submit, None),
     "running-cost": (sc_running_cost, None),
+    "pickup": (sc_pickup, None),
 }
 
 
@@ -1066,6 +1107,7 @@ SWEEPS = {
     "service-delay": (("delay_ms", "delay_ms"), ("workflows", "workflows")),
     "hung-submit": (),
     "running-cost": (("window_seconds", "window"), ("interval_seconds", "interval")),
+    "pickup": (("start_jitter", "start_jitter"),),
 }
 
 
@@ -1084,6 +1126,8 @@ def main() -> int:
     p.add_argument("--delay-ms", type=int, help="delay every service's packets by this much first (service-delay)")
     p.add_argument("--window", type=float, default=120, help="length of each measured window, s (running-cost)")
     p.add_argument("--interval", type=float, default=10, help="seconds between workflows in the trickle (running-cost)")
+    p.add_argument("--start-jitter", type=float, default=0,
+                   help="wait a random 0..J s before each submission (pickup)")
     p.add_argument("--timeout", type=float, default=180, help="per-workflow wait (s)")
     p.add_argument("--observe", type=float, default=30, help="fault observation window (s)")
     p.add_argument("--down-extra", type=float, default=10, help="short-outage extra downtime (s)")

@@ -15,6 +15,7 @@ RNG = np.random.default_rng(20260925)
 MARGIN = 0.05  # equivalence margin for overhead
 SWEEP_SCENARIOS = ("scale", "inline-size", "data-size")
 COST_SCENARIOS = ("service-delay", "hung-submit", "running-cost")  # Amendment 5, PROTOCOL.md 12
+DIAGNOSTIC_SCENARIOS = ("pickup",)  # Amendment 6
 VERSIONS = ("old", "new")
 COLOR = {"old": "#eb6834", "new": "#2a78d6"}
 HATCH = {"old": "////", "new": ""}
@@ -118,7 +119,7 @@ def analyse_trials(trials: list[dict]) -> dict:
         # checks-off arm is analysed separately (analyse_overhead), and so are
         # the sweeps, whose points must not be pooled (analyse_sweeps).
         if (not t.get("warmup") and t.get("variant", "default") == "default"
-                and t["scenario"] not in SWEEP_SCENARIOS + COST_SCENARIOS):
+                and t["scenario"] not in SWEEP_SCENARIOS + COST_SCENARIOS + DIAGNOSTIC_SCENARIOS):
             groups[(t["scenario"], t["use_case"])][t["version"]].append(t)
 
     result = {}
@@ -228,6 +229,49 @@ def analyse_dispersion(trials: list[dict]) -> dict:
             r["fligner_p"] = float(stats.fligner(old, new).pvalue)
         result[uc] = r
     return result
+
+
+def analyse_pickup(trials: list[dict]) -> dict:
+    """Diagnostic, not pre-registered (Amendment 6): where nominal latency goes.
+
+    Cells are (use case, start jitter, version). Within each use case and
+    jitter, OLD and NEW are compared on pickup and end-to-end latency, and on
+    the spread of the latter, as in analyse_dispersion.
+    """
+    cells: dict[tuple, list[dict]] = defaultdict(list)
+    for t in trials:
+        if (t["scenario"] == "pickup" and not t.get("warmup") and "error" not in t
+                and t.get("pickup_seconds") is not None):
+            cells[(t["use_case"], float(t.get("start_jitter") or 0), t["version"])].append(t)
+
+    result: dict = {"cells": {}, "comparisons": {}}
+    for (uc, jitter, version), ts in sorted(cells.items(), key=lambda kv: (kv[0][0], kv[0][1], VERSIONS.index(kv[0][2]))):
+        gaps = values(ts, "since_previous_submit_seconds")
+        after = [t["pickup_seconds"] for t in ts if (t.get("worker_socket_timeouts_before") or 0) > 0]
+        clean = [t["pickup_seconds"] for t in ts if t.get("worker_socket_timeouts_before") == 0]
+        result["cells"][f"{uc}/{jitter:g}/{version}"] = {
+            "n": len(ts),
+            "pickup": describe_spread(values(ts, "pickup_seconds")),
+            "work": describe_spread(values(ts, "work_seconds")),
+            "e2e": describe_spread(values(ts, "e2e_seconds")),
+            "pickup_share_median": _med([t["pickup_seconds"] / t["e2e_seconds"] for t in ts]),
+            "submit_gap_median": _med(gaps),
+            "socket_timeouts": sum(t.get("worker_socket_timeouts_before") or 0 for t in ts),
+            "pickup_median_after_timeout": _med(after),
+            "pickup_median_no_timeout": _med(clean),
+            "n_after_timeout": len(after),
+        }
+    for uc, jitter in sorted({(u, j) for u, j, _ in cells}):
+        old, new = cells.get((uc, jitter, "old"), []), cells.get((uc, jitter, "new"), [])
+        if len(old) > 1 and len(new) > 1:
+            e_old, e_new = values(old, "e2e_seconds"), values(new, "e2e_seconds")
+            result["comparisons"][f"{uc}/{jitter:g}"] = {
+                "pickup": compare_continuous(values(old, "pickup_seconds"), values(new, "pickup_seconds")),
+                "e2e": compare_continuous(e_old, e_new),
+                "brown_forsythe_p": float(stats.levene(e_old, e_new, center="median").pvalue),
+                "fligner_p": float(stats.fligner(e_old, e_new).pvalue),
+            }
+    return result if result["cells"] else {}
 
 
 def _history_totals(trials: list[dict]) -> dict | None:
@@ -781,6 +825,26 @@ def write_tables(out: Path, summary: dict) -> None:
         lines.append(r"\end{tabular}")
         (out / "table_dispersion.tex").write_text("\n".join(lines) + "\n")
 
+    pickup = summary.get("pickup", {})
+    if pickup:
+        lines = [
+            r"\begin{tabular}{lrlrrrrrrr}", r"\toprule",
+            r"Use case & Jitter [s] & Version & $n$ & Gap [s] & Pickup [s] (P5--P95) & Work [s]"
+            r" & Pickup share & End-to-end [s] & Timeouts \\",
+            r"\midrule",
+        ]
+        for name, c in pickup["cells"].items():
+            uc, jitter, version = name.split("/")
+            pk = c["pickup"]
+            lines.append(
+                f"{tex_escape(uc)} & {jitter} & {version.upper()} & {c['n']} & {fmt(c['submit_gap_median'], 2)} & "
+                f"{fmt(pk['median'], 2)} ({fmt(pk['p5'], 2)}--{fmt(pk['p95'], 2)}) & "
+                f"{fmt(c['work']['median'], 3)} & {fmt(c['pickup_share_median'], 2)} & "
+                f"{fmt(c['e2e']['median'], 2)} & {c['socket_timeouts']} \\\\"
+            )
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        (out / "table_pickup.tex").write_text("\n".join(lines) + "\n")
+
     sweeps = summary.get("sweeps", {})
     if sweeps.get("scale"):
         lines = [
@@ -957,7 +1021,7 @@ def write_figures(out: Path, trials: list[dict]) -> None:
 
     by = defaultdict(lambda: {"old": [], "new": []})
     for t in trials:
-        if not t.get("warmup") and "error" not in t and t["scenario"] not in SWEEP_SCENARIOS + COST_SCENARIOS:
+        if not t.get("warmup") and "error" not in t and t["scenario"] not in SWEEP_SCENARIOS + COST_SCENARIOS + DIAGNOSTIC_SCENARIOS:
             by[f"{t['scenario']}\n{t['use_case']}"][t["version"]].append(t)
     names = sorted(by)
     if not names:
@@ -1205,6 +1269,7 @@ def main() -> int:
         "trials": analyse_trials(raw),
         "overhead": analyse_overhead(raw),
         "dispersion": analyse_dispersion(raw),
+        "pickup": analyse_pickup(raw),
         "sweeps": analyse_sweeps(raw),
         "costs": analyse_costs(raw),
         "equivalence": analyse_equivalence(raw),
