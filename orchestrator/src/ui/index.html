@@ -6,60 +6,8 @@
 <title>Orchestrator Dashboard</title>
 <!--
   Orchestrator dashboard, served by the API at /ui.
-  Self-contained: no external scripts or fonts. It holds no data itself; every
-  call goes to the API and carries the API key entered below (kept in this
-  browser's localStorage only).
 -->
-<style>
-  :root {
-    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #677084;
-    --border: #dde1e8; --accent: #2f6fdb;
-    --pending: #9aa3b2; --running: #2f6fdb; --blocked: #d98b00;
-    --completed: #1f9d55; --failed: #d64545; --degraded: #d98b00;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg: #14171d; --panel: #1c2028; --text: #e6e9ef; --muted: #98a1b3;
-      --border: #2d333f; --accent: #6ea0ff;
-    }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--text); }
-  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 12px 16px;
-           border-bottom: 1px solid var(--border); background: var(--panel); }
-  header h1 { font-size: 16px; margin: 0 8px 0 0; }
-  header input { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
-                 background: var(--bg); color: var(--text); min-width: 220px; }
-  .pill { padding: 2px 10px; border-radius: 999px; color: #fff; font-size: 12px; background: var(--pending); }
-  main { display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 16px; padding: 16px; }
-  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
-  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-width: 0; }
-  section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
-  .stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-  ul.list { list-style: none; margin: 0; padding: 0; }
-  ul.list li { padding: 8px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
-  ul.list li:hover, ul.list li.sel { background: var(--bg); }
-  .small { font-size: 12px; color: var(--muted); }
-  .mono { font-family: ui-monospace, monospace; }
-  .st { font-weight: 600; }
-  .st-pending { color: var(--pending); } .st-running { color: var(--running); }
-  .st-blocked { color: var(--blocked); } .st-completed { color: var(--completed); }
-  .st-failed { color: var(--failed); }
-  .st-HEALTHY { color: var(--completed); } .st-DEGRADED { color: var(--degraded); }
-  .st-UNHEALTHY { color: var(--failed); }
-  table { width: 100%; border-collapse: collapse; }
-  td, th { text-align: left; padding: 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { font-weight: 600; color: var(--muted); font-size: 12px; }
-  button { padding: 4px 10px; border: 1px solid var(--accent); background: transparent; color: var(--accent);
-           border-radius: 6px; cursor: pointer; }
-  button:hover { background: var(--accent); color: #fff; }
-  pre { margin: 0; max-height: 280px; overflow: auto; white-space: pre-wrap; word-break: break-word;
-        background: var(--bg); padding: 8px; border-radius: 6px; font-size: 12px; }
-  svg text { fill: var(--text); font-size: 12px; }
-  .graph { overflow-x: auto; }
-  .empty { color: var(--muted); padding: 8px 0; }
-  .error { color: var(--failed); }
-</style>
+<link rel="stylesheet" href="index.css">
 </head>
 <body>
 <header>
@@ -88,6 +36,10 @@
       <div id="tasks"></div>
     </section>
     <section>
+      <h2>Verification</h2>
+      <div id="verify" class="empty">Select a workflow.</div>
+    </section>
+    <section>
       <h2>Logs</h2>
       <pre id="logs" class="mono">Select a workflow to see its log lines.</pre>
     </section>
@@ -98,185 +50,6 @@
   </div>
 </main>
 
-<script>
-const POLL_MS = 2500;
-const KEY_DEBOUNCE_MS = 400;
-const LOCKED_TEXT = 'API key required: enter the orchestrator API key above.';
-const COLORS = { pending: '--pending', running: '--running', blocked: '--blocked',
-                 completed: '--completed', failed: '--failed' };
-let selected = null;
-
-const $ = id => document.getElementById(id);
-const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const time = iso => iso ? new Date(iso).toLocaleTimeString() : '';
-
-class Unauthorized extends Error {}
-
-function readKey() { try { return localStorage.getItem('orch_key') || ''; } catch { return ''; } }
-function saveKey(v) { try { localStorage.setItem('orch_key', v); } catch { /* private mode */ } }
-
-async function api(path, options = {}) {
-  const key = $('apikey').value.trim();
-  const headers = key ? { Authorization: 'Bearer ' + key } : {};
-  const response = await fetch(path, { ...options, headers });
-  if (response.status === 401) throw new Unauthorized(LOCKED_TEXT);
-  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
-  return response;
-}
-
-function say(text, isError = false) {
-  $('message').textContent = text;
-  $('message').className = isError ? 'small error' : 'small';
-}
-
-async function checkOnline() {
-  try { await fetch('/health'); $('online').textContent = 'online'; $('online').style.background = css('--completed'); }
-  catch { $('online').textContent = 'offline'; $('online').style.background = css('--failed'); }
-}
-
-async function loadWorkflows() {
-  const data = await (await api('/workflows')).json();
-  if (!data.workflows.length) { $('workflows').innerHTML = '<li class="empty">No workflows yet.</li>'; return; }
-  if (!selected) selected = data.workflows[0].workflow_id;
-  $('workflows').innerHTML = data.workflows.map(w => `
-    <li data-id="${esc(w.workflow_id)}" class="${w.workflow_id === selected ? 'sel' : ''}">
-      <span><span class="mono">${esc(w.workflow_id)}</span><br><span class="small">${esc(w.name || '')} · ${time(w.created_at)}</span></span>
-      <span class="st st-${esc(w.status)}">${esc(w.status)}</span>
-    </li>`).join('');
-  $('workflows').querySelectorAll('li[data-id]').forEach(li =>
-    li.onclick = () => { selected = li.dataset.id; tick(); });
-}
-
-async function loadServices() {
-  const data = await (await api('/orchestrator/health/services')).json();
-  if (!data.services.length) { $('services').innerHTML = '<div class="empty">No services registered yet.</div>'; return; }
-  $('services').innerHTML = `
-    <div class="small">overall <span class="st st-${esc(data.overall_status)}">${esc(data.overall_status)}</span></div>
-    <table><tr><th>Service</th><th>Status</th><th></th></tr>
-    ${data.services.map(s => `
-      <tr title="${esc(s.last_error || '')}">
-        <td class="mono">${esc(s.service_name)}<br><span class="small">${esc(s.circuit_state)}${s.failure_count ? ' · ' + s.failure_count + ' failures' : ''}${s.retry_after ? ' · next probe ' + time(s.retry_after) : ''}</span></td>
-        <td class="st st-${esc(s.status)}">${esc(s.status)}</td>
-        <td>${s.status !== 'HEALTHY' ? `<button data-recover="${esc(s.service_name)}">Recover</button>` : ''}</td>
-      </tr>`).join('')}
-    </table>`;
-  $('services').querySelectorAll('button[data-recover]').forEach(b => b.onclick = async () => {
-    try {
-      const r = await (await api(`/orchestrator/health/services/${encodeURIComponent(b.dataset.recover)}/recover`, { method: 'POST' })).json();
-      say(`${r.service_name}: ${r.message}`);
-      tick();
-    } catch (e) { say(e.message, true); }
-  });
-}
-
-function drawGraph(graph) {
-  // Layered layout: a node's column is its longest distance from a start node.
-  const incoming = {}; graph.nodes.forEach(n => incoming[n.key] = []);
-  graph.edges.forEach(e => { if (incoming[e.target]) incoming[e.target].push(e.source); });
-  const depth = {};
-  const depthOf = (k, seen = new Set()) => {
-    if (k in depth) return depth[k];
-    if (seen.has(k)) return 0;
-    seen.add(k);
-    depth[k] = incoming[k].length ? 1 + Math.max(...incoming[k].map(p => depthOf(p, seen))) : 0;
-    return depth[k];
-  };
-  graph.nodes.forEach(n => depthOf(n.key));
-  const columns = {};
-  graph.nodes.forEach(n => (columns[depth[n.key]] ||= []).push(n));
-
-  const W = 170, H = 46, GX = 60, GY = 22;
-  const pos = {};
-  Object.entries(columns).forEach(([c, nodes]) => nodes.forEach((n, i) =>
-    pos[n.key] = { x: 10 + c * (W + GX), y: 10 + i * (H + GY) }));
-  const width = 20 + Object.keys(columns).length * (W + GX);
-  const height = 20 + Math.max(...Object.values(columns).map(c => c.length)) * (H + GY);
-
-  const edges = graph.edges.filter(e => pos[e.source] && pos[e.target]).map(e => {
-    const a = pos[e.source], b = pos[e.target];
-    return `<line x1="${a.x + W}" y1="${a.y + H / 2}" x2="${b.x}" y2="${b.y + H / 2}" stroke="${css('--muted')}" stroke-width="1.5" marker-end="url(#arrow)"/>`;
-  }).join('');
-  const nodes = graph.nodes.map(n => {
-    const p = pos[n.key], color = css(COLORS[n.status] || '--pending');
-    const health = n.service_status ? `service ${n.service_status} (${n.circuit_state})` : 'service health unknown';
-    return `<g><title>${esc(n.key)}\n${esc(n.status)}\n${esc(health)}</title>
-      <rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="8" fill="${color}" fill-opacity="0.15" stroke="${color}" stroke-width="2"/>
-      <text x="${p.x + 10}" y="${p.y + 19}">${esc(n.container_name)}</text>
-      <text x="${p.x + 10}" y="${p.y + 36}" fill="${color}" style="fill:${color};font-weight:600">${esc(n.status)}${n.service_status && n.service_status !== 'HEALTHY' ? ' · ' + esc(n.service_status) : ''}</text></g>`;
-  }).join('');
-  $('graph').innerHTML = `<svg width="${width}" height="${height}" role="img" aria-label="workflow graph">
-    <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="${css('--muted')}"/></marker></defs>${edges}${nodes}</svg>`;
-}
-
-async function loadSelected() {
-  if (!selected) return;
-  const [graph, tasks, logs] = await Promise.all([
-    api(`/workflows/${selected}/graph`).then(r => r.json()),
-    api(`/workflows/${selected}/tasks`).then(r => r.json()),
-    api(`/workflows/${selected}/logs?lines=150`).then(r => r.text()),
-  ]);
-  $('wf-title').innerHTML = `${esc(graph.name || 'Workflow')} <span class="mono small">${esc(selected)}</span> · <span class="st st-${esc(graph.status)}">${esc(graph.status)}</span>`;
-  drawGraph(graph);
-  $('tasks').innerHTML = `<table><tr><th>Task</th><th>Status</th><th>Updated</th><th>Error</th></tr>
-    ${tasks.tasks.map(t => `<tr><td class="mono">${esc(t.node_key)}</td>
-      <td class="st st-${esc(t.status)}">${esc(t.status)}</td>
-      <td class="small">${time(t.updated_at)}</td>
-      <td class="small">${esc(t.error || '')}</td></tr>`).join('')}</table>`;
-  const pre = $('logs'), atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
-  pre.textContent = logs || '(no log lines)';
-  if (atBottom) pre.scrollTop = pre.scrollHeight;
-}
-
-async function loadAlerts() {
-  const data = await (await api('/orchestrator/alerts?limit=15')).json();
-  if (!data.alerts.length) { $('alerts').innerHTML = '<div class="empty">No alerts.</div>'; return; }
-  const cls = { SERVICE_DOWN: 'st-failed', SERVICE_RECOVERED: 'st-completed', SERVICE_MANUAL_RECOVERY: 'st-blocked', WORKFLOW_VERIFICATION_FAILED: 'st-failed' };
-  $('alerts').innerHTML = `<table>${data.alerts.map(a => `<tr>
-    <td class="small">${time(a.timestamp)}</td>
-    <td class="st ${cls[a.alert] || ''}">${esc(a.alert || '')}</td>
-    <td class="mono">${esc(a.service_name || a.workflow_id || '')}</td>
-    <td class="small">${esc(a.last_error || a.summary || '')}</td></tr>`).join('')}</table>`;
-}
-
-// Without a valid key no panel can load: say so in every panel instead of
-// leaving them on "Loading…" or showing data from before the key changed.
-function showLocked() {
-  $('workflows').innerHTML = `<li class="empty error">${LOCKED_TEXT}</li>`;
-  for (const id of ['services', 'alerts', 'tasks']) $(id).innerHTML = `<div class="empty error">${LOCKED_TEXT}</div>`;
-  $('graph').innerHTML = '';
-  $('wf-title').textContent = 'Locked';
-  $('logs').textContent = LOCKED_TEXT;
-}
-
-async function tick() {
-  checkOnline();
-  try {
-    await Promise.all([loadWorkflows(), loadServices(), loadAlerts()]);
-    await loadSelected();
-    // A successful refresh clears an earlier error; a Recover confirmation stays.
-    if ($('message').classList.contains('error')) say('');
-  } catch (e) {
-    if (e instanceof Unauthorized) showLocked();
-    say(e.message, true);
-  }
-}
-
-// Apply the key as it is typed (after a short pause) or at once on Enter.
-function applyKey() { saveKey($('apikey').value.trim()); tick(); }
-let keyTimer = null;
-$('apikey').addEventListener('input', () => {
-  clearTimeout(keyTimer);
-  keyTimer = setTimeout(applyKey, KEY_DEBOUNCE_MS);
-});
-$('apikey').addEventListener('keydown', e => {
-  if (e.key === 'Enter') { clearTimeout(keyTimer); applyKey(); }
-});
-
-$('apikey').value = readKey();
-tick();
-setInterval(tick, POLL_MS);
-</script>
+<script src="index.js"></script>
 </body>
 </html>
