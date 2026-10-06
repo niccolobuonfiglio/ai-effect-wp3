@@ -1,8 +1,4 @@
-"""Checks of the output-equivalence oracle itself (PROTOCOL.md, Amendment 3).
-
-The instrument must say "divergent" when one byte changes and "missing" when a
-file is absent, or a run where every job is "equivalent" proves nothing.
-Run with any pytest: ``python -m pytest evaluation/test_oracle.py``.
+"""Checks of the output-equivalence oracle.
 """
 
 import hashlib

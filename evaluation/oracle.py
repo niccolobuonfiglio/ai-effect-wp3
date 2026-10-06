@@ -1,12 +1,4 @@
-"""Output-equivalence oracle (PROTOCOL.md, Amendment 3).
-
-A job that completes under a fault must produce the same output as a job that
-completes without one. For a deterministic use case, "the same" can be checked
-without judging the data: every output file must be byte-identical to a
-reference fixed before the measurements.
-
-The oracle reads the files the services wrote on the host, never the copy the
-orchestrator was told about, so it does not depend on either version's API.
+"""Output-equivalence oracle.
 """
 
 import hashlib

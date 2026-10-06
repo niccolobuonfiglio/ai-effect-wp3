@@ -1,8 +1,4 @@
 """Fixed settings of the OLD vs NEW evaluation.
-
-Everything that must be identical for both versions lives here, so that the
-only thing that changes between a pair of trials is the orchestrator code.
-Paths can be overridden with environment variables.
 """
 
 import os

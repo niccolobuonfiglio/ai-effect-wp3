@@ -1,4 +1,4 @@
-"""Checks of the Amendment 5 instruments.
+"""Checks of the costs experiments.
 
 Run with any pytest: ``python -m pytest evaluation/test_costs.py``. 
 """
